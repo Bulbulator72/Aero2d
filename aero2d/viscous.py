@@ -744,6 +744,10 @@ class ViscousSolver:
         """Решение для одного угла атаки. Если Ньютон не сошёлся при малом Re,
         включается продолжение по числу Рейнольдса: решение при большем Re
         (где отрывы слабее) и пошаговое уменьшение Re до заданного."""
+        with np.errstate(all="ignore"):
+            return self._solve_h(alpha, init, max_iter, tol, verbose, homotopy)
+
+    def _solve_h(self, alpha, init, max_iter, tol, verbose, homotopy):
         r = self._solve(alpha, init, max_iter, tol, verbose)
         if r.converged or not homotopy or self.re > 2e6:
             return r
