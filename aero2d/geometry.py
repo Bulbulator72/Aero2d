@@ -1,0 +1,279 @@
+"""Геометрия профилей.
+
+Соглашение об обходе контура (как в XFOIL): от задней кромки по верхней
+поверхности к передней кромке и далее по нижней поверхности обратно к задней
+кромке. Первая и последняя точки — задняя кромка (для острой кромки совпадают).
+Хорда нормирована на 1, передняя кромка в (0, 0), задняя в (1, 0).
+"""
+from __future__ import annotations
+
+import numpy as np
+from dataclasses import dataclass
+from math import comb
+
+
+@dataclass
+class Airfoil:
+    x: np.ndarray
+    y: np.ndarray
+    name: str = "airfoil"
+
+    @property
+    def n(self) -> int:
+        return len(self.x)
+
+    def coords(self) -> np.ndarray:
+        return np.column_stack([self.x, self.y])
+
+    @staticmethod
+    def from_file(path: str) -> "Airfoil":
+        """Читает формат Selig (имя в первой строке, далее x y)."""
+        with open(path) as f:
+            lines = [ln.strip() for ln in f if ln.strip()]
+        name = lines[0]
+        pts = np.array([[float(v) for v in ln.split()[:2]] for ln in lines[1:]])
+        return Airfoil(pts[:, 0], pts[:, 1], name)
+
+
+# ---------------------------------------------------------------------------
+# NACA
+# ---------------------------------------------------------------------------
+def _cosine_spacing(n: int) -> np.ndarray:
+    beta = np.linspace(0.0, np.pi, n)
+    return 0.5 * (1.0 - np.cos(beta))
+
+
+def naca4(code: str, n_side: int = 100, closed_te: bool = True) -> Airfoil:
+    """NACA 4-значный профиль. n_side — число точек на каждой стороне."""
+    m = int(code[0]) / 100.0
+    p = int(code[1]) / 10.0
+    t = int(code[2:]) / 100.0
+    xc = _cosine_spacing(n_side)
+    a4 = -0.1036 if closed_te else -0.1015
+    yt = 5 * t * (0.2969 * np.sqrt(xc) - 0.1260 * xc - 0.3516 * xc**2
+                  + 0.2843 * xc**3 + a4 * xc**4)
+    yc = np.zeros_like(xc)
+    dyc = np.zeros_like(xc)
+    if m > 0 and p > 0:
+        f = xc < p
+        yc[f] = m / p**2 * (2 * p * xc[f] - xc[f] ** 2)
+        dyc[f] = 2 * m / p**2 * (p - xc[f])
+        b = ~f
+        yc[b] = m / (1 - p) ** 2 * ((1 - 2 * p) + 2 * p * xc[b] - xc[b] ** 2)
+        dyc[b] = 2 * m / (1 - p) ** 2 * (p - xc[b])
+    th = np.arctan(dyc)
+    xu, yu = xc - yt * np.sin(th), yc + yt * np.cos(th)
+    xl, yl = xc + yt * np.sin(th), yc - yt * np.cos(th)
+    x = np.concatenate([xu[::-1], xl[1:]])
+    y = np.concatenate([yu[::-1], yl[1:]])
+    if closed_te:
+        y[0] = y[-1] = 0.5 * (y[0] + y[-1])
+    return Airfoil(x, y, f"NACA {code}")
+
+
+# ---------------------------------------------------------------------------
+# CST (Kulfan)
+# ---------------------------------------------------------------------------
+def _bernstein(n: int, x: np.ndarray) -> np.ndarray:
+    return np.array([comb(n, i) * x**i * (1 - x) ** (n - i) for i in range(n + 1)])
+
+
+def cst(au, al, n_side: int = 100, te_thickness: float = 0.0,
+        n1: float = 0.5, n2: float = 1.0) -> Airfoil:
+    """Профиль по параметризации CST. au, al — весовые коэффициенты
+    верхней и нижней поверхностей (al обычно отрицательные)."""
+    au, al = np.asarray(au, float), np.asarray(al, float)
+    xc = _cosine_spacing(n_side)
+    c = xc**n1 * (1 - xc) ** n2
+    yu = c * (au @ _bernstein(len(au) - 1, xc)) + xc * te_thickness / 2
+    yl = c * (al @ _bernstein(len(al) - 1, xc)) - xc * te_thickness / 2
+    x = np.concatenate([xc[::-1], xc[1:]])
+    y = np.concatenate([yu[::-1], yl[1:]])
+    return Airfoil(x, y, "CST")
+
+
+# ---------------------------------------------------------------------------
+# Профили Кармана–Треффца / Жуковского с точным решением потенциального обтекания
+# ---------------------------------------------------------------------------
+class KarmanTrefftz:
+    """Окружность радиуса R с центром mu в плоскости zeta, проходящая через
+    zeta = c, отображается в профиль с углом задней кромки tau:
+        (z - n c)/(z + n c) = ((zeta - c)/(zeta + c))^n,  n = 2 - tau/pi.
+    При tau = 0 — профиль Жуковского (острая кромка-«клюв»).
+
+    eps  — параметр толщины (сдвиг центра влево, в долях c),
+    delta — параметр кривизны (сдвиг центра вверх, в долях c).
+    Координаты, Cp и Cl отнесены к хорде профиля; угол атаки — от хорды.
+    """
+
+    def __init__(self, eps=0.1, delta=0.0, tau_deg=0.0, c=1.0):
+        self.eps, self.delta, self.tau_deg, self.c = eps, delta, tau_deg, c
+        self.nexp = 2.0 - np.radians(tau_deg) / np.pi
+        self.mu = complex(-eps * c, delta * c)
+        self.R = abs(c - self.mu)
+        self.theta_te = np.angle(c - self.mu)
+        th = self.theta_te + np.linspace(0, 2 * np.pi, 200001)
+        z = self._z(th)
+        self.z_te = self.nexp * c
+        i = np.argmax(np.abs(z - self.z_te))
+        self.z_le = z[i]
+        self.chord = abs(self.z_te - self.z_le)
+        self.chord_angle = np.angle(self.z_te - self.z_le)
+        self._th_fine = th
+        self._z_fine = self._normalize(z)
+
+    def _zeta(self, th):
+        return self.mu + self.R * np.exp(1j * th)
+
+    def _w(self, zeta):
+        return (zeta - self.c) / (zeta + self.c)
+
+    def _z(self, th):
+        wn = self._w(self._zeta(th)) ** self.nexp
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return self.nexp * self.c * (1 + wn) / (1 - wn)
+
+    def _dzdzeta(self, zeta):
+        n, c = self.nexp, self.c
+        w = self._w(zeta)
+        dw = 2 * c / (zeta + c) ** 2
+        return n * c * 2 * n * w ** (n - 1) * dw / (1 - w**n) ** 2
+
+    def _normalize(self, z):
+        """Передняя кромка в (0,0), хорда 1 вдоль оси x."""
+        return (z - self.z_le) * np.exp(-1j * self.chord_angle) / self.chord
+
+    def airfoil(self, n: int = 201) -> Airfoil:
+        th = self.theta_te + np.linspace(0, 2 * np.pi, n)
+        z = self._normalize(self._z(th))
+        z[0] = z[-1] = self._normalize(self.z_te)
+        return Airfoil(z.real.copy(), z.imag.copy(),
+                       f"Karman-Trefftz eps={self.eps} delta={self.delta} tau={self.tau_deg}")
+
+    def theta_of_point(self, x, y):
+        """Параметр окружности для точек, лежащих (почти) на контуре."""
+        p = np.asarray(x) + 1j * np.asarray(y)
+        return np.array([self._th_fine[np.argmin(np.abs(self._z_fine - pi))]
+                         for pi in np.atleast_1d(p)])
+
+    def _alpha_plane(self, alpha_deg):
+        return np.radians(alpha_deg) + self.chord_angle
+
+    def cp(self, th, alpha_deg: float):
+        """Точный несжимаемый Cp на контуре."""
+        a = self._alpha_plane(alpha_deg)
+        zeta = self._zeta(th)
+        s = zeta - self.mu
+        gam = 4 * np.pi * self.R * np.sin(a - self.theta_te)   # U = 1
+        dw = np.exp(-1j * a) - self.R**2 * np.exp(1j * a) / s**2 + 1j * gam / (2 * np.pi * s)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            q = np.abs(dw / self._dzdzeta(zeta))
+        return 1 - q**2
+
+    def cl(self, alpha_deg: float) -> float:
+        a = self._alpha_plane(alpha_deg)
+        return 2 * 4 * np.pi * self.R * np.sin(a - self.theta_te) / self.chord
+
+
+def Joukowski(eps=0.1, delta=0.0, c=1.0) -> KarmanTrefftz:
+    return KarmanTrefftz(eps, delta, 0.0, c)
+
+
+# ---------------------------------------------------------------------------
+# Подготовка произвольного контура (из файла) к расчёту
+# ---------------------------------------------------------------------------
+def normalize(af: Airfoil) -> Airfoil:
+    """Приводит контур к соглашению пакета: обход задняя кромка → верх →
+    передняя кромка → низ → задняя кромка, хорда 1, передняя кромка в (0,0)."""
+    x, y = np.asarray(af.x, float), np.asarray(af.y, float)
+    # формат Lednicer: две половины, каждая от передней к задней кромке
+    if x[0] < 0.5 and np.any(np.diff(x) < -0.5):
+        k = int(np.argmax(np.diff(x) < -0.5)) + 1
+        up, lo = slice(0, k), slice(k, None)
+        x = np.concatenate([x[up][::-1], x[lo][1:] if np.isclose(x[lo][0], x[up][0]) else x[lo]])
+        y = np.concatenate([af.y[up][::-1], af.y[lo][1:] if np.isclose(af.x[lo][0], af.x[up][0]) else af.y[lo]])
+    # уже нормированные данные (типичные файлы профилей) не трогаем: иначе
+    # у профилей с кривизной поворот на угол «геометрической» хорды сдвинет
+    # отсчёт угла атаки относительно справочных данных
+    already = (abs(x.min()) < 2e-3 and abs(x.max() - 1) < 2e-3
+               and abs(0.5 * (y[0] + y[-1])) < 2e-3)
+    if not already:
+        x, y = _rescale(x, y)
+    # обход против часовой стрелки (площадь > 0)
+    area = 0.5 * np.sum(x[:-1] * y[1:] - x[1:] * y[:-1])
+    if area < 0:
+        x, y = x[::-1], y[::-1]
+    return Airfoil(x, y, af.name)
+
+
+def _rescale(x, y):
+    """Хорда — от задней кромки до самой удалённой от неё точки."""
+    xte = 0.5 * np.array([x[0] + x[-1], y[0] + y[-1]])
+    d = np.hypot(x - xte[0], y - xte[1])
+    ile = int(np.argmax(d))
+    le = np.array([x[ile], y[ile]])
+    ch = xte - le
+    c = np.hypot(*ch)
+    ang = np.arctan2(ch[1], ch[0])
+    ca, sa = np.cos(-ang), np.sin(-ang)
+    xs, ys = (x - le[0]) / c, (y - le[1]) / c
+    return xs * ca - ys * sa, xs * sa + ys * ca
+
+
+def repanel(af: Airfoil, n_side: int = 100, spacing: str = "cosine") -> Airfoil:
+    """Перераспределяет точки контура: сплайн по длине дуги, n_side точек на
+    сторону. spacing="cosine" — сгущение к обеим кромкам; "viscous" — сильное
+    сгущение к передней кромке и умеренное к задней (панели у задней кромки
+    около 1 % хорды, как в XFOIL): для вязкого расчёта слишком мелкие панели
+    у задней кромки делают задачу жёсткой."""
+    from scipy.interpolate import CubicSpline
+    x, y = np.asarray(af.x, float), np.asarray(af.y, float)
+    keep = np.concatenate([[True], np.hypot(np.diff(x), np.diff(y)) > 1e-10])
+    x, y = x[keep], y[keep]
+    s = np.concatenate([[0.0], np.cumsum(np.hypot(np.diff(x), np.diff(y)))])
+    sx, sy = CubicSpline(s, x), CubicSpline(s, y)
+    # передняя кромка — минимум x на сплайне
+    sf = np.linspace(0, s[-1], 20001)
+    sle = sf[np.argmin(sx(sf))]
+    if spacing == "viscous":
+        u = np.linspace(0, 1, n_side)               # 0 — передняя, 1 — задняя кромка
+        w = 0.55
+        g = w * (1 - np.cos(0.5 * np.pi * u)) + (1 - w) * 0.5 * (1 - np.cos(np.pi * u))
+        s1 = sle * (1 - g[::-1])
+        s2 = sle + (s[-1] - sle) * g
+    else:
+        b = np.linspace(0, np.pi, n_side)
+        s1 = sle * 0.5 * (1 - np.cos(b))
+        s2 = sle + (s[-1] - sle) * 0.5 * (1 - np.cos(b))
+    st = np.concatenate([s1, s2[1:]])
+    out = Airfoil(sx(st), sy(st), af.name)
+    out = normalize(out)
+    out.x[0] = out.x[-1] = 0.5 * (out.x[0] + out.x[-1])
+    out.y[0] = out.y[-1] = 0.5 * (out.y[0] + out.y[-1])
+    return out
+
+
+def load_airfoil(path: str, n_side: int = 100) -> Airfoil:
+    """Чтение файла координат (Selig или Lednicer, с заголовком или без),
+    нормировка и перепанелизация."""
+    rows, name = [], None
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for ln in f:
+            parts = ln.replace(",", " ").split()
+            try:
+                v = [float(p) for p in parts[:2]]
+                if len(v) == 2:
+                    rows.append(v)
+                    continue
+            except ValueError:
+                pass
+            if name is None and ln.strip():
+                name = ln.strip()
+    pts = np.array(rows)
+    # строка Lednicer «число точек верх / низ» (значения > 1)
+    if len(pts) and pts[0, 0] > 1.5 and pts[0, 1] > 1.5:
+        pts = pts[1:]
+    if len(pts) < 10:
+        raise ValueError("В файле слишком мало точек контура")
+    af = normalize(Airfoil(pts[:, 0], pts[:, 1], name or "airfoil"))
+    return repanel(af, n_side)
