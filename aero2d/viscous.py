@@ -114,8 +114,9 @@ class ViscousSolver:
         pts = np.array(pts)
         return pts[:, 0], pts[:, 1]
 
-    def _topology(self, g):
-        """Точка торможения и станции слоя по текущему распределению γ."""
+    def _topology(self, g, prev=None):
+        """Точка торможения и станции слоя по текущему распределению γ.
+        prev — текущая сигнатура (k, nu, nl) для гистерезиса исключения узла."""
         N = self.N
         # верх: γ > 0 (узлы 0..k), низ: γ < 0
         idx = np.where((g[:-1] > 0) & (g[1:] <= 0))[0]
@@ -128,9 +129,13 @@ class ViscousSolver:
         lo = np.arange(k + 1, N + 1)
         # узел, почти совпадающий с точкой торможения, исключается из слоя
         # (m = 0 в нём); иначе первая станция вырождается (ξ → 0, Ue → 0)
-        if f < 0.1:
+        was_up = was_lo = False
+        if prev is not None and prev[0] == k:
+            was_up = prev[1] == k                  # узел k уже исключён сверху
+            was_lo = prev[2] == N - k - 1          # узел k+1 уже исключён снизу
+        if f < (0.15 if was_up else 0.05):
             up = up[1:]
-        elif f > 0.9:
+        elif f > (0.85 if was_lo else 0.95):
             lo = lo[1:]
         return k, s_st, up, lo
 
@@ -139,7 +144,8 @@ class ViscousSolver:
         self._alpha = alpha
         N = self.N
         x, y = self.x, self.y
-        k, s_st, up, lo = self._topology(g_inv if self._g_cur is None else self._g_cur)
+        k, s_st, up, lo = self._topology(g_inv if self._g_cur is None else self._g_cur,
+                                         getattr(self, "sig", None) if self._g_cur is not None else None)
         self.k, self.s_st = k, s_st
         self.sig = (k, len(up), len(lo))
         if getattr(self, "_wake_alpha", None) != alpha:
@@ -467,10 +473,10 @@ class ViscousSolver:
         rez_h = hlog + btmp * ulog + xlog * (0.5 * cfx2 - dix)
         # запаздывание
         ald = np.where(wake, bc.DLCON, 1.0)
-        hka = 0.5 * (A["hk"] + B["hk"])
+        hka = (1 - upw) * A["hk"] + upw * B["hk"]            # как в XFOIL (BLDIF)
         rta = 0.5 * (A["rt"] + B["rt"])
         da = 0.5 * (A["ds"] + B["ds"])
-        cfa = 0.5 * (A["cf"] + B["cf"])
+        cfa = (1 - upw) * A["cf"] + upw * B["cf"]
         gcc = np.where(wake, 0.0, bc.GCCON)
         hkc = bc._max(hka - 1.0 - gcc / rta, 0.01 + 0 * hka)
         hr = hkc / (bc.GACON * ald * hka)
@@ -789,7 +795,7 @@ class ViscousSolver:
         for _ in range(6):
             g = g_inv + self.dg_dm @ X[:, 1]
             try:
-                k, s_st, up, lo = self._topology(g)
+                k, s_st, up, lo = self._topology(g, self.sig)
             except RuntimeError:
                 return X
             if (k, len(up), len(lo)) != self.sig:
