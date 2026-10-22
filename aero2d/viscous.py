@@ -710,25 +710,26 @@ class ViscousSolver:
             rl = 1.0
             why = ""
             turb = self._turb_flags(X)
+            # ограничение шага (как UPDATE в XFOIL): относительные изменения θ, δ*,
+            # Ue и sqrt(Cτ) — в пределах [-0.5, 1.5]; Ñ — не больше 5 за шаг
             dlo, dhi = getattr(self, "dlim", (-0.5, 1.5))
-            for c, lo_, hi_ in ((0, dlo, dhi), (1, dlo, dhi), (3, dlo, dhi)):
-                ref = np.maximum(np.abs(X[:, c]), 1e-12 if c != 1 else 1e-9)
-                rr = dX[:, c] / ref
-                if c == 3:
-                    rr = np.where(turb, rr, 0.0)
-                if rr.min() < lo_ and lo_ / rr.min() < rl:
-                    rl = lo_ / rr.min(); why = f"var{c} st{rr.argmin()} {rr.min():.2g}"
-                if rr.max() > hi_ and hi_ / rr.max() < rl:
-                    rl = hi_ / rr.max(); why = f"var{c} st{rr.argmax()} {rr.max():.2g}"
+            ue_old = self._ue
+            due = self.D @ dX[:, 1]
+            dstar = X[:, 1] / ue_old
+            ddstar = dX[:, 1] / ue_old - X[:, 1] * due / ue_old**2      # линеаризация δ* = m/Ue
+            rels = (("θ", dX[:, 0] / np.maximum(np.abs(X[:, 0]), 1e-12)),
+                    ("δ*", ddstar / np.maximum(np.abs(dstar), np.abs(X[:, 0]))),
+                    ("Ue", due / np.maximum(np.abs(ue_old), 0.02)),
+                    ("S", np.where(turb, dX[:, 3] / np.maximum(np.abs(X[:, 3]), 1e-6), 0.0)))
+            for nm, rr in rels:
+                if rr.min() < dlo and dlo / rr.min() < rl:
+                    rl = dlo / rr.min(); why = f"{nm} st{rr.argmin()} {rr.min():.2g}"
+                if rr.max() > dhi and dhi / rr.max() < rl:
+                    rl = dhi / rr.max(); why = f"{nm} st{rr.argmax()} {rr.max():.2g}"
             dn = np.abs(dX[:, 2]).max()
             dnmax = getattr(self, "dnmax", 5.0)
             if dn > dnmax:
                 rl = min(rl, dnmax / dn)
-            ue_new = self.ue_inv + self.D @ (X[:, 1] + rl * dX[:, 1])
-            ue_old = self._ue
-            du = (ue_new - ue_old) / np.maximum(np.abs(ue_old), 1e-3)
-            if np.abs(du).max() > 0.5:
-                rl = min(rl, 0.5 / np.abs(du).max())
             # разрыв циклов: если размер шага перестал уменьшаться (Ньютон «скачет»
             # через излом замыкающих соотношений), шаги постепенно демпфируются
             if (len(hist) >= 8 and max(hist[-6:]) < 0.3
@@ -741,8 +742,9 @@ class ViscousSolver:
                 why += f" damp {damp:.2f}"
             X = X + rl * dX
             X[:, 0] = np.maximum(X[:, 0], 1e-10)
+            X[:, 1] = np.maximum(X[:, 1], 1e-12)
             X[:, 3] = np.maximum(X[:, 3], 1e-6)
-            rms = np.sqrt(np.mean((dX[:, [0, 1, 3]] / np.maximum(np.abs(X[:, [0, 1, 3]]), 1e-9)) ** 2))
+            rms = np.sqrt(np.mean(np.concatenate([rels[0][1], rels[1][1], rels[2][1]]) ** 2))
             hist.append(rms)
             if verbose:
                 ir = np.unravel_index(np.abs(R).argmax(), R.shape)
