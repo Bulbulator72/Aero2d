@@ -1,4 +1,5 @@
-"""Сценарии расчёта для интерфейса: профиль → поляра (панели или Эйлер)."""
+"""Сценарии расчёта для интерфейса: профиль → поляра (панели, панели +
+пограничный слой, Эйлер)."""
 from __future__ import annotations
 
 import csv
@@ -30,6 +31,12 @@ class Polar:
     cp_x: list = field(default_factory=list)
     cp: list = field(default_factory=list)
     notes: list = field(default_factory=list)
+    re: float = float("nan")
+    cdf: np.ndarray | None = None          # сопротивление трения (вязкий расчёт)
+    xtr_u: np.ndarray | None = None        # точки перехода
+    xtr_l: np.ndarray | None = None
+    bl: list = field(default_factory=list)  # распределения пограничного слоя по углам
+    cp_inv: list = field(default_factory=list)
 
 
 def make_airfoil(source: str, value: str, n_side: int = 100) -> Airfoil:
@@ -121,12 +128,73 @@ def run_euler(af: Airfoil, alphas, mach: float, grid: str = "грубая (бы�
                  r.cl, r.cd, r.cm, ok, [xw] * len(alphas), [c for c in r.cp], notes)
 
 
+def run_viscous(af: Airfoil, alphas, mach: float, re: float, ncrit: float = 9.0,
+                xtr=(1.0, 1.0), callback=None) -> Polar:
+    """Панели + интегральный пограничный слой (как XFOIL). callback(text, fraction)
+    -> True для остановки."""
+    from .viscous import ViscousSolver
+    if not 1e3 <= re <= 1e9:
+        raise ValueError("Число Рейнольдса должно быть в диапазоне 1e3…1e9")
+    if mach >= 0.8:
+        raise ValueError("Вязкий панельный метод применим при M < 0,8 (сжимаемость — поправкой "
+                         "Кармана–Цяня); для трансзвука используйте Эйлер.")
+    alphas = np.asarray(alphas, float)
+    solver = ViscousSolver(af, re, ncrit=ncrit, mach=mach, xtr=xtr)
+    stop = {"flag": False}
+
+    def cb(i, n, r):
+        if callback:
+            stop["flag"] = bool(callback(f"Точка {i}/{n}: α = {r.alpha:g}° — "
+                                         f"{'сошлась' if r.converged else 'НЕ сошлась'}", i / n))
+        if stop["flag"]:
+            raise _Stop()
+
+    if callback:
+        callback("Первая точка (маршевое начальное приближение)…", 0.0)
+    try:
+        res = solver.polar(alphas, callback=cb)
+    except _Stop:
+        res = None
+    if res is None or any(r is None for r in res):
+        raise RuntimeError("Расчёт остановлен")
+    ok = np.array([r.converged for r in res])
+    cpstar = critical_cp(mach)
+    sup = np.array([np.min(r.cp) < cpstar for r in res]) if mach > 0 else np.zeros(len(res), bool)
+    notes = []
+    if not ok.all():
+        notes.append(f"Не сошлись: α = {', '.join(f'{a:g}' for a in alphas[~ok])}°. Обычно это "
+                     "срыв (вязко-невязкий метод его описывает только до начала) или сильные "
+                     "отрывные пузыри при малых Re.")
+    if sup.any():
+        notes.append(f"При α = {', '.join(f'{a:g}' for a in alphas[sup])}° на профиле есть "
+                     "сверхзвуковая зона: поправка Кармана–Цяня там неточна.")
+    notes.append(f"Re = {re:.3g}, Ñкрит = {ncrit:g} (9 — типичная аэродинамическая труба; "
+                 "меньше — более турбулентный поток). Cd — по Сквайру–Янгу в конце следа, "
+                 "Cdf — трение. Срыв на больших углах описывается приближённо.")
+    label = f"{af.name}, вязкий, Re={re:.3g}, M={mach:g}"
+    return Polar(label, "viscous", mach, alphas, np.array([r.cl for r in res]),
+                 np.array([r.cd for r in res]), np.array([r.cm for r in res]), ok & ~sup,
+                 [r.x for r in res], [r.cp for r in res], notes, re=re,
+                 cdf=np.array([r.cdf for r in res]),
+                 xtr_u=np.array([r.xtr_u for r in res]), xtr_l=np.array([r.xtr_l for r in res]),
+                 bl=[r.side for r in res], cp_inv=[r.cp_inv for r in res])
+
+
+class _Stop(Exception):
+    pass
+
+
 def save_csv(polars, path):
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f, delimiter=";")
-        w.writerow(["расчёт", "метод", "M", "alpha", "Cl", "Cd", "Cm", "надёжно"])
+        w.writerow(["расчёт", "метод", "M", "Re", "alpha", "Cl", "Cd", "Cdf", "Cm",
+                    "xtr_верх", "xtr_низ", "надёжно"])
+        f6 = lambda v: "" if v is None or not np.isfinite(v) else f"{v:.6f}"
         for p in polars:
             for k in range(len(p.alpha)):
-                cd = "" if np.isnan(p.cd[k]) else f"{p.cd[k]:.6f}"
-                w.writerow([p.label, p.method, f"{p.mach:g}", f"{p.alpha[k]:g}",
-                            f"{p.cl[k]:.6f}", cd, f"{p.cm[k]:.6f}", "да" if p.ok[k] else "нет"])
+                w.writerow([p.label, p.method, f"{p.mach:g}",
+                            "" if not np.isfinite(p.re) else f"{p.re:.4g}", f"{p.alpha[k]:g}",
+                            f6(p.cl[k]), f6(p.cd[k]), f6(None if p.cdf is None else p.cdf[k]),
+                            f6(p.cm[k]), f6(None if p.xtr_u is None else p.xtr_u[k]),
+                            f6(None if p.xtr_l is None else p.xtr_l[k]),
+                            "да" if p.ok[k] else "нет"])

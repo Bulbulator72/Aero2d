@@ -36,7 +36,9 @@ def main():
         for re in res:
             t = time.time()
             v = ViscousSolver(af, re)
-            pol = v.polar(alphas)
+            pol = v.polar(alphas, callback=lambda i, n, r: print(f"    {i}/{n} α={r.alpha:g} "
+                                                                  f"{'ok' if r.converged else 'нет'} "
+                                                                  f"{time.time() - t:.0f}s", flush=True))
             tm = time.time() - t
             xf = xfoil_polar("n" + f, alphas, re, coords=(afx.x, afx.y))
             for p, x in zip(pol, xf):

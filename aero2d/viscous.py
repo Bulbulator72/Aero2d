@@ -364,14 +364,23 @@ class ViscousSolver:
             hk = vd[M] / vd[U] / vd[TH]
             if xtr_f is None:
                 hmax = hmax_t                      # след
+                turb = True
             else:
                 turb = vd[N_] >= self.ncrit or xcb >= xtr_f
                 hmax = hmax_t if turb else hmax_l
             if ok and 1.0 < hk <= hmax:
                 return vd
-            eq = lambda Vm, hm=hmax: Vm[M] / Vm[U] / Vm[TH] - hm
+            # обратный режим: целевой H меняется плавно (как MRCHUE в XFOIL):
+            # в ламинарном отрыве растёт, в турбулентном — убывает к пределу
+            h1 = v[1] / v[4] / v[0]
+            dxt = (v[11] - v[5]) / v[0]
+            htarg = h1 + 0.03 * dxt if not turb else h1 - 0.15 * dxt
+            hm = max(htarg, hmax)
+            if xtr_f is None:
+                hm = max(min(h1, hmax), 1.02)
+            eq = lambda Vm, hm=hm: Vm[M] / Vm[U] / Vm[TH] - hm
             v = v.copy()
-            v[M] = hmax * v[TH] * v[U]
+            v[M] = hm * v[TH] * v[U]
             vi, ok2 = self._local_newton(fint, v, [TH, M, N_, S_, U], extra_eq=eq)
             if ok2 and np.all(np.isfinite(vi)) and vi[TH] > 0 and vi[U] > 0:
                 return vi
@@ -864,39 +873,54 @@ class ViscousSolver:
                             g, side, self._to_state(X))
         return res
 
-    def polar(self, alphas, verbose=False, callback=None):
-        """Поляра с продолжением по углу атаки: от ближайшего к нулю угла вверх и
-        вниз, каждая точка стартует с решения соседней. Несошедшаяся точка
-        повторяется с маршевого начального приближения; при неудаче следующая
-        точка продолжает от последней сошедшейся."""
+    def polar(self, alphas, verbose=False, callback=None, max_iter=50):
+        """Поляра с продолжением по углу атаки. Опорная точка — первая сошедшаяся
+        в порядке |α| (обычно α ≈ 0); от неё — вверх и вниз, каждая точка
+        стартует с решения соседней. Несошедшаяся точка повторяется через
+        промежуточный угол и с маршевого приближения."""
         alphas = np.asarray(alphas, float)
-        out = [None] * len(alphas)
-        a0 = int(np.argmin(np.abs(alphas)))
-        res0 = self.solve(alphas[a0], verbose=verbose)
-        out[a0] = res0
-        done = 1
-        if callback:
-            callback(done, len(alphas), res0)
+        n = len(alphas)
+        out = [None] * n
+        done = [0]
+
+        def report(i, r):
+            out[i] = r
+            done[0] += 1
+            if callback:
+                callback(done[0], n, r)
+
+        anchor = None
+        for i in np.argsort(np.abs(alphas)):
+            r = self.solve(alphas[i], verbose=verbose, max_iter=max_iter)
+            report(i, r)
+            if r.converged:
+                anchor = i
+                break
+        if anchor is None:
+            for i in range(n):
+                if out[i] is None:
+                    report(i, self.solve(alphas[i], verbose=verbose, max_iter=max_iter))
+            return out
         for direction in (1, -1):
-            last_ok = res0 if res0.converged else None
+            last_ok = out[anchor]
             idx = [i for i in np.argsort(alphas * direction)
-                   if direction * (alphas[i] - alphas[a0]) > 0]
+                   if direction * (alphas[i] - alphas[anchor]) > 0]
             for i in idx:
-                r = self.solve(alphas[i], init=last_ok.state if last_ok else None, verbose=verbose)
-                if not r.converged and last_ok is not None:
-                    # половинный шаг по углу
-                    am = 0.5 * (alphas[i] + last_ok.alpha)
-                    rm = self.solve(am, init=last_ok.state, verbose=verbose)
-                    if rm.converged:
-                        r = self.solve(alphas[i], init=rm.state, verbose=verbose)
+                prev = out[i]
+                r = self.solve(alphas[i], init=last_ok.state, verbose=verbose, max_iter=max_iter)
                 if not r.converged:
-                    r2 = self.solve(alphas[i], init=None, verbose=verbose)
+                    am = 0.5 * (alphas[i] + last_ok.alpha)
+                    rm = self.solve(am, init=last_ok.state, verbose=verbose, max_iter=max_iter)
+                    if rm.converged:
+                        r = self.solve(alphas[i], init=rm.state, verbose=verbose, max_iter=max_iter)
+                if not r.converged and prev is None:
+                    r2 = self.solve(alphas[i], init=None, verbose=verbose, max_iter=max_iter)
                     if r2.converged:
                         r = r2
-                out[i] = r
+                if prev is not None:
+                    out[i] = r
+                else:
+                    report(i, r)
                 if r.converged:
                     last_ok = r
-                done += 1
-                if callback:
-                    callback(done, len(alphas), r)
         return out

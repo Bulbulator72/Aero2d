@@ -79,8 +79,8 @@ class App(tk.Tk):
         # --- режим
         f = ttk.LabelFrame(left, text="Режим", padding=6)
         f.pack(fill="x", pady=4)
-        self.mach = tk.StringVar(value="0.5")
-        self.a0, self.a1, self.da = tk.StringVar(value="-4"), tk.StringVar(value="10"), tk.StringVar(value="1")
+        self.mach = tk.StringVar(value="0")
+        self.a0, self.a1, self.da = tk.StringVar(value="-4"), tk.StringVar(value="14"), tk.StringVar(value="1")
         for r, (lbl, var) in enumerate([("Число Маха M", self.mach), ("α от, °", self.a0),
                                         ("α до, °", self.a1), ("шаг α, °", self.da)]):
             ttk.Label(f, text=lbl).grid(row=r, column=0, sticky="w")
@@ -89,18 +89,29 @@ class App(tk.Tk):
         # --- метод
         f = ttk.LabelFrame(left, text="Метод", padding=6)
         f.pack(fill="x", pady=4)
-        self.method = tk.StringVar(value="panel")
-        ttk.Radiobutton(f, text="Панели + Карман–Цянь\n(мгновенно; M < ~0,7; без Cd)",
-                        variable=self.method, value="panel").grid(row=0, column=0, columnspan=2, sticky="w")
+        self.method = tk.StringVar(value="viscous")
+        ttk.Radiobutton(f, text="Вязкий: панели + пограничный слой\n(Re, переход, Cd; секунды на точку)",
+                        variable=self.method, value="viscous").grid(row=0, column=0, columnspan=2, sticky="w")
+        self.re = tk.StringVar(value="1e6")
+        self.ncrit = tk.StringVar(value="9")
+        self.xtru = tk.StringVar(value="1")
+        self.xtrl = tk.StringVar(value="1")
+        for r, (lbl, var) in enumerate([("   Re", self.re), ("   Ñкрит", self.ncrit),
+                                        ("   переход верх ≤ x/c", self.xtru),
+                                        ("   переход низ ≤ x/c", self.xtrl)], start=1):
+            ttk.Label(f, text=lbl).grid(row=r, column=0, sticky="w")
+            ttk.Entry(f, textvariable=var, width=8).grid(row=r, column=1, sticky="w")
+        ttk.Radiobutton(f, text="Невязкий: панели + Карман–Цянь\n(мгновенно; без Cd)",
+                        variable=self.method, value="panel").grid(row=5, column=0, columnspan=2, sticky="w")
         ttk.Radiobutton(f, text="Уравнения Эйлера\n(сжимаемый, со скачками;\nминуты на CPU; M ≥ 0,2)",
-                        variable=self.method, value="euler").grid(row=1, column=0, columnspan=2, sticky="w")
-        ttk.Label(f, text="Сетка:").grid(row=2, column=0, sticky="w")
+                        variable=self.method, value="euler").grid(row=6, column=0, columnspan=2, sticky="w")
+        ttk.Label(f, text="   Сетка:").grid(row=7, column=0, sticky="w")
         self.grid_name = tk.StringVar(value=list(core.GRIDS)[0])
         ttk.Combobox(f, textvariable=self.grid_name, values=list(core.GRIDS), state="readonly",
-                     width=18).grid(row=2, column=1, sticky="w")
-        ttk.Label(f, text="Итераций:").grid(row=3, column=0, sticky="w")
+                     width=16).grid(row=7, column=1, sticky="w")
+        ttk.Label(f, text="   Итераций:").grid(row=8, column=0, sticky="w")
         self.niter = tk.StringVar(value="100")
-        ttk.Entry(f, textvariable=self.niter, width=8).grid(row=3, column=1, sticky="w")
+        ttk.Entry(f, textvariable=self.niter, width=8).grid(row=8, column=1, sticky="w")
 
         # --- кнопки
         f = ttk.Frame(left, padding=(0, 6))
@@ -133,12 +144,21 @@ class App(tk.Tk):
         self.cb_alpha = ttk.Combobox(bar, textvariable=self.cp_alpha, width=8, state="readonly")
         self.cb_alpha.pack(side="left")
         self.cb_alpha.bind("<<ComboboxSelected>>", lambda _: self.plot_cp())
+        self.t_bl = PlotTab(nb, "Пограничный слой")
+        bar = ttk.Frame(self.t_bl.frame)
+        bar.pack(side="top", fill="x", before=self.t_bl.canvas.get_tk_widget())
+        ttk.Label(bar, text="  α, °: ").pack(side="left")
+        self.cb_alpha_bl = ttk.Combobox(bar, textvariable=self.cp_alpha, width=8, state="readonly")
+        self.cb_alpha_bl.pack(side="left")
+        self.cb_alpha_bl.bind("<<ComboboxSelected>>", lambda _: (self.plot_cp(), self.plot_bl()))
+        self.cb_alpha.bind("<<ComboboxSelected>>", lambda _: (self.plot_cp(), self.plot_bl()))
         # таблица
         tf = ttk.Frame(nb)
         nb.add(tf, text="Таблица")
-        cols = ("calc", "alpha", "cl", "cd", "cm", "ok")
+        cols = ("calc", "alpha", "cl", "cd", "cdf", "cm", "xu", "xl", "ok")
         self.table = ttk.Treeview(tf, columns=cols, show="headings")
-        for c, t, w in zip(cols, ["Расчёт", "α, °", "Cl", "Cd", "Cm", "Надёжно"], [380, 60, 90, 90, 90, 70]):
+        for c, t, w in zip(cols, ["Расчёт", "α, °", "Cl", "Cd", "Cd трения", "Cm", "Переход верх",
+                                  "Переход низ", "Надёжно"], [330, 50, 75, 80, 80, 75, 85, 85, 65]):
             self.table.heading(c, text=t)
             self.table.column(c, width=w, anchor="w" if c == "calc" else "e")
         sb = ttk.Scrollbar(tf, orient="vertical", command=self.table.yview)
@@ -197,22 +217,26 @@ class App(tk.Tk):
 
     # --------------------------------------------------------------- расчёт
     def _params(self):
+        num = lambda v: float(v.get().replace(",", ".").replace(" ", ""))
         try:
-            mach = float(self.mach.get().replace(",", "."))
-            alphas = core.alpha_range(*(float(v.get().replace(",", ".")) for v in (self.a0, self.a1, self.da)))
+            mach = num(self.mach)
+            alphas = core.alpha_range(num(self.a0), num(self.a1), num(self.da))
             niter = int(self.niter.get())
+            re_ = num(self.re)
+            ncrit = num(self.ncrit)
+            xtr = (num(self.xtru), num(self.xtrl))
         except ValueError as e:
-            raise ValueError(f"Проверьте числа в полях режима: {e}") from None
+            raise ValueError(f"Проверьте числа в полях: {e}") from None
         if not 0 <= mach < 3.5:
             raise ValueError("M должно быть в диапазоне 0…3")
-        return mach, alphas, niter
+        return mach, alphas, niter, re_, ncrit, xtr
 
     def run(self):
         if self.worker and self.worker.is_alive():
             return
         try:
             af = self.get_airfoil()
-            mach, alphas, niter = self._params()
+            mach, alphas, niter, re_, ncrit, xtr = self._params()
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("Ошибка", str(e))
             return
@@ -220,18 +244,20 @@ class App(tk.Tk):
         method, grid = self.method.get(), self.grid_name.get()
         self.stop_flag.clear()
         self.btn_run.configure(state="disabled")
-        self.btn_stop.configure(state="normal" if method == "euler" else "disabled")
+        self.btn_stop.configure(state="normal" if method != "panel" else "disabled")
         self.progress["value"] = 0
         self.status.set("Расчёт…")
 
         def job():
             try:
+                def cb(text, frac):
+                    self.q.put(("progress", text, frac))
+                    return self.stop_flag.is_set()
                 if method == "panel":
                     p = core.run_panel(af, alphas, mach)
+                elif method == "viscous":
+                    p = core.run_viscous(af, alphas, mach, re_, ncrit, xtr, cb)
                 else:
-                    def cb(text, frac):
-                        self.q.put(("progress", text, frac))
-                        return self.stop_flag.is_set()
                     p = core.run_euler(af, alphas, mach, grid, niter, cb)
                     if self.stop_flag.is_set():
                         p.label += " (остановлен)"
@@ -275,12 +301,15 @@ class App(tk.Tk):
         n_ok = int(p.ok.sum())
         self.status.set(f"Готово: {p.label}. Надёжных точек {n_ok} из {len(p.alpha)}.")
         self.notes.insert("end", f"■ {p.label}\n" + "".join(f"   • {t}\n" for t in p.notes) + "\n")
+        fmt = lambda arr, k, f: "—" if arr is None or not np.isfinite(arr[k]) else format(arr[k], f)
         for k in range(len(p.alpha)):
-            cd = "—" if np.isnan(p.cd[k]) else f"{p.cd[k]:.5f}"
-            self.table.insert("", "end", values=(p.label, f"{p.alpha[k]:g}", f"{p.cl[k]:.4f}", cd,
-                                                 f"{p.cm[k]:.4f}", "да" if p.ok[k] else "НЕТ"))
+            self.table.insert("", "end", values=(
+                p.label, f"{p.alpha[k]:g}", f"{p.cl[k]:.4f}", fmt(p.cd, k, ".5f"), fmt(p.cdf, k, ".5f"),
+                f"{p.cm[k]:.4f}", fmt(p.xtr_u, k, ".3f"), fmt(p.xtr_l, k, ".3f"),
+                "да" if p.ok[k] else "НЕТ"))
         alphas = sorted({f"{a:g}" for q in self.polars for a in q.alpha}, key=float)
         self.cb_alpha["values"] = alphas
+        self.cb_alpha_bl["values"] = alphas
         if not self.cp_alpha.get() or self.cp_alpha.get() not in alphas:
             mid = p.alpha[np.argmin(np.abs(p.alpha - 4))]
             self.cp_alpha.set(f"{mid:g}")
@@ -322,13 +351,14 @@ class App(tk.Tk):
             self._style(axd1, "α, °", "Cd")
             self._style(axd2, "Cd", "Cl")
         else:
-            axd1.text(0.5, 0.5, "Сопротивление даёт только метод Эйлера\n(волновое сопротивление)",
+            axd1.text(0.5, 0.5, "Сопротивление даёт вязкий метод\n(и метод Эйлера — только волновое)",
                       ha="center", va="center", transform=axd1.transAxes, color="#777")
             axd1.set_axis_off(); axd2.set_axis_off()
         axl.set_title("× — расчёт не сошёлся или вне границ применимости метода", fontsize=8, color="#777")
         for t in (self.t_cl, self.t_cd, self.t_cm):
             t.draw()
         self.plot_cp()
+        self.plot_bl()
 
     def plot_cp(self):
         ax = self.t_cp.ax
@@ -345,6 +375,9 @@ class App(tk.Tk):
             k = k[0]
             ax.plot(p.cp_x[k], p.cp[k], "-", color=COLORS[i % len(COLORS)], lw=1.3,
                     label=p.label + ("" if p.ok[k] else " (НЕ сошёлся)"))
+            if p.cp_inv:
+                ax.plot(p.cp_x[k], p.cp_inv[k], ":", color=COLORS[i % len(COLORS)], lw=1.0,
+                        label="  то же без вязкости")
         if self.polars and self.polars[-1].mach > 0:
             from .panel import critical_cp
             cs = critical_cp(self.polars[-1].mach)
@@ -354,6 +387,51 @@ class App(tk.Tk):
         ax.set_title(f"α = {a:g}°")
         self._style(ax, "x/c", "Cp")
         self.t_cp.draw()
+
+    def plot_bl(self):
+        fig = self.t_bl.fig
+        fig.clear()
+        try:
+            a = float(self.cp_alpha.get())
+        except ValueError:
+            self.t_bl.draw()
+            return
+        axs = fig.subplots(2, 2, sharex=True)
+        labels = [("cf", "Cf (по местной Ue)"), ("H", "H = δ*/θ"), ("dstar", "δ*/c"), ("n", "Ñ (рост возмущений)")]
+        found = False
+        for i, p in enumerate(self.polars):
+            k = np.where(np.isclose(p.alpha, a))[0]
+            if not p.bl or len(k) == 0:
+                continue
+            found = True
+            side = p.bl[k[0]]
+            c = COLORS[i % len(COLORS)]
+            for ax, (key, title) in zip(axs.ravel(), labels):
+                for nm, ls in (("upper", "-"), ("lower", "--")):
+                    d = side[nm]
+                    ax.plot(d["x"], np.real(d[key]), ls, color=c, lw=1.2,
+                            label=(p.label + (", верх" if nm == "upper" else ", низ")) if key == "cf" else None)
+                if key in ("H", "dstar"):
+                    d = side["wake"]
+                    ax.plot(d["x"], np.real(d[key]), ":", color=c, lw=1.0)
+                ax.set_title(title, fontsize=9)
+                ax.grid(alpha=0.3)
+            if p.xtr_u is not None:
+                for ax in axs.ravel():
+                    ax.axvline(p.xtr_u[k[0]], color=c, lw=0.6, ls="-", alpha=0.5)
+                    ax.axvline(p.xtr_l[k[0]], color=c, lw=0.6, ls="--", alpha=0.5)
+        if not found:
+            axs[0, 0].text(0.5, 0.5, "Распределения пограничного слоя\nдаёт вязкий метод",
+                           ha="center", va="center", transform=axs[0, 0].transAxes, color="#777")
+        else:
+            axs[0, 0].legend(fontsize=7)
+            axs[0, 0].axhline(0, color="#999", lw=0.6)
+            axs[0, 1].set_ylim(1, min(8, axs[0, 1].get_ylim()[1]))
+            axs[1, 1].axhline(9, color="#999", lw=0.6)
+        for ax in axs[1]:
+            ax.set_xlabel("x/c (вертикали — точки перехода; пунктир — низ; точки — след)")
+        fig.suptitle(f"α = {a:g}°", fontsize=10)
+        self.t_bl.draw()
 
     def clear(self):
         self.polars.clear()
@@ -381,7 +459,7 @@ class App(tk.Tk):
         d = filedialog.askdirectory(title="Папка для графиков")
         if d:
             for name, t in [("profile", self.t_geo), ("cl_alpha", self.t_cl), ("cd", self.t_cd),
-                            ("cm_alpha", self.t_cm), ("cp", self.t_cp)]:
+                            ("cm_alpha", self.t_cm), ("cp", self.t_cp), ("boundary_layer", self.t_bl)]:
                 t.fig.savefig(os.path.join(d, f"{name}.png"), dpi=150)
             self.status.set(f"Графики сохранены в {d}")
 
