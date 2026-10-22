@@ -357,9 +357,14 @@ class ViscousSolver:
         hmax_l, hmax_t = 3.8, 2.5
         TH, M, N_, S_, U = 6, 7, 8, 9, 10           # индексы станции b
 
-        def solve_b(fint, v, hmax):
+        def solve_b(fint, v, xtr_f=None, xcb=None):
             vd, ok = self._local_newton(fint, v, [TH, M, N_, S_])
             hk = vd[M] / vd[U] / vd[TH]
+            if xtr_f is None:
+                hmax = hmax_t                      # след
+            else:
+                turb = vd[N_] >= self.ncrit or xcb >= xtr_f
+                hmax = hmax_t if turb else hmax_l
             if ok and 1.0 < hk <= hmax:
                 return vd
             eq = lambda Vm, hm=hmax: Vm[M] / Vm[U] / Vm[TH] - hm
@@ -381,8 +386,7 @@ class ViscousSolver:
                 guess[2] = max(X[a, 2], X0[b, 2]) if X[a, 2] < self.ncrit else X[a, 2]
                 guess[1] = ue[b] * (X[a, 1] / ue[a])
                 v = np.concatenate([X[a], [ue[a], self.xi[a]], guess, [ue[b], self.xi[b]]])
-                turb_b = guess[2] >= self.ncrit or self.xc[b] >= xtr_f
-                v = solve_b(fint, v, hmax_t if turb_b else hmax_l)
+                v = solve_b(fint, v, xtr_f, self.xc[b])
                 X[b] = v[TH:TH + 4]
                 ue[b] = v[U]
         # след
@@ -399,7 +403,7 @@ class ViscousSolver:
             guess = X[a].copy()
             guess[1] = ue[b] * X[a, 1] / ue[a]
             v = np.concatenate([X[a], [ue[a], self.xi[a]], guess, [ue[b], self.xi[b]]])
-            v = solve_b(fint, v, hmax_t)
+            v = solve_b(fint, v)
             X[b] = v[TH:TH + 4]
             ue[b] = v[U]
         self._ue_march = ue
@@ -640,8 +644,8 @@ class ViscousSolver:
         g_inv = self.ps.gamma(alpha)
         self._g_cur = None
         self._build(alpha, g_inv)
-        if init is not None and init[0] == (self.k, self.Ns):
-            X = init[1].copy()
+        if init is not None:
+            X = self._from_state(init)
         else:
             X = self._march()
         X = self._relocate(X, alpha, g_inv)
@@ -711,6 +715,28 @@ class ViscousSolver:
                 converged = True
                 break
         return self._result(alpha, X, converged, it, g_inv)
+
+    def _to_state(self, X):
+        """Состояние по узлам профиля и следу (не зависит от точки торможения)."""
+        Xnode = np.full((self.N + 1, 4), np.nan)
+        Xnode[self.node[:self.nu + self.nl]] = X[:self.nu + self.nl]
+        return dict(node=Xnode, wake=X[self.st_wk].copy())
+
+    def _from_state(self, state):
+        Xn = state["node"]
+        X = np.zeros((self.Ns, 4))
+        X[:self.nu + self.nl] = Xn[self.node[:self.nu + self.nl]]
+        nw = min(len(state["wake"]), self.nw)
+        X[self.st_wk[:nw]] = state["wake"][:nw]
+        # узлы, которых не было в слое (точка торможения сместилась): копия соседа
+        for st in list(self.st_up) + list(self.st_lo):
+            if not np.all(np.isfinite(X[st])):
+                nb = st + 1 if st in (self.st_up[0], self.st_lo[0]) else st - 1
+                X[st] = X[nb] if np.all(np.isfinite(X[nb])) else X[st + 1]
+        bad = ~np.all(np.isfinite(X), axis=1)
+        if bad.any():
+            X[bad] = self._initial()[bad]
+        return X
 
     def _relocate(self, X, alpha, g_inv):
         """Перенос точки торможения по текущему вязкому γ. Возвращает X
@@ -806,27 +832,42 @@ class ViscousSolver:
         side["wake_xy"] = (self.wx, self.wy)
         res = ViscousResult(alpha, self.re, float(cl), float(cd), float(cdf), float(cd - cdf),
                             float(cm), xtr[0], xtr[1], converged, it, x, y, cp, 1 - g_inv**2,
-                            g, side, ((self.k, self.Ns), X))
+                            g, side, self._to_state(X))
         return res
 
-    def polar(self, alphas, verbose=False):
-        """Расчёт по углам с продолжением: начинается от ближайшего к нулю угла."""
+    def polar(self, alphas, verbose=False, callback=None):
+        """Поляра с продолжением по углу атаки: от ближайшего к нулю угла вверх и
+        вниз, каждая точка стартует с решения соседней. Несошедшаяся точка
+        повторяется с маршевого начального приближения; при неудаче следующая
+        точка продолжает от последней сошедшейся."""
         alphas = np.asarray(alphas, float)
-        order = np.argsort(np.abs(alphas))
         out = [None] * len(alphas)
-        # две ветки: вверх и вниз от минимального |α|
-        a0 = order[0]
+        a0 = int(np.argmin(np.abs(alphas)))
         res0 = self.solve(alphas[a0], verbose=verbose)
         out[a0] = res0
+        done = 1
+        if callback:
+            callback(done, len(alphas), res0)
         for direction in (1, -1):
-            init = res0.state if res0.converged else None
-            idx = [i for i in np.argsort(alphas * direction) if direction * (alphas[i] - alphas[a0]) > 0]
+            last_ok = res0 if res0.converged else None
+            idx = [i for i in np.argsort(alphas * direction)
+                   if direction * (alphas[i] - alphas[a0]) > 0]
             for i in idx:
-                r = self.solve(alphas[i], init=init, verbose=verbose)
-                if not r.converged and init is not None:
+                r = self.solve(alphas[i], init=last_ok.state if last_ok else None, verbose=verbose)
+                if not r.converged and last_ok is not None:
+                    # половинный шаг по углу
+                    am = 0.5 * (alphas[i] + last_ok.alpha)
+                    rm = self.solve(am, init=last_ok.state, verbose=verbose)
+                    if rm.converged:
+                        r = self.solve(alphas[i], init=rm.state, verbose=verbose)
+                if not r.converged:
                     r2 = self.solve(alphas[i], init=None, verbose=verbose)
                     if r2.converged:
                         r = r2
                 out[i] = r
-                init = r.state if r.converged else init
+                if r.converged:
+                    last_ok = r
+                done += 1
+                if callback:
+                    callback(done, len(alphas), r)
         return out
