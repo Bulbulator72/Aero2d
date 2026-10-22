@@ -172,7 +172,7 @@ def station(th, ds, ue, s, re, msq, turb, wake):
     de = de_thick(hk, th, ds)
     ax = dampl(hk, th, rt)
     return dict(h=h, hk=hk, rt=rt, hs=hs, hc=hc, cf=cf, us=us, cq=cq, di=di, de=de, ax=ax,
-                th=th, ds=ds, ue=ue, s=s)
+                th=th, ds=ds, ue=ue, s=s, msq=msq, re=re)
 
 
 def s_transition(hk, cq):

@@ -359,6 +359,8 @@ class ViscousSolver:
 
         def solve_b(fint, v, xtr_f=None, xcb=None):
             vd, ok = self._local_newton(fint, v, [TH, M, N_, S_])
+            if not np.all(np.isfinite(vd)):
+                vd, ok = v.copy(), False
             hk = vd[M] / vd[U] / vd[TH]
             if xtr_f is None:
                 hmax = hmax_t                      # след
@@ -371,7 +373,9 @@ class ViscousSolver:
             v = v.copy()
             v[M] = hmax * v[TH] * v[U]
             vi, ok2 = self._local_newton(fint, v, [TH, M, N_, S_, U], extra_eq=eq)
-            return vi if ok2 else vd
+            if ok2 and np.all(np.isfinite(vi)) and vi[TH] > 0 and vi[U] > 0:
+                return vi
+            return vd if np.all(np.isfinite(vd)) and vd[TH] > 0 else v
 
         for side, st in (("u", self.st_up), ("l", self.st_lo)):
             xtr_f = self.xtr[0] if side == "u" else self.xtr[1]
@@ -424,8 +428,8 @@ class ViscousSolver:
             turb = self._turb_flags(X)
         th, m, s = X[:, 0], X[:, 1], X[:, 3]
         ds = m / ue
-        msq = self.mach**2 + 0 * th
-        return bc.station(th, ds, ue, s, self.re, msq, turb, self.is_wake)
+        uc, msq, ree = self._edge(ue)
+        return bc.station(th, ds, uc, s, ree, msq, turb, self.is_wake)
 
     def _segment(self, A, B, xa, xb, wake, turb):
         """Невязки импульса и формпараметра на отрезке a→b (массивы станций A, B —
@@ -435,11 +439,11 @@ class ViscousSolver:
         xlog = np.log(xb / xa)
         hlog = np.log(B["hs"] / A["hs"])
         ha = 0.5 * (A["h"] + B["h"])
-        msq = self.mach**2
+        msq = 0.5 * (A["msq"] + B["msq"])
         # Cf в середине отрезка
         thm, dsm, uem = 0.5 * (A["th"] + B["th"]), 0.5 * (A["ds"] + B["ds"]), 0.5 * (A["ue"] + B["ue"])
-        mid = bc.station(thm, dsm, uem, 0.5 * (A["s"] + B["s"]), self.re, msq + 0 * thm,
-                         turb, wake)
+        mid = bc.station(thm, dsm, uem, 0.5 * (A["s"] + B["s"]), 0.5 * (A["re"] + B["re"]),
+                         msq + 0 * thm, turb, wake)
         xa_t, xb_t = xa / A["th"], xb / B["th"]
         cfx = 0.5 * mid["cf"] * (0.5 * (xa + xb)) / thm + 0.25 * (A["cf"] * xa_t + B["cf"] * xb_t)
         rez_t = tlog + (ha + 2.0 - msq) * ulog - xlog * 0.5 * cfx
@@ -482,13 +486,18 @@ class ViscousSolver:
         """Невязки для набора отрезков. V: (12, n) — [θ,m,Ñ,S,ue,ξ] в начале и
         конце. ξ — тоже вход: от него зависят все невязки, а сама ξ зависит от
         положения точки торможения. Возвращает (4, n)."""
-        th1, m1, n1, s1, u1, xa, th2, m2, n2, s2, u2, xb = V
+        th1, m1, n1, s1, u1i, xa, th2, m2, n2, s2, u2i, xb = V
         nc = self.ncrit
-        msq = self.mach**2 + 0 * th1
+        d1, d2 = m1 / u1i, m2 / u2i                       # δ* = m / Ue (несжимаемая)
+        u1, msq1, re1 = self._edge(u1i)
+        u2, msq2, re2 = self._edge(u2i)
+        m1, m2 = u1 * d1, u2 * d2                         # дальше — со сжимаемой Ue
+        msq = 0.5 * (msq1 + msq2)
+        self._re_seg = 0.5 * (re1 + re2)
         n1r, n2r = np.real(n1), np.real(n2)
         F = np.zeros(1, bool)
-        A_l = bc.station(th1, m1 / u1, u1, s1, self.re, msq, F, wake)
-        B_l = bc.station(th2, m2 / u2, u2, s2, self.re, msq, F, wake)
+        A_l = bc.station(th1, m1 / u1, u1, s1, re1, msq1, F, wake)
+        B_l = bc.station(th2, m2 / u2, u2, s2, re2, msq2, F, wake)
         # тип отрезка (по вещественным частям). Переходный — если ламинарная
         # экстраполяция Ñ на конец отрезка достигает Ñкрит; решение не зависит
         # от неизвестной Ñ₂, поэтому области «ламинарный»/«переходный» не
@@ -498,8 +507,8 @@ class ViscousSolver:
         turb_start = wake | (n1r >= nc) | ((xca >= xtr_f) & ~wake)
         lam_end = ~turb_start & ~forced & (phi1 < nc)
         trans = ~lam_end & ~turb_start
-        A_t = bc.station(th1, m1 / u1, u1, s1, self.re, msq, ~F, wake)
-        B_t = bc.station(th2, m2 / u2, u2, s2, self.re, msq, ~F, wake)
+        A_t = bc.station(th1, m1 / u1, u1, s1, re1, msq1, ~F, wake)
+        B_t = bc.station(th2, m2 / u2, u2, s2, re2, msq2, ~F, wake)
         # --- ламинарный отрезок
         rt_l, rh_l, _ = self._segment(A_l, B_l, xa, xb, wake, F)
         ra_l = n2 - n1 - 0.5 * (A_l["ax"] + B_l["ax"]) * (xb - xa)
@@ -524,10 +533,11 @@ class ViscousSolver:
         dst = m1 / u1 + ft * (m2 / u2 - m1 / u1)
         uet = u1 + ft * (u2 - u1)
         xt = xa + ft * (xb - xa)
-        T_l = bc.station(tht, dst, uet, s1, self.re, msq, F, wake)
-        T_t0 = bc.station(tht, dst, uet, s1, self.re, msq, ~F, wake)
+        ret = re1 + ft * (re2 - re1)
+        T_l = bc.station(tht, dst, uet, s1, ret, msq, F, wake)
+        T_t0 = bc.station(tht, dst, uet, s1, ret, msq, ~F, wake)
         st_tr = bc.s_transition(T_t0["hk"], T_t0["cq"])
-        T_t = bc.station(tht, dst, uet, st_tr, self.re, msq, ~F, wake)
+        T_t = bc.station(tht, dst, uet, st_tr, ret, msq, ~F, wake)
         r1t, r1h, _ = self._segment(A_l, T_l, xa, xt, wake, F)
         r2t, r2h, r2c = self._segment(T_t, B_t, xt, xb, wake, ~F)
         # Ñ: при естественном переходе — до точки перехода (по ней же и Ñ = Ñкрит),
@@ -550,10 +560,10 @@ class ViscousSolver:
 
     def _sim_res(self, V):
         """Первая станция у точки торможения (автомодельное решение)."""
-        th, m, n, s, ue, xi = V
-        msq = self.mach**2 + 0 * th
+        th, m, n, s, uei, xi = V
         F = np.zeros(1, bool)
-        st = bc.station(th, m / ue, ue, s, self.re, msq, F, F)
+        ue, msq, ree = self._edge(uei)
+        st = bc.station(th, m / uei, ue, s, ree, msq, F, F)
         xot = xi / st["th"]
         r0 = st["h"] + 2.0 - msq - 0.5 * st["cf"] * xot
         btmp = 2.0 * st["hc"] / st["hs"] + 1.0 - st["h"]
@@ -571,6 +581,29 @@ class ViscousSolver:
         return np.array([r0, r1, r2, r3])
 
     # ------------------------------------------------------------------
+    def _edge(self, u):
+        """Сжимаемость (как в XFOIL): несжимаемая Ue панельного метода →
+        сжимаемая по Карману–Цяню; местный Me², отношение ρ/μ на границе слоя
+        (изоэнтропия + Сазерленд). Возвращает (ue_c, Me², Re_eff)."""
+        M = self.mach
+        if M <= 0:
+            return u, 0.0 * u, self.re + 0.0 * u
+        g = 1.4
+        b = np.sqrt(1 - M**2)
+        tk = M**2 / (1 + b) ** 2
+        uc = u * (1 - tk) / (1 - tk * u**2)
+        hst = (g - 1) * M**2 / (1 + 0.5 * (g - 1) * M**2)
+        tr = 1 - 0.5 * uc**2 * hst                      # T_e / T_0 (в единицах T0 через q∞=1)
+        msq = uc**2 * hst / ((g - 1) * tr)
+        rho = tr ** (1 / (g - 1))
+        hv = 0.35                                       # Сазерленд: S/T0
+        mu = np.sqrt(tr) ** 3 * (1 + hv) / (tr + hv)
+        # нормировка на набегающий поток
+        tinf = 1 - 0.5 * hst
+        rinf = tinf ** (1 / (g - 1))
+        muinf = np.sqrt(tinf) ** 3 * (1 + hv) / (tinf + hv)
+        return uc, msq, self.re * (rho / rinf) / (mu / muinf)
+
     def _assemble(self, X, jac=True):
         """Невязка R (Ns,4) и якобиан J (4Ns x 4Ns) с учётом Ue = Ue_inv + D m
         и зависимости ξ от положения точки торможения (тоже функция m).
@@ -728,12 +761,15 @@ class ViscousSolver:
         X[:self.nu + self.nl] = Xn[self.node[:self.nu + self.nl]]
         nw = min(len(state["wake"]), self.nw)
         X[self.st_wk[:nw]] = state["wake"][:nw]
-        # узлы, которых не было в слое (точка торможения сместилась): копия соседа
-        for st in list(self.st_up) + list(self.st_lo):
-            if not np.all(np.isfinite(X[st])):
-                nb = st + 1 if st in (self.st_up[0], self.st_lo[0]) else st - 1
-                X[st] = X[nb] if np.all(np.isfinite(X[nb])) else X[st + 1]
-        bad = ~np.all(np.isfinite(X), axis=1)
+        # узлы, которых не было в слое (точка торможения сместилась): ближайший
+        # сосед по той же стороне (от торможения — вниз по потоку)
+        for side in (self.st_up, self.st_lo):
+            ok = np.all(np.isfinite(X[side]), axis=1) & (X[side, 0] > 0)
+            if ok.any() and not ok.all():
+                idx = np.where(ok)[0]
+                for j in np.where(~ok)[0]:
+                    X[side[j]] = X[side[idx[np.argmin(np.abs(idx - j))]]]
+        bad = ~np.all(np.isfinite(X), axis=1) | (X[:, 0] <= 0)
         if bad.any():
             X[bad] = self._initial()[bad]
         return X
@@ -743,7 +779,10 @@ class ViscousSolver:
         (возможно, на новой системе станций)."""
         for _ in range(6):
             g = g_inv + self.dg_dm @ X[:, 1]
-            k, s_st, up, lo = self._topology(g)
+            try:
+                k, s_st, up, lo = self._topology(g)
+            except RuntimeError:
+                return X
             if (k, len(up), len(lo)) != self.sig:
                 if getattr(self, "verbose_remap", False):
                     print(f"      remap {self.sig} -> {(k, len(up), len(lo))}")
@@ -761,21 +800,10 @@ class ViscousSolver:
 
     def _remap(self, X, g, alpha, g_inv):
         """Точка торможения перешла через узел: перестроить станции."""
-        old_node, old_wk = self.node.copy(), self.st_wk.copy()
-        Xnode = np.zeros((self.N + 1, 4))
-        Xnode[old_node[old_node >= 0]] = X[:self.nu + self.nl]
-        Xw = X[old_wk]
+        state = self._to_state(X)
         self._g_cur = g
         self._build(alpha, g_inv)
-        Xn = np.zeros((self.Ns, 4))
-        Xn[:self.nu + self.nl] = Xnode[self.node[:self.nu + self.nl]]
-        for st in (self.st_up[0], self.st_lo[0]):
-            if Xn[st, 0] <= 0:                        # узел только что вошёл в слой
-                nb = st + 1 if st == self.st_up[0] else st + 1
-                Xn[st] = Xn[nb] if nb < self.Ns else Xn[st]
-                Xn[st, 1] *= 0.5
-        Xn[self.st_wk] = Xw
-        return Xn
+        return self._from_state(state)
 
     def _result(self, alpha, X, converged, it, g_inv):
         Ns = self.Ns
@@ -797,7 +825,8 @@ class ViscousSolver:
         st = self._stations(X, ue)
         last = self.st_wk[-1]
         h_end = np.real(st["h"][last])
-        cd = 2.0 * X[last, 0] * ue[last] ** ((h_end + 5.0) / 2.0)
+        ue_end = np.real(self._edge(ue[last])[0])          # сжимаемая скорость в конце следа
+        cd = 2.0 * X[last, 0] * ue_end ** ((h_end + 5.0) / 2.0)
         # трение
         cf = np.real(st["cf"])
         tau = cf * ue**2                       # τ_w / q∞ = Cf (Ue/V∞)²
