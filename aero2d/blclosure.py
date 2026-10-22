@@ -121,9 +121,16 @@ def de_thick(hk, th, ds):
     return _min(de, 12.0 * th)
 
 
-def dit(cf, us, s, rt, hs, wake):
-    """2 C_D / H* (турбулентный): стенка + внешняя часть + ламинарная добавка."""
-    di = _where(wake, 0.0 * cf, 0.5 * cf * us * 2.0 / hs)
+def dit(cf, us, s, rt, hs, wake, hk=None):
+    """2 C_D / H* (турбулентный): стенка (с поправкой DFAC при малых Hk, как в
+    XFOIL) + внешняя часть + ламинарная добавка."""
+    di_w = 0.5 * cf * us * 2.0 / hs
+    if hk is not None:
+        grt = np.log(rt)
+        hmin = 1.0 + 2.1 / grt
+        dfac = 0.5 + 0.5 * np.tanh((hk - 1.0) / (hmin - 1.0))
+        di_w = di_w * dfac
+    di = _where(wake, 0.0 * cf, di_w)
     di = di + s**2 * (0.995 - us) * 2.0 / hs
     di = di + 0.15 * (0.995 - us) ** 2 / rt * 2.0 / hs
     return _where(wake, 2.0 * di, di)
@@ -161,13 +168,13 @@ def station(th, ds, ue, s, re, msq, turb, wake):
     hs = _where(turb, hs_t, hs_l)
     hc = hct(hk, msq)
     cf_l = cfl(hk, rt)
-    cf_t = cft(hk, rt, msq)
+    cf_t = _max(cft(hk, rt, msq), cf_l)          # как в XFOIL: не меньше ламинарного
     cf = _where(wake, 0.0 * cf_t, _where(turb, cf_t, cf_l))
     us = us_factor(hs, hk, h, wake)
     cq = cq_eq(hs, hk, h, us, rt, wake)
     di_l = _where(wake, dilw(hk, rt, hs), dil(hk, rt))
-    di_t = dit(cf_t, us, s, rt, hs, wake)
-    di_t = _max(di_t, _where(wake, 0 * di_t, dil(hk, rt)))
+    di_t = dit(cft(hk, rt, msq), us, s, rt, hs, wake, hk)
+    di_t = _max(di_t, _where(wake, dilw(hk, rt, hs), dil(hk, rt)))
     di = _where(turb, di_t, di_l)
     de = de_thick(hk, th, ds)
     ax = dampl(hk, th, rt)

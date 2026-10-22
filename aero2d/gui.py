@@ -397,7 +397,8 @@ class App(tk.Tk):
             self.t_bl.draw()
             return
         axs = fig.subplots(2, 2, sharex=True)
-        labels = [("cf", "Cf (по местной Ue)"), ("H", "H = δ*/θ"), ("dstar", "δ*/c"), ("n", "Ñ (рост возмущений)")]
+        labels = [("cf_inf", "τ стенки / q∞ (трение)"), ("H", "H = δ*/θ"), ("dstar", "δ*/c"),
+                  ("n", "Ñ (рост возмущений)")]
         found = False
         for i, p in enumerate(self.polars):
             k = np.where(np.isclose(p.alpha, a))[0]
@@ -410,7 +411,7 @@ class App(tk.Tk):
                 for nm, ls in (("upper", "-"), ("lower", "--")):
                     d = side[nm]
                     ax.plot(d["x"], np.real(d[key]), ls, color=c, lw=1.2,
-                            label=(p.label + (", верх" if nm == "upper" else ", низ")) if key == "cf" else None)
+                            label=(p.label + (", верх" if nm == "upper" else ", низ")) if key == "cf_inf" else None)
                 if key in ("H", "dstar"):
                     d = side["wake"]
                     ax.plot(d["x"], np.real(d[key]), ":", color=c, lw=1.0)

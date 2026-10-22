@@ -59,7 +59,8 @@ class ViscousSolver:
                  xtr=(1.0, 1.0), wake_length: float = 1.0, n_wake: int | None = None,
                  n_panels: int = 160):
         from .geometry import repanel
-        airfoil = repanel(airfoil, n_panels // 2 + 1, spacing="viscous")
+        if n_panels:
+            airfoil = repanel(airfoil, n_panels // 2 + 1, spacing="viscous")
         self.ps = PanelSolver(airfoil)
         self.af = airfoil
         self.re = float(re)
@@ -96,7 +97,9 @@ class ViscousSolver:
         d = t1 / np.linalg.norm(t1) + t2 / np.linalg.norm(t2)
         d /= np.linalg.norm(d)
         a = np.radians(self._alpha)
-        pts = [np.array([x[0], y[0]])]
+        # первая точка следа — на 1e-4 хорды за кромкой (как в XFOIL): слой
+        # источников следа не касается узлов профиля
+        pts = [np.array([x[0], y[0]]) + getattr(self, "wake_offset", 0.0) * d]
         for j in range(n - 1):
             p = pts[-1]
             if j == 0:
@@ -138,6 +141,78 @@ class ViscousSolver:
         elif f > (0.85 if was_lo else 0.95):
             lo = lo[1:]
         return k, s_st, up, lo
+
+    def _influence_const(self, S):
+        """Постоянные по панелям источники (первоначальная схема)."""
+        N, Ns = self.N, self.Ns
+        x, y, wx, wy = self.x, self.y, self.wx, self.wy
+        nw, npw = len(wx), len(wx) - 1
+        Lw = np.hypot(np.diff(wx), np.diff(wy))
+        if self._wake_cache is None:
+            Bpsi_w, _, _ = source_influence(wx, wy, x[:-1], y[:-1])
+            pairs = [(j, j - 1 if j > 0 else None, j if j < npw else None) for j in range(1, nw)]
+            _, Ua, Va = source_influence(x, y, wx[1:], wy[1:])
+            pairs_local = [(j - 1, a, b) for (j, a, b) in pairs]
+            _, Uw, Vw = source_influence(wx, wy, wx[1:], wy[1:], self_pairs=pairs_local)
+            Uv, Vv = vortex_velocity_influence(x, y, wx[1:], wy[1:])
+            tw = self._wake_tangent(wx, wy)
+            self._wake_cache = (Bpsi_w, Ua, Va, Uw, Vw, Uv, Vv, tw)
+        Bpsi_w, Ua, Va, Uw, Vw, Uv, Vv, tw = self._wake_cache
+        Bpsi = np.hstack([self.Bpsi_air, Bpsi_w])
+        dg_dm = (-self.ps.Ainv[:N + 1, :N] @ Bpsi) @ S
+        D = np.zeros((Ns, Ns))
+        nb = self.nu + self.nl
+        D[:nb] = (self.sg_node[self.node[:nb]])[:, None] * dg_dm[self.node[:nb]]
+        Uall = np.hstack([Ua, Uw]) @ S + Uv @ dg_dm
+        Vall = np.hstack([Va, Vw]) @ S + Vv @ dg_dm
+        D[self.st_wk[1:]] = tw[1:, 0:1] * Uall + tw[1:, 1:2] * Vall
+        D[self.st_wk[0]] = 0.5 * (D[self.st_up[-1]] + D[self.st_lo[-1]])
+        return D, dg_dm, tw, Uv, Vv
+
+    @staticmethod
+    def _wake_tangent(wx, wy):
+        Lw = np.hypot(np.diff(wx), np.diff(wy))
+        dw = np.column_stack([np.diff(wx), np.diff(wy)]) / Lw[:, None]
+        tw = np.zeros((len(wx), 2))
+        tw[0], tw[-1] = dw[0], dw[-1]
+        tw[1:-1] = dw[:-1] + dw[1:]
+        return tw / np.linalg.norm(tw, axis=1, keepdims=True)
+
+    def _influence_linear(self, S, sgm, st_of_node):
+        """Источники с линейным распределением на полупанелях (как в XFOIL):
+        «масса» q в узлах, σ = dq/ds; на профиле q = ±m (знак — по стороне),
+        в следе q = m."""
+        from .sources import lin_source
+        N, Ns = self.N, self.Ns
+        x, y, wx, wy = self.x, self.y, self.wx, self.wy
+        nw = len(wx)
+        if self._wake_cache is None:
+            if not hasattr(self, "_air_psi"):
+                self._air_psi = lin_source(x, y, x[:-1], y[:-1], self_idx=np.arange(N),
+                                           on_sheet=True)[0]
+            Pw, _, _ = lin_source(wx, wy, x[:-1], y[:-1], wake_sheet=True)
+            _, Pxa, Pya = lin_source(x, y, wx[1:], wy[1:])
+            _, Pxw, Pyw = lin_source(wx, wy, wx[1:], wy[1:], self_idx=np.arange(1, nw),
+                                     on_sheet=True, wake_sheet=True)
+            Uv, Vv = vortex_velocity_influence(x, y, wx[1:], wy[1:])
+            tw = self._wake_tangent(wx, wy)
+            self._wake_cache = (Pw, Pxa, Pya, Pxw, Pyw, Uv, Vv, tw)
+        Pw, Pxa, Pya, Pxw, Pyw, Uv, Vv, tw = self._wake_cache
+        Qa = np.zeros((N + 1, Ns))
+        nodes = np.where(st_of_node >= 0)[0]
+        Qa[nodes, st_of_node[nodes]] = sgm[nodes]
+        Qw = np.zeros((nw, Ns))
+        Qw[np.arange(nw), self.st_wk] = 1.0
+        dpsi_dm = self._air_psi @ Qa + Pw @ Qw                 # N x Ns
+        dg_dm = -self.ps.Ainv[:N + 1, :N] @ dpsi_dm
+        D = np.zeros((Ns, Ns))
+        nb = self.nu + self.nl
+        D[:nb] = (self.sg_node[self.node[:nb]])[:, None] * dg_dm[self.node[:nb]]
+        Uall = Pya @ Qa + Pyw @ Qw + Uv @ dg_dm
+        Vall = -(Pxa @ Qa + Pxw @ Qw) + Vv @ dg_dm
+        D[self.st_wk[1:]] = tw[1:, 0:1] * Uall + tw[1:, 1:2] * Vall
+        D[self.st_wk[0]] = 0.5 * (D[self.st_up[-1]] + D[self.st_lo[-1]])
+        return D, dg_dm, tw, Uv, Vv
 
     def _build(self, alpha, g_inv):
         """Всё, что зависит от α и топологии: след, станции, ue_inv, D."""
@@ -193,36 +268,11 @@ class ViscousSolver:
         for j in range(npw):
             S[npa + j, self.st_wk[j + 1]] += 1.0 / Lw[j]
             S[npa + j, self.st_wk[j]] -= 1.0 / Lw[j]
-        # функция тока источников следа в узлах профиля
-        if self._wake_cache is None:
-            Bpsi_w, _, _ = source_influence(wx, wy, x[:-1], y[:-1])
-            pairs = [(j, j - 1 if j > 0 else None, j if j < npw else None) for j in range(1, nw)]
-            # скорости в узлах следа (кроме нулевого) от всех источников и вихрей
-            _, Ua, Va = source_influence(x, y, wx[1:], wy[1:])
-            pairs_local = [(j - 1, a, b) for (j, a, b) in pairs]
-            _, Uw, Vw = source_influence(wx, wy, wx[1:], wy[1:], self_pairs=pairs_local)
-            Uv, Vv = vortex_velocity_influence(x, y, wx[1:], wy[1:])
-            # касательная следа в узлах
-            tw = np.zeros((nw, 2))
-            dw = np.column_stack([np.diff(wx), np.diff(wy)]) / Lw[:, None]
-            tw[0] = dw[0]
-            tw[-1] = dw[-1]
-            tw[1:-1] = dw[:-1] + dw[1:]
-            tw /= np.linalg.norm(tw, axis=1, keepdims=True)
-            self._wake_cache = (Bpsi_w, Ua, Va, Uw, Vw, Uv, Vv, tw)
-        Bpsi_w, Ua, Va, Uw, Vw, Uv, Vv, tw = self._wake_cache
-        Bpsi = np.hstack([self.Bpsi_air, Bpsi_w])            # N x (npa+npw)
-        Ainv = self.ps.Ainv
-        dg_dsig = -Ainv[:N + 1, :N] @ Bpsi                    # (N+1) x npanels
-        dg_dm = dg_dsig @ S                                   # (N+1) x Ns
+        if getattr(self, "source_model", "linear") == "linear":
+            D, dg_dm, tw, Uv, Vv = self._influence_linear(S, sgm, st_of_node)
+        else:
+            D, dg_dm, tw, Uv, Vv = self._influence_const(S)
         self.dg_dm = dg_dm
-        D = np.zeros((Ns, Ns))
-        D[:nu + nl] = (sg_node[node[:nu + nl]])[:, None] * dg_dm[node[:nu + nl]]
-        # след: скорость от вихрей (через dγ) и от всех источников
-        Uall = np.hstack([Ua, Uw]) @ S + Uv @ dg_dm
-        Vall = np.hstack([Va, Vw]) @ S + Vv @ dg_dm
-        D[self.st_wk[1:]] = tw[1:, 0:1] * Uall + tw[1:, 1:2] * Vall
-        D[self.st_wk[0]] = 0.5 * (D[self.st_up[-1]] + D[self.st_lo[-1]])
         self.D = D * getattr(self, "couple", 1.0)
         # невязкая скорость на станциях
         a = np.radians(alpha)
@@ -462,10 +512,12 @@ class ViscousSolver:
         xa_t, xb_t = xa / A["th"], xb / B["th"]
         cfx = 0.5 * mid["cf"] * (0.5 * (xa + xb)) / thm + 0.25 * (A["cf"] * xa_t + B["cf"] * xb_t)
         rez_t = tlog + (ha + 2.0 - msq) * ulog - xlog * 0.5 * cfx
-        # формпараметр с противопоточным весом
-        hl = np.log(B["hk"] / A["hk"])
+        # формпараметр с противопоточным весом (как BLDIF в XFOIL: по изменению
+        # ln(Hk − 1); в следе — слабее)
+        hl = np.log((B["hk"] - 1.0) / (A["hk"] - 1.0))
         hlsq = bc._min(hl**2, 15.0 + 0 * hl)
-        upw = 1.0 - 0.5 * np.exp(-hlsq * 5.0 / B["hk"] ** 2)
+        hdcon = np.where(wake, 1.0, 5.0) / B["hk"] ** 2
+        upw = 1.0 - 0.5 * np.exp(-hlsq * hdcon)
         dix = (1 - upw) * A["di"] * xa_t + upw * B["di"] * xb_t
         cfx2 = (1 - upw) * A["cf"] * xa_t + upw * B["cf"] * xb_t
         hsa, hca = 0.5 * (A["hs"] + B["hs"]), 0.5 * (A["hc"] + B["hc"])
@@ -688,7 +740,54 @@ class ViscousSolver:
 
     # ------------------------------------------------------------------
     def solve(self, alpha: float, init=None, max_iter: int = 60, tol: float = 1e-5,
-              verbose: bool = False) -> ViscousResult:
+              verbose: bool = False, homotopy: bool = True) -> ViscousResult:
+        """Решение для одного угла атаки. Если Ньютон не сошёлся при малом Re,
+        включается продолжение по числу Рейнольдса: решение при большем Re
+        (где отрывы слабее) и пошаговое уменьшение Re до заданного."""
+        r = self._solve(alpha, init, max_iter, tol, verbose)
+        if r.converged or not homotopy or self.re > 2e6:
+            return r
+        re_target = self.re
+        seq = []
+        re_k = re_target
+        while re_k < min(30 * re_target, 3e6):
+            re_k *= 2.0
+            seq.append(re_k)
+        seq = seq[::-1]
+        try:
+            best = None
+            for i, re_k in enumerate(seq):
+                self.re = re_k
+                start = self._scale_state(best.state, 2.0) if best else init
+                rk = self._solve(alpha, start, max_iter, tol, verbose)
+                if getattr(self, "verbose_homotopy", False):
+                    print(f"      Re={re_k:.3g}: {'ok' if rk.converged else 'нет'} it={rk.iterations} "
+                          f"Cl={rk.cl:.4f} Cd={rk.cd:.5f} xtr={rk.xtr_u:.3f}/{rk.xtr_l:.3f}")
+                if rk.converged:
+                    best = rk
+                elif best is None:
+                    continue
+                else:
+                    return r
+            if best is None:
+                return r
+            self.re = re_target
+            r2 = self._solve(alpha, self._scale_state(best.state, 2.0), max_iter, tol, verbose)
+            return r2 if r2.converged or not r.converged else r
+        finally:
+            self.re = re_target
+
+    @staticmethod
+    def _scale_state(state, re_ratio):
+        """Перенос состояния на Re/re_ratio: толщины растут примерно как Re^0.4."""
+        f = re_ratio ** 0.4
+        st = {k: v.copy() for k, v in state.items()}
+        for k in ("node", "wake"):
+            st[k][:, 0] *= f
+            st[k][:, 1] *= f
+        return st
+
+    def _solve(self, alpha, init, max_iter, tol, verbose) -> ViscousResult:
         g_inv = self.ps.gamma(alpha)
         self._g_cur = None
         self._build(alpha, g_inv)
@@ -873,8 +972,8 @@ class ViscousSolver:
         side = {}
         for name, sts in (("upper", self.st_up), ("lower", self.st_lo), ("wake", self.st_wk)):
             side[name] = dict(x=self.xc[sts], xi=self.xi[sts], theta=X[sts, 0], dstar=X[sts, 1] / ue[sts],
-                              H=np.real(st["h"][sts]), cf=cf[sts], ue=ue[sts], n=X[sts, 2],
-                              ctau=X[sts, 3] ** 2)
+                              H=np.real(st["h"][sts]), cf=cf[sts], cf_inf=cf[sts] * ue[sts] ** 2,
+                              ue=ue[sts], n=X[sts, 2], ctau=X[sts, 3] ** 2)
         side["wake_xy"] = (self.wx, self.wy)
         res = ViscousResult(alpha, self.re, float(cl), float(cd), float(cdf), float(cd - cdf),
                             float(cm), xtr[0], xtr[1], converged, it, x, y, cp, 1 - g_inv**2,
