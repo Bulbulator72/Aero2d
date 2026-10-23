@@ -79,14 +79,31 @@ def report(pts, title):
               f"      {np.median(rcd):+6.1%}          {np.median(np.abs(rcd)):5.1%}")
 
 
+def merge(rows, repl):
+    """Случаи из repl заменяют одноимённые (имя, Re) в rows."""
+    idx = {(r["name"], round(r["re"])): i for i, r in enumerate(rows)}
+    rows = list(rows)
+    for r in repl:
+        k = (r["name"], round(r["re"]))
+        if k in idx:
+            rows[idx[k]] = r
+    return rows
+
+
 def main():
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    repl_path = None
+    if "--replace" in sys.argv:
+        repl_path = sys.argv[sys.argv.index("--replace") + 1]
+    args = [a for a in sys.argv[1:] if not a.startswith("--") and a != repl_path]
     ncrit = None
     if "--ncrit" in sys.argv:
         ncrit = float(sys.argv[sys.argv.index("--ncrit") + 1])
         args = [a for a in args if a != str(sys.argv[sys.argv.index("--ncrit") + 1])]
     paths = args or [os.path.join(HERE, "uiuc_sweep.jsonl")]
     rows = load(paths, ncrit)
+    if repl_path:
+        rows = merge(rows, load([repl_path], ncrit))
+        print(f"с заменой случаев из {os.path.basename(repl_path)}")
     print(f"{len(rows)} поляр, {len({r['name'] for r in rows})} профилей")
     report(points(rows), "aero2d против эксперимента (до срыва)")
     if any("cl_xf" in r for r in rows):
