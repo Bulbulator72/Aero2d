@@ -152,6 +152,26 @@ class App(tk.Tk):
         self.cb_alpha_bl.pack(side="left")
         self.cb_alpha_bl.bind("<<ComboboxSelected>>", lambda _: (self.plot_cp(), self.plot_bl()))
         self.cb_alpha.bind("<<ComboboxSelected>>", lambda _: (self.plot_cp(), self.plot_bl()))
+        # поле течения
+        self.t_fl = PlotTab(nb, "Поле течения")
+        bar = ttk.Frame(self.t_fl.frame)
+        bar.pack(side="top", fill="x", before=self.t_fl.canvas.get_tk_widget())
+        ttk.Label(bar, text="  α, °: ").pack(side="left")
+        self.cb_alpha_fl = ttk.Combobox(bar, textvariable=self.cp_alpha, width=8, state="readonly")
+        self.cb_alpha_fl.pack(side="left")
+        ttk.Label(bar, text="   величина: ").pack(side="left")
+        self.fl_qty = tk.StringVar(value="Давление Cp")
+        ttk.Combobox(bar, textvariable=self.fl_qty, values=["Давление Cp", "Скорость |V|/V∞"],
+                     state="readonly", width=16).pack(side="left")
+        ttk.Label(bar, text="   область: ").pack(side="left")
+        from .field import REGIONS
+        self.fl_reg = tk.StringVar(value=list(REGIONS)[0])
+        ttk.Combobox(bar, textvariable=self.fl_reg, values=list(REGIONS), state="readonly",
+                     width=20).pack(side="left")
+        self.fl_lines = tk.BooleanVar(value=True)
+        ttk.Checkbutton(bar, text="линии тока", variable=self.fl_lines).pack(side="left", padx=6)
+        ttk.Button(bar, text="Построить", command=self.plot_field).pack(side="left", padx=6)
+        self._field_cache = {}
         # таблица
         tf = ttk.Frame(nb)
         nb.add(tf, text="Таблица")
@@ -282,6 +302,10 @@ class App(tk.Tk):
                 elif msg[0] == "done":
                     self._finish()
                     self.add_polar(msg[1])
+                elif msg[0] == "field":
+                    self._draw_field(*msg[1:])
+                elif msg[0] == "field_error":
+                    self.status.set("Поле течения: " + msg[1])
                 elif msg[0] == "error":
                     self._finish()
                     self.status.set("Ошибка расчёта")
@@ -310,6 +334,7 @@ class App(tk.Tk):
         alphas = sorted({f"{a:g}" for q in self.polars for a in q.alpha}, key=float)
         self.cb_alpha["values"] = alphas
         self.cb_alpha_bl["values"] = alphas
+        self.cb_alpha_fl["values"] = alphas
         if not self.cp_alpha.get() or self.cp_alpha.get() not in alphas:
             mid = p.alpha[np.argmin(np.abs(p.alpha - 4))]
             self.cp_alpha.set(f"{mid:g}")
@@ -434,10 +459,78 @@ class App(tk.Tk):
         fig.suptitle(f"α = {a:g}°", fontsize=10)
         self.t_bl.draw()
 
+    def plot_field(self):
+        """Поле течения для последнего расчёта, в котором есть выбранный α."""
+        try:
+            a = float(self.cp_alpha.get())
+        except ValueError:
+            messagebox.showinfo("Поле течения", "Сначала выполните расчёт и выберите α.")
+            return
+        cand = [p for p in self.polars if p.field_ctx is not None and np.isclose(p.alpha, a).any()]
+        if not cand:
+            messagebox.showinfo("Поле течения", "Поле строится для вязкого и невязкого (панельного) "
+                                "расчёта. Для метода Эйлера — в следующей версии.")
+            return
+        p = cand[-1]
+        k = int(np.where(np.isclose(p.alpha, a))[0][0])
+        from .field import REGIONS, compute_field
+        box = REGIONS[self.fl_reg.get()]
+        key = (id(p), k, self.fl_reg.get())
+        if key in self._field_cache:
+            self._draw_field(p.label, self._field_cache[key], key)
+            return
+        self.status.set(f"Поле течения: расчёт для α = {a:g}°…")
+
+        def job():
+            try:
+                f = compute_field(p.field_ctx, k, box)
+                self.q.put(("field", p.label, f, key))
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("field_error", str(e)))
+        threading.Thread(target=job, daemon=True).start()
+
+    def _draw_field(self, label, f, key):
+        self._field_cache[key] = f
+        fig = self.t_fl.fig
+        fig.clear()
+        ax = fig.add_subplot(111)
+        X, Y = f["X"], f["Y"]
+        if self.fl_qty.get().startswith("Давление"):
+            z, cmap, name = f["cp"], "RdBu_r", "Cp"
+            lo = max(np.nanpercentile(z, 1), -6.0)
+            levels = np.linspace(lo, 1.0, 41)
+        else:
+            z, cmap, name = f["speed"], "viridis", "|V| / V∞"
+            levels = np.linspace(np.nanpercentile(z, 0.5), min(np.nanpercentile(z, 99.5), 3.0), 41)
+        c = ax.contourf(X, Y, z, levels=levels, cmap=cmap, extend="both")
+        fig.colorbar(c, ax=ax, label=name, shrink=0.85)
+        if self.fl_lines.get():
+            ys = np.linspace(Y.min(), Y.max(), 34)
+            seeds = np.column_stack([np.full_like(ys, X.min() + 1e-3 * (X.max() - X.min())), ys])
+            U = np.nan_to_num(f["U"]); V = np.nan_to_num(f["V"])
+            ax.streamplot(X, Y, U, V, start_points=seeds, density=4, color="k", linewidth=0.55,
+                          arrowsize=0.5, broken_streamlines=False)
+        ax.fill(*f["body"], color="#444", zorder=3)
+        if "disp" in f:
+            for dx, dy in f["disp"]:
+                ax.plot(dx, dy, "-", color="#ffd400", lw=1.0, zorder=4)
+            ax.plot(*f["wake"], "--", color="#ffd400", lw=0.9, zorder=4)
+        ax.set_xlim(X.min(), X.max())
+        ax.set_ylim(Y.min(), Y.max())
+        ax.set_aspect("equal")
+        extra = "; жёлтым — граница вытеснения (контур + δ*) и линия следа" if "disp" in f else ""
+        warn = "" if f.get("converged", True) else " — РАСЧЁТ НЕ СОШЁЛСЯ"
+        ax.set_title(f"{label}, α = {f['alpha']:g}°{warn}\n{name}{extra}", fontsize=9)
+        ax.set_xlabel("x/c")
+        ax.set_ylabel("y/c")
+        self.t_fl.draw()
+        self.status.set("Поле течения построено.")
+
     def clear(self):
         self.polars.clear()
         self.table.delete(*self.table.get_children())
         self.notes.delete("1.0", "end")
+        self._field_cache.clear()
         self.cb_alpha["values"] = []
         self.cp_alpha.set("")
         self.replot()
@@ -460,7 +553,8 @@ class App(tk.Tk):
         d = filedialog.askdirectory(title="Папка для графиков")
         if d:
             for name, t in [("profile", self.t_geo), ("cl_alpha", self.t_cl), ("cd", self.t_cd),
-                            ("cm_alpha", self.t_cm), ("cp", self.t_cp), ("boundary_layer", self.t_bl)]:
+                            ("cm_alpha", self.t_cm), ("cp", self.t_cp), ("boundary_layer", self.t_bl),
+                            ("flow_field", self.t_fl)]:
                 t.fig.savefig(os.path.join(d, f"{name}.png"), dpi=150)
             self.status.set(f"Графики сохранены в {d}")
 

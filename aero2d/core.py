@@ -37,6 +37,7 @@ class Polar:
     xtr_l: np.ndarray | None = None
     bl: list = field(default_factory=list)  # распределения пограничного слоя по углам
     cp_inv: list = field(default_factory=list)
+    field_ctx: dict | None = None          # данные для расчёта поля течения (field.py)
 
 
 def make_airfoil(source: str, value: str, n_side: int = 100) -> Airfoil:
@@ -82,7 +83,8 @@ def run_panel(af: Airfoil, alphas, mach: float) -> Polar:
                      f"(Cp < Cp* = {cpstar:.2f}): панели+КЦ там неприменимы, нужен Эйлер.")
     notes.append("Панельный метод невязкий: сопротивление и срыв не рассчитываются.")
     return Polar(f"{af.name}, панели, M={mach:g}", "panel", mach, np.asarray(alphas, float),
-                 np.array(cl), np.full(len(cl), np.nan), np.array(cm), ok, xs, cps, notes)
+                 np.array(cl), np.full(len(cl), np.nan), np.array(cm), ok, xs, cps, notes,
+                 field_ctx=dict(method="panel", airfoil=af, mach=mach, alpha=np.asarray(alphas, float)))
 
 
 def run_euler(af: Airfoil, alphas, mach: float, grid: str = "грубая (быстро)",
@@ -167,8 +169,10 @@ def run_viscous(af: Airfoil, alphas, mach: float, re: float, ncrit: float = 9.0,
     if sup.any():
         notes.append(f"При α = {', '.join(f'{a:g}' for a in alphas[sup])}° на профиле есть "
                      "сверхзвуковая зона: поправка Кармана–Цяня там неточна.")
-    notes.append(f"Re = {re:.3g}, Ñкрит = {ncrit:g} (9 — типичная аэродинамическая труба; "
-                 "меньше — более турбулентный поток). Cd — по Сквайру–Янгу в конце следа, "
+    notes.append(f"Re = {re:.3g}, Ñкрит = {ncrit:g}. Ñкрит задаёт возмущённость потока: 9 — "
+                 "обычная труба, 10–11 — малотурбулентная труба или спокойная атмосфера (при "
+                 "сверке с продувками UIUC и NASA LTPT сопротивление при Re 1e5–3e5 ближе всего "
+                 "при 10–11), 4–7 — турбулентный поток. Cd — по Сквайру–Янгу в конце следа, "
                  "Cdf — трение. Срыв на больших углах описывается приближённо.")
     label = f"{af.name}, вязкий, Re={re:.3g}, M={mach:g}"
     return Polar(label, "viscous", mach, alphas, np.array([r.cl for r in res]),
@@ -176,7 +180,10 @@ def run_viscous(af: Airfoil, alphas, mach: float, re: float, ncrit: float = 9.0,
                  [r.x for r in res], [r.cp for r in res], notes, re=re,
                  cdf=np.array([r.cdf for r in res]),
                  xtr_u=np.array([r.xtr_u for r in res]), xtr_l=np.array([r.xtr_l for r in res]),
-                 bl=[r.side for r in res], cp_inv=[r.cp_inv for r in res])
+                 bl=[r.side for r in res], cp_inv=[r.cp_inv for r in res],
+                 field_ctx=dict(method="viscous", airfoil=af, re=re, ncrit=ncrit, mach=mach, xtr=xtr,
+                                alpha=alphas, states=[r.state for r in res],
+                                n_panels=[getattr(r, "n_panels", 160) for r in res]))
 
 
 class _Stop(Exception):

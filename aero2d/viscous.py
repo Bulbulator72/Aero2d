@@ -1218,6 +1218,8 @@ def polar_robust(airfoil, re, alphas, ncrit=9.0, mach=0.0, xtr=(1.0, 1.0), callb
     alphas = np.asarray(alphas, float)
     solver = ViscousSolver(airfoil, re, ncrit=ncrit, mach=mach, xtr=xtr, n_panels=n_panels)
     res = solver.polar(alphas, callback=callback, max_iter=max_iter)
+    for r in res:
+        r.n_panels = n_panels
     order = np.argsort(alphas)
     ok = np.array([r.converged for r in res])
     if ok.all():
@@ -1238,6 +1240,7 @@ def polar_robust(airfoil, re, alphas, ncrit=9.0, mach=0.0, xtr=(1.0, 1.0), callb
         for i in retry:
             r = s2.solve(alphas[i], max_iter=max_iter)
             if r.converged:
+                r.n_panels = npn
                 res[i] = r
             else:
                 still.append(i)
