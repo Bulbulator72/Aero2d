@@ -1202,10 +1202,14 @@ class ViscousSolver:
                         out[i] = r
                         break
             else:
-                # последнее средство — холодный старт с продолжением по Re
-                r = self.solve(alphas[i], init=None, verbose=verbose, max_iter=max_iter)
-                if r.converged:
-                    out[i] = r
+                # последнее средство — холодный старт с продолжением по Re, но только
+                # для «дыр» внутри сошедшегося диапазона (за срывом не тратим время)
+                okn = [out[j] is not None and out[j].converged for j in order]
+                inner = any(okn[:pos]) and any(okn[pos + 1:])
+                if inner:
+                    r = self.solve(alphas[i], init=None, verbose=verbose, max_iter=max_iter)
+                    if r.converged:
+                        out[i] = r
         return out
 
 

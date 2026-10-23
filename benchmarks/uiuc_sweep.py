@@ -39,6 +39,12 @@ def run_case(task):
     t0 = time.time()
     out = dict(name=name, re=re_exp, ncrit=ncrit, opts=opts, alpha=rows[:, 0].tolist(),
                cl_exp=rows[:, 1].tolist(), cd_exp=rows[:, 2].tolist())
+    import signal
+
+    def _alarm(*_):
+        raise TimeoutError("превышено время на случай")
+    signal.signal(signal.SIGALRM, _alarm)
+    signal.alarm(int(os.environ.get("CASE_TIMEOUT", "600")))
     try:
         af = make_airfoil(coords)
         from aero2d import blclosure as bc
@@ -53,6 +59,8 @@ def run_case(task):
                    xtr_l=[p.xtr_l for p in pol])
     except Exception as e:                       # noqa: BLE001
         out.update(error=repr(e))
+    finally:
+        signal.alarm(0)
     out["time"] = time.time() - t0
     if use_xf:
         try:
