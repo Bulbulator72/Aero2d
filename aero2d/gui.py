@@ -84,19 +84,14 @@ class App(tk.Tk):
         ttk.Checkbutton(f, text="сгладить контур (измеренные координаты)", variable=self.smooth,
                         command=self.preview_airfoil).grid(row=4, column=0, columnspan=2, sticky="w")
         # --- механизация из одного профиля
-        self.flap_on = tk.BooleanVar(value=False)
-        ttk.Checkbutton(f, text="Щелевой закрылок (из профиля NACA/файла)", variable=self.flap_on,
-                        command=self.preview_airfoil).grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        self.flap_x, self.flap_d = tk.StringVar(value="0.75"), tk.StringVar(value="20")
-        self.flap_gap, self.flap_ov = tk.StringVar(value="0.015"), tk.StringVar(value="0")
-        ff = ttk.Frame(f)
-        ff.grid(row=6, column=0, columnspan=2, sticky="w")
-        for k, (lbl, var) in enumerate([("срез x/c", self.flap_x), ("δ, °", self.flap_d),
-                                        ("зазор", self.flap_gap), ("перекр.", self.flap_ov)]):
-            ttk.Label(ff, text=("   " if k % 2 == 0 else " ") + lbl).grid(row=k // 2, column=2 * (k % 2), sticky="w")
-            e = ttk.Entry(ff, textvariable=var, width=6)
-            e.grid(row=k // 2, column=2 * (k % 2) + 1, sticky="w")
-            e.bind("<Return>", lambda _: self.preview_airfoil())
+        self.hl_cfg = {"flap": None, "slat": None}
+        hf = ttk.Frame(f)
+        hf.grid(row=5, column=0, columnspan=2, sticky="we", pady=(4, 0))
+        ttk.Label(hf, text="Механизация:").pack(side="left")
+        ttk.Button(hf, text="Настроить…", command=self.open_highlift).pack(side="right")
+        self.hl_desc = tk.StringVar(value="нет")
+        ttk.Label(f, textvariable=self.hl_desc, foreground="#555", wraplength=250).grid(
+            row=6, column=0, columnspan=2, sticky="w")
 
         # --- режим
         f = ttk.LabelFrame(left, text="Режим", padding=6)
@@ -183,15 +178,19 @@ class App(tk.Tk):
         self.cb_alpha_fl.pack(side="left")
         ttk.Label(bar, text="   величина: ").pack(side="left")
         self.fl_qty = tk.StringVar(value="Давление Cp")
-        ttk.Combobox(bar, textvariable=self.fl_qty, values=["Давление Cp", "Скорость |V|/V∞"],
-                     state="readonly", width=16).pack(side="left")
+        cq = ttk.Combobox(bar, textvariable=self.fl_qty,
+                          values=["Давление Cp", "Скорость |V|/V∞", "Нет (только линии тока)"],
+                          state="readonly", width=22)
+        cq.pack(side="left")
+        cq.bind("<<ComboboxSelected>>", lambda _: self._redraw_field())
         ttk.Label(bar, text="   область: ").pack(side="left")
         from .field import REGIONS
         self.fl_reg = tk.StringVar(value=list(REGIONS)[0])
         ttk.Combobox(bar, textvariable=self.fl_reg, values=list(REGIONS), state="readonly",
                      width=20).pack(side="left")
         self.fl_lines = tk.BooleanVar(value=True)
-        ttk.Checkbutton(bar, text="линии тока", variable=self.fl_lines).pack(side="left", padx=6)
+        ttk.Checkbutton(bar, text="линии тока", variable=self.fl_lines,
+                        command=self._redraw_field).pack(side="left", padx=6)
         ttk.Button(bar, text="Построить", command=self.plot_field).pack(side="left", padx=6)
         self._field_cache = {}
         # таблица
@@ -232,6 +231,123 @@ class App(tk.Tk):
             self.src.set("mfile")
             self.preview_airfoil()
 
+    def open_highlift(self):
+        """Окно настройки механизации: тип закрылка, дефлектор, предкрылок."""
+        from .multi import FLAP_TYPES
+        if getattr(self, "_hl_win", None) and self._hl_win.winfo_exists():
+            self._hl_win.lift()
+            return
+        w = tk.Toplevel(self)
+        self._hl_win = w
+        w.title("Механизация профиля")
+        w.resizable(False, False)
+        presets = {
+            "однощелевой": dict(chord=0.25, deflection=30, gap=0.015, overlap=0.02),
+            "Фаулера": dict(chord=0.30, deflection=30, gap=0.02, overlap=0.0),
+            "двухщелевой": dict(chord=0.35, deflection=45, gap=0.012, overlap=0.0,
+                                vane_chord=0.12, vane_deflection=20, vane_gap=0.015, vane_overlap=0.0),
+        }
+        fl = self.hl_cfg["flap"] or {}
+        sl = self.hl_cfg["slat"] or {}
+        inv = {v: k for k, v in FLAP_TYPES.items()}
+        ftype = tk.StringVar(value=inv.get(fl.get("type"), "нет"))
+        V = {}
+
+        def var(key, default):
+            V[key] = tk.StringVar(value=str(default))
+            return V[key]
+
+        frm = ttk.LabelFrame(w, text="Закрылок", padding=6)
+        frm.grid(row=0, column=0, sticky="nwe", padx=6, pady=4)
+        ttk.Label(frm, text="тип").grid(row=0, column=0, sticky="w")
+        cb = ttk.Combobox(frm, textvariable=ftype, values=list(FLAP_TYPES), state="readonly", width=14)
+        cb.grid(row=0, column=1, sticky="w")
+        rows = [("хорда закрылка (всего), доли хорды", "chord", 0.30), ("угол отклонения δ, °", "deflection", 30),
+                ("зазор, доли хорды", "gap", 0.015), ("перекрытие, доли хорды", "overlap", 0.0)]
+        for r, (lbl, k, d) in enumerate(rows, start=1):
+            ttk.Label(frm, text=lbl).grid(row=r, column=0, sticky="w")
+            ttk.Entry(frm, textvariable=var("f_" + k, fl.get(k, d)), width=8).grid(row=r, column=1, sticky="w")
+        frv = ttk.LabelFrame(w, text="Дефлектор (передний элемент двухщелевого закрылка)", padding=6)
+        frv.grid(row=1, column=0, sticky="nwe", padx=6, pady=4)
+        rows = [("хорда дефлектора, доли хорды", "vane_chord", 0.12), ("угол δ₁, °", "vane_deflection", 20),
+                ("зазор до основной части", "vane_gap", 0.015), ("перекрытие", "vane_overlap", 0.0)]
+        for r, (lbl, k, d) in enumerate(rows):
+            ttk.Label(frv, text=lbl).grid(row=r, column=0, sticky="w")
+            ttk.Entry(frv, textvariable=var("f_" + k, fl.get(k, d)), width=8).grid(row=r, column=1, sticky="w")
+        frs = ttk.LabelFrame(w, text="Предкрылок", padding=6)
+        frs.grid(row=2, column=0, sticky="nwe", padx=6, pady=4)
+        slat_on = tk.BooleanVar(value=bool(sl))
+        ttk.Checkbutton(frs, text="есть", variable=slat_on).grid(row=0, column=0, sticky="w")
+        rows = [("хорда, доли хорды", "chord", 0.15), ("угол (носком вниз), °", "deflection", 25),
+                ("зазор до основной части", "gap", 0.02), ("перекрытие", "overlap", 0.01)]
+        for r, (lbl, k, d) in enumerate(rows, start=1):
+            ttk.Label(frs, text=lbl).grid(row=r, column=0, sticky="w")
+            ttk.Entry(frs, textvariable=var("s_" + k, sl.get(k, d)), width=8).grid(row=r, column=1, sticky="w")
+        ttk.Label(w, wraplength=380, foreground="#555", justify="left", text=(
+            "Зазор — наименьшее расстояние от задней кромки впереди стоящего элемента до "
+            "следующего элемента. Перекрытие — на сколько носок закрылка (дефлектора) "
+            "выдвинут вперёд за эту кромку; у предкрылка — на сколько его кромка позади "
+            "носка основной части. Однощелевой: короткая ниша, перекрытие ~0,01–0,03. "
+            "Фаулера: закрылок убран в глубокую нишу и выдвинут назад (перекрытие ~0 — "
+            "наибольшее увеличение хорды). Коэффициенты отнесены к хорде исходного профиля.")
+                  ).grid(row=3, column=0, padx=6, pady=4, sticky="w")
+
+        def on_type(_=None):
+            t = ftype.get()
+            if t in presets:
+                for k, v in presets[t].items():
+                    V["f_" + k].set(str(v))
+        cb.bind("<<ComboboxSelected>>", on_type)
+
+        def apply(close=False):
+            num = lambda k: float(V[k].get().replace(",", "."))
+            try:
+                t = FLAP_TYPES[ftype.get()]
+                flap = None
+                if t:
+                    flap = dict(type=t, **{k: num("f_" + k) for k in ("chord", "deflection", "gap", "overlap")})
+                    if t == "double":
+                        flap.update({k: num("f_" + k) for k in
+                                     ("vane_chord", "vane_deflection", "vane_gap", "vane_overlap")})
+                        if flap["vane_chord"] >= flap["chord"] - 0.05:
+                            raise ValueError("хорда дефлектора должна быть меньше хорды закрылка")
+                    if not 0.05 <= flap["chord"] <= 0.5:
+                        raise ValueError("хорда закрылка — от 0,05 до 0,5")
+                slat = None
+                if slat_on.get():
+                    slat = {k: num("s_" + k) for k in ("chord", "deflection", "gap", "overlap")}
+                    if not 0.05 <= slat["chord"] <= 0.3:
+                        raise ValueError("хорда предкрылка — от 0,05 до 0,3")
+            except (ValueError, KeyError) as e:
+                messagebox.showerror("Механизация", str(e), parent=w)
+                return
+            self.hl_cfg = {"flap": flap, "slat": slat}
+            parts = []
+            if slat:
+                parts.append(f"предкрылок {slat['deflection']:g}°")
+            if flap:
+                nm = ftype.get()
+                d = f"{flap['vane_deflection']:g}/{flap['deflection']:g}" if t == "double" else f"{flap['deflection']:g}"
+                parts.append(f"закрылок {nm} {d}°")
+            self.hl_desc.set(", ".join(parts) if parts else "нет")
+            if self.src.get() == "mfile":
+                self.src.set("naca")
+            self.preview_airfoil()
+            self.nb.select(0)
+            if close:
+                w.destroy()
+
+        bf = ttk.Frame(w, padding=6)
+        bf.grid(row=4, column=0, sticky="we")
+        ttk.Button(bf, text="Показать", command=apply).pack(side="left")
+        ttk.Button(bf, text="Готово", command=lambda: apply(True)).pack(side="left", padx=6)
+
+        def reset():
+            ftype.set("нет")
+            slat_on.set(False)
+            apply()
+        ttk.Button(bf, text="Без механизации", command=reset).pack(side="right")
+
     def get_config(self):
         """Один профиль (Airfoil) или список элементов механизации."""
         num = lambda v: float(v.get().replace(",", "."))
@@ -243,9 +359,9 @@ class App(tk.Tk):
             els = load_multi(self.mfile.get())
             return [repanel(e, 80, keep_frame=True) for e in els]
         af = self.get_airfoil()
-        if self.flap_on.get():
-            from .multi import split_flap
-            return split_flap(af, num(self.flap_x), num(self.flap_d), num(self.flap_gap), num(self.flap_ov))
+        if self.hl_cfg["flap"] or self.hl_cfg["slat"]:
+            from .multi import highlift
+            return highlift(af, flap=self.hl_cfg["flap"], slat=self.hl_cfg["slat"])
         return af
 
     def get_airfoil(self):
@@ -342,8 +458,7 @@ class App(tk.Tk):
                     self.q.put(("progress", text, frac))
                     return self.stop_flag.is_set()
                 if method == "multi":
-                    nm = "закрылок δ=" + self.flap_d.get() + "°" if self.src.get() != "mfile" else \
-                        os.path.basename(self.mfile.get())
+                    nm = self.hl_desc.get() if self.src.get() != "mfile" else os.path.basename(self.mfile.get())
                     p = core.run_multi(af, alphas, mach, nm, chord=1.0 if self.src.get() != "mfile" else None)
                 elif method == "panel":
                     p = core.run_panel(af, alphas, mach)
@@ -561,27 +676,43 @@ class App(tk.Tk):
                 self.q.put(("field_error", str(e)))
         threading.Thread(target=job, daemon=True).start()
 
+    def _redraw_field(self):
+        """Перерисовать уже рассчитанное поле (смена величины, линий тока)."""
+        last = getattr(self, "_field_last", None)
+        if last:
+            self._draw_field(*last)
+
     def _draw_field(self, label, f, key):
         self._field_cache[key] = f
+        self._field_last = (label, f, key)
         fig = self.t_fl.fig
         fig.clear()
         ax = fig.add_subplot(111)
         X, Y = f["X"], f["Y"]
-        if self.fl_qty.get().startswith("Давление"):
+        qty = self.fl_qty.get()
+        if qty.startswith("Давление"):
             z, cmap, name = f["cp"], "RdBu_r", "Cp"
             lo = max(np.nanpercentile(z, 1), -6.0)
             levels = np.linspace(lo, 1.0, 41)
-        else:
+        elif qty.startswith("Скорость"):
             z, cmap, name = f["speed"], "viridis", "|V| / V∞"
             levels = np.linspace(np.nanpercentile(z, 0.5), min(np.nanpercentile(z, 99.5), 3.0), 41)
-        c = ax.contourf(X, Y, z, levels=levels, cmap=cmap, extend="both")
-        fig.colorbar(c, ax=ax, label=name, shrink=0.85)
-        if self.fl_lines.get():
+        else:
+            z, name = None, "линии тока"
+        if z is not None:
+            c = ax.contourf(X, Y, z, levels=levels, cmap=cmap, extend="both")
+            fig.colorbar(c, ax=ax, label=name, shrink=0.85)
+        if self.fl_lines.get() or z is None:
             ys = np.linspace(Y.min(), Y.max(), 34)
             seeds = np.column_stack([np.full_like(ys, X.min() + 1e-3 * (X.max() - X.min())), ys])
             U = np.nan_to_num(f["U"]); V = np.nan_to_num(f["V"])
-            ax.streamplot(X, Y, U, V, start_points=seeds, density=4, color="k", linewidth=0.55,
-                          arrowsize=0.5, broken_streamlines=False)
+            if z is None:      # только линии тока — цвет по скорости
+                sp = ax.streamplot(X, Y, U, V, start_points=seeds, density=4, color=f["speed"],
+                                   cmap="viridis", linewidth=1.0, arrowsize=0.6, broken_streamlines=False)
+                fig.colorbar(sp.lines, ax=ax, label="|V| / V∞", shrink=0.85)
+            else:
+                ax.streamplot(X, Y, U, V, start_points=seeds, density=4, color="k", linewidth=0.55,
+                              arrowsize=0.5, broken_streamlines=False)
         for bx, by in f.get("bodies", [f["body"]]):
             ax.fill(bx, by, color="#444", zorder=3)
         if "disp" in f:

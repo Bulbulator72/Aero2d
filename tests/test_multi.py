@@ -37,3 +37,24 @@ def test_field_far_from_body_is_freestream():
     ctx = dict(method="panel", airfoil=af, mach=0.0, alpha=np.array([0.0]))
     f = compute_field(ctx, 0, box=(5.0, 6.0, 5.0, 6.0), n=10)
     assert np.allclose(f["speed"], 1.0, atol=0.02)
+
+
+def test_highlift_types_valid_and_converged():
+    from aero2d.multi import highlift, _intersects
+    af = naca4("4415", 201)
+    cfgs = [dict(flap=dict(type="slotted", chord=0.25, deflection=30, gap=0.015, overlap=0.02)),
+            dict(flap=dict(type="fowler", chord=0.30, deflection=30, gap=0.02, overlap=0.0)),
+            dict(flap=dict(type="double", chord=0.35, deflection=45, gap=0.012, overlap=0.0,
+                           vane_chord=0.12, vane_deflection=20, vane_gap=0.015, vane_overlap=0.0)),
+            dict(slat=dict(chord=0.15, deflection=25, gap=0.02, overlap=0.01),
+                 flap=dict(type="fowler", chord=0.30, deflection=30, gap=0.02, overlap=0.0))]
+    base = PanelSolver(af).solve(8.0).cl
+    for c in cfgs:
+        els = highlift(af, n_side=70, **c)
+        for i in range(len(els)):
+            for j in range(i + 1, len(els)):
+                assert not _intersects(els[i].x, els[i].y, els[j].x, els[j].y)
+        r1 = MultiPanelSolver(els, chord=1.0).solve(8.0).cl
+        r2 = MultiPanelSolver(highlift(af, n_side=120, **c), chord=1.0).solve(8.0).cl
+        assert abs(r1 / r2 - 1) < 5e-3
+        assert r1 > base + 0.5

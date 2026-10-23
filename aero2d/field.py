@@ -104,9 +104,21 @@ def compute_field(ctx: dict, k: int, box=None, n: int = 220) -> dict:
     cp0 = 1.0 - q2
     cp = karman_tsien(cp0, ctx.get("mach", 0.0)) if ctx.get("mach", 0.0) > 0 else cp0
     shape = X.shape
-    U, V, cp = (np.where(inside, np.nan, arr).reshape(shape) for arr in (U, V, cp))
+    speed = np.sqrt(U**2 + V**2)
+    # для заливки: внутри тел — значения ближайшей точки снаружи, иначе по
+    # контуру остаётся «лесенка» пустых ячеек; тело потом закрашивается сверху
+    ins = inside.reshape(shape)
+    if ins.any():
+        from scipy.ndimage import distance_transform_edt
+        iy, ix = distance_transform_edt(ins, return_distances=False, return_indices=True)
+        cp_f = cp.reshape(shape)[iy, ix]
+        sp_f = speed.reshape(shape)[iy, ix]
+    else:
+        cp_f, sp_f = cp.reshape(shape), speed.reshape(shape)
+    U, V = (np.where(inside, np.nan, arr).reshape(shape) for arr in (U, V))
+    cp, speed = cp_f, sp_f
     extra.setdefault("bodies", [(x, y)])
-    return dict(X=X, Y=Y, U=U, V=V, cp=cp, speed=np.sqrt(U**2 + V**2), alpha=alpha,
+    return dict(X=X, Y=Y, U=U, V=V, cp=cp, speed=speed, alpha=alpha,
                 body=(x, y), **extra)
 
 

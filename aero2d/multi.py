@@ -112,66 +112,205 @@ class MultiPanelSolver:
 # ---------------------------------------------------------------------------
 # геометрия механизации
 # ---------------------------------------------------------------------------
-def split_flap(af: Airfoil, x_cut: float = 0.75, deflection: float = 20.0, gap: float = 0.015,
-               overlap: float = 0.0, n_side: int = 80):
-    """Простой однощелевой закрылок из одного профиля (для оценок и примеров).
-
-    Основная часть — исходный профиль до x_cut; нижняя поверхность на участке
-    [x_cut − 0.12, x_cut] плавно поднимается к верхней (ниша под закрылок),
-    кромка острая. Закрылок — участок профиля от x_cut − 0.03 до задней кромки
-    со скруглённым носком; он отклоняется вниз на deflection градусов вокруг
-    носка и ставится под кромку основной части: перекрытие overlap (доли
-    хорды, > 0 — носок закрылка впереди кромки) и зазор gap — наименьшее
-    расстояние от кромки основной части до закрылка.
-    Возвращает [основная часть, закрылок]."""
-    from matplotlib.path import Path
+def _surfaces(af: Airfoil):
     x, y = np.asarray(af.x, float), np.asarray(af.y, float)
     ile = int(np.argmin(x))
     xu, yu = x[:ile + 1][::-1], y[:ile + 1][::-1]
     xl, yl = x[ile:], y[ile:]
-    fu = lambda t: np.interp(t, xu, yu)
-    fl = lambda t: np.interp(t, xl, yl)
-    cove = 0.12
-    # --- основная часть
-    t = 0.5 * (1 - np.cos(np.linspace(0, np.pi, 400))) * x_cut
-    up = fu(t)
-    w = np.clip((t - (x_cut - cove)) / cove, 0, 1)
-    w = 3 * w**2 - 2 * w**3
-    lo = fl(t) * (1 - w) + (up - 0.002 * (1 - w)) * w
-    lo[-1] = up[-1]
-    main = Airfoil(np.concatenate([t[::-1], t[1:]]), np.concatenate([up[::-1], lo[1:]]),
-                   af.name + " — основная часть")
-    te = np.array([t[-1], up[-1]])
-    # --- закрылок
-    xf0 = x_cut - 0.03
-    tf = xf0 + 0.5 * (1 - np.cos(np.linspace(0, np.pi, 300))) * (1 - xf0)
-    yc = 0.5 * (fu(tf) + fl(tf))
-    th = np.maximum(fu(tf) - fl(tf), 0)
-    rr = np.clip((tf - xf0) / 0.05, 0, 1)
-    th = th * np.sqrt(np.clip(1 - (1 - rr) ** 2, 0, 1))
-    fx = np.concatenate([tf[::-1], tf[1:]])
-    fy = np.concatenate([(yc + 0.5 * th)[::-1], (yc - 0.5 * th)[1:]])
-    d = np.radians(deflection)
-    px, py = xf0, yc[0]
-    rx, ry = fx - px, fy - py
-    fx, fy = px + rx * np.cos(d) + ry * np.sin(d), py - rx * np.sin(d) + ry * np.cos(d)
-    # носок закрылка — на overlap впереди кромки основной части
-    fx = fx + (te[0] - overlap) - fx.min()
-    main_path = Path(np.column_stack([main.x, main.y]))
-    dy = te[1] - fy[np.argmin(fx)] - gap
-    for _ in range(60):
-        gy = fy + dy
-        dist = np.min(np.hypot(fx - te[0], gy - te[1]))
-        hit = main_path.contains_points(np.column_stack([fx, gy])).any()
-        if hit:
-            dy -= 0.002
+    return (lambda t: np.interp(t, xu, yu)), (lambda t: np.interp(t, xl, yl))
+
+
+def _cos_pts(a, b, n=300):
+    return a + 0.5 * (1 - np.cos(np.linspace(0, np.pi, n))) * (b - a)
+
+
+def _smooth(w):
+    w = np.clip(w, 0, 1)
+    return 3 * w**2 - 2 * w**3
+
+
+def _contour(t, up, lo):
+    """Замкнутый контур: задняя кромка → верх → нос → низ → задняя кромка."""
+    return np.concatenate([t[::-1], t[1:]]), np.concatenate([up[::-1], lo[1:]])
+
+
+def _segment(fu, fl, x0, x1, round_le=True, te_taper=0.0, close_te=True):
+    """Элемент из участка профиля [x0, x1] (средняя линия + толщина): скруглённый
+    нос (если x0 > 0) и острая кромка; te_taper > 0 — толщина плавно сходит
+    к нулю на последней доле te_taper длины (для дефлектора)."""
+    t = _cos_pts(x0, x1)
+    yc = 0.5 * (fu(t) + fl(t))
+    th = np.maximum(fu(t) - fl(t), 0)
+    if round_le and x0 > 1e-6:
+        r = min(0.05, 0.25 * (x1 - x0))
+        rr = np.clip((t - x0) / r, 0, 1)
+        th = th * np.sqrt(np.clip(1 - (1 - rr) ** 2, 0, 1))
+    if te_taper > 0:
+        L = te_taper * (x1 - x0)
+        th = th * (1 - _smooth((t - (x1 - L)) / L))
+    if close_te:
+        th[-1] = 0.0
+    return _contour(t, yc + 0.5 * th, yc - 0.5 * th)
+
+
+def _rotate(x, y, px, py, deg):
+    """Поворот по часовой стрелке на deg градусов (положительный угол — задняя
+    часть элемента вниз, если точка поворота спереди)."""
+    d = np.radians(deg)
+    rx, ry = x - px, y - py
+    return px + rx * np.cos(d) + ry * np.sin(d), py - rx * np.sin(d) + ry * np.cos(d)
+
+
+def _intersects(xa, ya, xb, yb):
+    from matplotlib.path import Path
+    pa, pb = Path(np.column_stack([xa, ya])), Path(np.column_stack([xb, yb]))
+    return pb.contains_points(np.column_stack([xa, ya])).any() or \
+        pa.contains_points(np.column_stack([xb, yb])).any()
+
+
+def _place_behind(ex, ey, bodies, te, gap, overlap):
+    """Элемент (закрылок, дефлектор) за задней кромкой te: носок на overlap
+    впереди кромки, затем опускаем, пока не будет зазора gap и пересечений."""
+    ex = ex + (te[0] - overlap) - ex.min()
+    ey = ey + te[1] - ey[np.argmin(ex)] + 0.02
+    best = None
+    for dy in np.arange(0.0, -0.4, -0.0005):
+        gy = ey + dy
+        if any(_intersects(ex, gy, bx, by) for bx, by in bodies):
             continue
-        if abs(dist - gap) < 2e-4:
+        dist = np.min(np.hypot(ex - te[0], gy - te[1]))
+        if dist >= gap:
+            best = dy
             break
-        dy += 0.6 * (dist - gap) if dist > gap else -0.6 * (gap - dist)
-    flap = Airfoil(fx, fy + dy, af.name + f" — закрылок {deflection:g}°")
-    return [repanel(main, n_side, keep_frame=True),
-            repanel(flap, max(n_side // 2, 40), keep_frame=True)]
+    return ex, ey + (best if best is not None else -0.05)
+
+
+def _place_ahead(ex, ey, main, gap, overlap):
+    """Предкрылок: его задняя кромка — на overlap позади носка основной части,
+    поднимаем, пока не будет зазора gap от кромки предкрылка до основной части."""
+    mx, my = main
+    ite = int(np.argmax(ex))                     # задняя кромка предкрылка
+    ex = ex + (mx.min() + overlap) - ex[ite]
+    xte = ex[ite]
+    near = np.abs(mx - xte) < 0.02
+    ytop = my[near].max() if near.any() else my.max()
+    ey = ey + (ytop - ey[ite])
+    for dy in np.arange(0.0, 0.4, 0.0005):
+        gy = ey + dy
+        if _intersects(ex, gy, mx, my):
+            continue
+        if np.min(np.hypot(mx - xte, my - gy[ite])) >= gap:
+            return ex, gy
+    return ex, ey + 0.05
+
+
+FLAP_TYPES = {
+    "нет": None,
+    "однощелевой": "slotted",
+    "Фаулера": "fowler",
+    "двухщелевой": "double",
+}
+
+
+def highlift(af: Airfoil, flap: dict | None = None, slat: dict | None = None, n_side: int = 80):
+    """Механизация из одного профиля (хорда 1). Все размеры — доли хорды,
+    углы — градусы (закрылок/дефлектор — вниз, предкрылок — носком вниз).
+
+    flap = dict(type="slotted"|"fowler"|"double", chord=0.30, deflection=30,
+                gap=0.015, overlap=0.0,
+                # только для двухщелевого — дефлектор (передний элемент):
+                vane_chord=0.12, vane_deflection=15, vane_gap=0.015, vane_overlap=0.0)
+      slotted — щель у носка закрылка, ниша под ним короткая;
+      fowler  — закрылок убран в глубокую нишу на всю свою хорду и выдвигается
+                назад (overlap обычно ≈ 0…0,02 — увеличение хорды);
+      double  — дефлектор + основной закрылок, каждый со своими зазором,
+                перекрытием (относительно кромки впереди стоящего элемента) и углом.
+    slat = dict(chord=0.15, deflection=20, gap=0.02, overlap=0.01)
+    Возвращает список элементов (спереди назад)."""
+    fu, fl = _surfaces(af)
+    names = []
+    # --- основная часть
+    x_le_main = 0.0
+    slat_el = None
+    if slat:
+        cs = slat.get("chord", 0.15)
+        x_le_main = 0.35 * cs
+    x_cut = 1.0 - (flap or {}).get("chord", 0.0) if flap else 1.0
+    if flap:
+        ftype = flap.get("type", "slotted")
+        cove = min(flap["chord"], 0.25) if ftype == "fowler" else min(0.12, 0.5 * flap["chord"])
+        t = _cos_pts(x_le_main, x_cut, 400)
+        if slat:
+            mx, my = _segment(fu, fl, x_le_main, x_cut, round_le=True, close_te=False)
+            t2 = _cos_pts(x_le_main, x_cut, 400)
+            up = np.interp(t2, *_upper_of(mx, my))
+            lo = np.interp(t2, *_lower_of(mx, my))
+            t = t2
+        else:
+            up, lo = fu(t), fl(t)
+        w = _smooth((t - (x_cut - cove)) / cove)
+        lo = lo * (1 - w) + (up - 0.002 * (1 - w)) * w
+        lo[-1] = up[-1]
+        mx, my = _contour(t, up, lo)
+    else:
+        mx, my = _segment(fu, fl, x_le_main, 1.0, round_le=bool(slat))
+    els = [Airfoil(mx, my, af.name + " — основная часть")]
+    bodies = [(mx, my)]
+    te = np.array([mx[0], my[0]])
+    # --- закрылки
+    if flap:
+        ftype = flap.get("type", "slotted")
+        if ftype == "double":
+            vc = flap.get("vane_chord", 0.4 * flap["chord"])
+            vx, vy = _segment(fu, fl, x_cut - 0.03, x_cut + vc, te_taper=0.6)
+            vx, vy = _rotate(vx, vy, vx.min(), vy[np.argmin(vx)], flap.get("vane_deflection", 15.0))
+            vx, vy = _place_behind(vx, vy, bodies, te, flap.get("vane_gap", 0.015),
+                                   flap.get("vane_overlap", 0.0))
+            els.append(Airfoil(vx, vy, af.name + f" — дефлектор {flap.get('vane_deflection', 15):g}°"))
+            bodies.append((vx, vy))
+            te = np.array([vx[0], vy[0]])
+            fx, fy = _segment(fu, fl, x_cut + vc - 0.02, 1.0)
+        else:
+            fx, fy = _segment(fu, fl, x_cut - 0.03, 1.0)
+        fx, fy = _rotate(fx, fy, fx.min(), fy[np.argmin(fx)], flap.get("deflection", 20.0))
+        fx, fy = _place_behind(fx, fy, bodies, te, flap.get("gap", 0.015), flap.get("overlap", 0.0))
+        nm = {"slotted": "закрылок", "fowler": "закрылок Фаулера", "double": "закрылок"}[ftype]
+        els.append(Airfoil(fx, fy, af.name + f" — {nm} {flap.get('deflection', 20):g}°"))
+    # --- предкрылок
+    if slat:
+        cs = slat.get("chord", 0.15)
+        t = _cos_pts(0.0, cs, 300)
+        up, lo = fu(t), fl(t)
+        w = _smooth((t - 0.3 * cs) / (0.7 * cs))
+        lo = lo * (1 - w) + (up - 0.002 * (1 - w)) * w
+        lo[-1] = up[-1]
+        sx, sy = _contour(t, up, lo)
+        sx, sy = _rotate(sx, sy, sx.max(), sy[0], -slat.get("deflection", 20.0))
+        sx, sy = _place_ahead(sx, sy, (mx, my), slat.get("gap", 0.02), slat.get("overlap", 0.01))
+        els.insert(0, Airfoil(sx, sy, af.name + f" — предкрылок {slat.get('deflection', 20):g}°"))
+    out = []
+    for e in els:
+        nn = n_side if "основная" in e.name else max(n_side // 2, 40)
+        r = repanel(e, nn, keep_frame=True)
+        out.append(Airfoil(r.x, r.y, e.name))
+    return out
+
+
+def _upper_of(x, y):
+    i = int(np.argmin(x))
+    return x[:i + 1][::-1], y[:i + 1][::-1]
+
+
+def _lower_of(x, y):
+    i = int(np.argmin(x))
+    return x[i:], y[i:]
+
+
+def split_flap(af: Airfoil, x_cut: float = 0.75, deflection: float = 20.0, gap: float = 0.015,
+               overlap: float = 0.0, n_side: int = 80):
+    """Однощелевой закрылок (совместимость): закрылок хордой 1 − x_cut."""
+    return highlift(af, flap=dict(type="slotted", chord=1 - x_cut, deflection=deflection,
+                                  gap=gap, overlap=overlap), n_side=n_side)
 
 
 def load_multi(path: str):
