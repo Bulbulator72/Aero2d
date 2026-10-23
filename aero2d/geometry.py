@@ -220,7 +220,7 @@ def _rescale(x, y):
     return xs * ca - ys * sa, xs * sa + ys * ca
 
 
-def repanel(af: Airfoil, n_side: int = 100, spacing: str = "cosine") -> Airfoil:
+def repanel(af: Airfoil, n_side: int = 100, spacing: str = "cosine", keep_frame: bool = False) -> Airfoil:
     """Перераспределяет точки контура: сплайн по длине дуги, n_side точек на
     сторону. spacing="cosine" — сгущение к обеим кромкам; "viscous" — сильное
     сгущение к передней кромке и умеренное к задней (панели у задней кромки
@@ -247,7 +247,12 @@ def repanel(af: Airfoil, n_side: int = 100, spacing: str = "cosine") -> Airfoil:
         s2 = sle + (s[-1] - sle) * 0.5 * (1 - np.cos(b))
     st = np.concatenate([s1, s2[1:]])
     out = Airfoil(sx(st), sy(st), af.name)
-    out = normalize(out)
+    if keep_frame:            # элементы механизации: без нормировки и поворота
+        area = 0.5 * np.sum(out.x[:-1] * out.y[1:] - out.x[1:] * out.y[:-1])
+        if area < 0:
+            out = Airfoil(out.x[::-1].copy(), out.y[::-1].copy(), af.name)
+    else:
+        out = normalize(out)
     out.x[0] = out.x[-1] = 0.5 * (out.x[0] + out.x[-1])
     out.y[0] = out.y[-1] = 0.5 * (out.y[0] + out.y[-1])
     return out

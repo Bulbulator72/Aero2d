@@ -14,6 +14,7 @@ from .panel import PanelSolver, vortex_velocity_influence, karman_tsien
 
 REGIONS = {
     "Весь профиль": (-0.45, 1.6, -0.55, 0.55),
+    "Механизация (щель закрылка)": (0.55, 1.15, -0.25, 0.12),
     "Передняя кромка": (-0.08, 0.22, -0.12, 0.12),
     "Задняя кромка и след": (0.7, 1.35, -0.18, 0.14),
 }
@@ -36,7 +37,7 @@ def compute_field(ctx: dict, k: int, box=None, n: int = 220) -> dict:
     xp, yp = X.ravel(), Y.ravel()
     alpha = float(ctx["alpha"][k])
     a = np.radians(alpha)
-    af = ctx["airfoil"]
+    af = ctx.get("airfoil")
     extra = {}
     if ctx["method"] == "viscous":
         from .viscous import ViscousSolver
@@ -73,6 +74,22 @@ def compute_field(ctx: dict, k: int, box=None, n: int = 220) -> dict:
             disp.append((x[nd] + ds * nx_[nd], y[nd] + ds * ny_[nd]))
         extra["disp"] = disp
         extra["converged"] = bool(r.converged)
+    elif ctx["method"] == "multi":
+        from .multi import MultiPanelSolver
+        ms = MultiPanelSolver(ctx["elements"], chord=ctx.get("chord"))
+        U = np.full(xp.shape, np.cos(a))
+        V = np.full(xp.shape, np.sin(a))
+        inside = np.zeros(xp.shape, bool)
+        bodies = []
+        for (x, y), g in zip(ms.els, ms.gamma(alpha)):
+            Uv, Vv = vortex_velocity_influence(x, y, xp, yp)
+            U += Uv @ g
+            V += Vv @ g
+            inside |= Path(np.column_stack([x, y])).contains_points(np.column_stack([xp, yp]))
+            bodies.append((x, y))
+        extra["bodies"] = bodies
+        extra["converged"] = True
+        x, y = bodies[0]
     else:
         ps = PanelSolver(af)
         g = ps.gamma(alpha)
@@ -81,12 +98,14 @@ def compute_field(ctx: dict, k: int, box=None, n: int = 220) -> dict:
         U = np.cos(a) + Uv @ g
         V = np.sin(a) + Vv @ g
         extra["converged"] = True
-    inside = Path(np.column_stack([x, y])).contains_points(np.column_stack([xp, yp]))
+    if ctx["method"] != "multi":
+        inside = Path(np.column_stack([x, y])).contains_points(np.column_stack([xp, yp]))
     q2 = U**2 + V**2
     cp0 = 1.0 - q2
     cp = karman_tsien(cp0, ctx.get("mach", 0.0)) if ctx.get("mach", 0.0) > 0 else cp0
     shape = X.shape
     U, V, cp = (np.where(inside, np.nan, arr).reshape(shape) for arr in (U, V, cp))
+    extra.setdefault("bodies", [(x, y)])
     return dict(X=X, Y=Y, U=U, V=V, cp=cp, speed=np.sqrt(U**2 + V**2), alpha=alpha,
                 body=(x, y), **extra)
 

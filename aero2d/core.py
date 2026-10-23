@@ -87,6 +87,38 @@ def run_panel(af: Airfoil, alphas, mach: float) -> Polar:
                  field_ctx=dict(method="panel", airfoil=af, mach=mach, alpha=np.asarray(alphas, float)))
 
 
+def run_multi(elements, alphas, mach: float, name: str = "многоэлементный", chord=None) -> Polar:
+    """Невязкий расчёт многоэлементного профиля (предкрылок, закрылки)."""
+    from .multi import MultiPanelSolver
+    if mach >= 1:
+        raise ValueError("Панельный метод с поправкой Кармана–Цяня применим только при M < 1")
+    ms = MultiPanelSolver(elements, chord=chord)
+    cpstar = critical_cp(mach)
+    cl, cm, ok, xs, cps, per = [], [], [], [], [], []
+    for a in alphas:
+        r = ms.solve(float(a), mach)
+        cl.append(r.cl); cm.append(r.cm)
+        ok.append(bool(min(np.min(e["cp"]) for e in r.elements) > cpstar))
+        # элементы — через NaN, чтобы на графике Cp они рисовались раздельно
+        xs.append(np.concatenate([np.append(e["x"], np.nan) for e in r.elements]))
+        cps.append(np.concatenate([np.append(e["cp"], np.nan) for e in r.elements]))
+        per.append([e["cl"] for e in r.elements])
+    per = np.array(per)
+    notes = [f"Многоэлементный профиль, {len(elements)} элемента(ов); опорная хорда {ms.chord:.3f} "
+             "(для закрылка из профиля — хорда исходного профиля, для файла — габарит). Расчёт НЕВЯЗКИЙ: пограничные слои, следы элементов "
+             "и отрыв на закрылке не учитываются, поэтому Cl завышен (обычно на 10–30 % при "
+             "отклонённом закрылке), сопротивление не рассчитывается. Это оценка распределения "
+             "нагрузки и влияния щели/угла; вязкий расчёт механизации — следующий этап.",
+             "Cl по элементам при каждом α: " + "; ".join(
+                 f"{a:g}°: " + ", ".join(f"{c:.3f}" for c in row) for a, row in zip(alphas, per))]
+    if mach > 0 and not all(ok):
+        notes.append("Есть точки со сверхзвуковой зоной (Cp < Cp*): поправка Кармана–Цяня там неточна.")
+    return Polar(f"{name}, панели, M={mach:g}", "multi", mach, np.asarray(alphas, float), np.array(cl),
+                 np.full(len(cl), np.nan), np.array(cm), np.array(ok), xs, cps, notes,
+                 field_ctx=dict(method="multi", elements=elements, mach=mach, chord=chord,
+                                alpha=np.asarray(alphas, float)))
+
+
 def run_euler(af: Airfoil, alphas, mach: float, grid: str = "грубая (быстро)",
               n_iter: int = 100, callback=None) -> Polar:
     """Все углы атаки считаются одним пакетом. callback(text, fraction) -> True для остановки."""

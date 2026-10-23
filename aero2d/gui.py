@@ -40,7 +40,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("aero2d — аэродинамика профилей")
-        self.geometry("1280x800")
+        self.geometry("1280x880")
         self.minsize(1000, 650)
         self.polars: list[core.Polar] = []
         self.airfoil = None
@@ -73,8 +73,27 @@ class App(tk.Tk):
                         command=self.preview_airfoil).grid(row=1, column=0, sticky="w")
         ttk.Button(f, text="Открыть…", command=self.open_file).grid(row=1, column=1, sticky="w")
         self.file = tk.StringVar(value="")
-        ttk.Label(f, textvariable=self.file, foreground="#555", wraplength=230).grid(
-            row=2, column=0, columnspan=2, sticky="w")
+        ttk.Radiobutton(f, text="Многоэлементный файл", variable=self.src, value="mfile",
+                        command=self.preview_airfoil).grid(row=2, column=0, sticky="w")
+        ttk.Button(f, text="Открыть…", command=self.open_mfile).grid(row=2, column=1, sticky="w")
+        self.mfile = tk.StringVar(value="")
+        self.file_disp = tk.StringVar(value="")
+        ttk.Label(f, textvariable=self.file_disp, foreground="#555", wraplength=250).grid(
+            row=3, column=0, columnspan=2, sticky="w")
+        # --- механизация из одного профиля
+        self.flap_on = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f, text="Щелевой закрылок (из профиля NACA/файла)", variable=self.flap_on,
+                        command=self.preview_airfoil).grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.flap_x, self.flap_d = tk.StringVar(value="0.75"), tk.StringVar(value="20")
+        self.flap_gap, self.flap_ov = tk.StringVar(value="0.015"), tk.StringVar(value="0")
+        ff = ttk.Frame(f)
+        ff.grid(row=6, column=0, columnspan=2, sticky="w")
+        for k, (lbl, var) in enumerate([("срез x/c", self.flap_x), ("δ, °", self.flap_d),
+                                        ("зазор", self.flap_gap), ("перекр.", self.flap_ov)]):
+            ttk.Label(ff, text=("   " if k % 2 == 0 else " ") + lbl).grid(row=k // 2, column=2 * (k % 2), sticky="w")
+            e = ttk.Entry(ff, textvariable=var, width=6)
+            e.grid(row=k // 2, column=2 * (k % 2) + 1, sticky="w")
+            e.bind("<Return>", lambda _: self.preview_airfoil())
 
         # --- режим
         f = ttk.LabelFrame(left, text="Режим", padding=6)
@@ -90,7 +109,7 @@ class App(tk.Tk):
         f = ttk.LabelFrame(left, text="Метод", padding=6)
         f.pack(fill="x", pady=4)
         self.method = tk.StringVar(value="viscous")
-        ttk.Radiobutton(f, text="Вязкий: панели + пограничный слой\n(Re, переход, Cd; секунды на точку)",
+        ttk.Radiobutton(f, text="Вязкий: панели + погр. слой (Re, Cd)",
                         variable=self.method, value="viscous").grid(row=0, column=0, columnspan=2, sticky="w")
         self.re = tk.StringVar(value="1e6")
         self.ncrit = tk.StringVar(value="9")
@@ -101,9 +120,9 @@ class App(tk.Tk):
                                         ("   переход низ ≤ x/c", self.xtrl)], start=1):
             ttk.Label(f, text=lbl).grid(row=r, column=0, sticky="w")
             ttk.Entry(f, textvariable=var, width=8).grid(row=r, column=1, sticky="w")
-        ttk.Radiobutton(f, text="Невязкий: панели + Карман–Цянь\n(мгновенно; без Cd)",
+        ttk.Radiobutton(f, text="Невязкий: панели (мгновенно, без Cd)",
                         variable=self.method, value="panel").grid(row=5, column=0, columnspan=2, sticky="w")
-        ttk.Radiobutton(f, text="Уравнения Эйлера\n(сжимаемый, со скачками;\nминуты на CPU; M ≥ 0,2)",
+        ttk.Radiobutton(f, text="Эйлер: сжимаемый, скачки (M ≥ 0,2)",
                         variable=self.method, value="euler").grid(row=6, column=0, columnspan=2, sticky="w")
         ttk.Label(f, text="   Сетка:").grid(row=7, column=0, sticky="w")
         self.grid_name = tk.StringVar(value=list(core.GRIDS)[0])
@@ -201,6 +220,31 @@ class App(tk.Tk):
             self.src.set("file")
             self.preview_airfoil()
 
+    def open_mfile(self):
+        p = filedialog.askopenfilename(title="Файл многоэлементного профиля (элементы разделены "
+                                       "пустой строкой или строкой 999 999)",
+                                       filetypes=[("Координаты", "*.dat *.txt *.csv"), ("Все файлы", "*.*")])
+        if p:
+            self.mfile.set(p)
+            self.src.set("mfile")
+            self.preview_airfoil()
+
+    def get_config(self):
+        """Один профиль (Airfoil) или список элементов механизации."""
+        num = lambda v: float(v.get().replace(",", "."))
+        if self.src.get() == "mfile":
+            if not self.mfile.get():
+                raise ValueError("Выберите файл многоэлементного профиля")
+            from .multi import load_multi
+            from .geometry import repanel
+            els = load_multi(self.mfile.get())
+            return [repanel(e, 80, keep_frame=True) for e in els]
+        af = self.get_airfoil()
+        if self.flap_on.get():
+            from .multi import split_flap
+            return split_flap(af, num(self.flap_x), num(self.flap_d), num(self.flap_gap), num(self.flap_ov))
+        return af
+
     def get_airfoil(self):
         if self.src.get() == "file":
             if not self.file.get():
@@ -209,14 +253,29 @@ class App(tk.Tk):
         return core.make_airfoil("naca", self.naca.get())
 
     def preview_airfoil(self):
+        src = self.src.get()
+        self.file_disp.set(os.path.basename(self.file.get()) if src == "file" else
+                           os.path.basename(self.mfile.get()) if src == "mfile" else "")
         try:
-            af = self.get_airfoil()
+            af = self.get_config()
         except Exception as e:  # noqa: BLE001
             self.status.set(f"Профиль: {e}")
             return
         self.airfoil = af
         ax = self.t_geo.ax
         ax.clear()
+        if isinstance(af, list):
+            for i, e in enumerate(af):
+                ax.plot(e.x, e.y, "-", color=COLORS[i % len(COLORS)], lw=1.5, label=e.name)
+                ax.plot(e.x, e.y, ".", color=COLORS[i % len(COLORS)], ms=2)
+            ax.set_aspect("equal")
+            ax.grid(alpha=0.3)
+            ax.legend(fontsize=8)
+            ax.set_title(f"Многоэлементный профиль: {len(af)} элемента(ов). Расчёт — невязкий")
+            ax.set_xlabel("x/c")
+            ax.set_ylabel("y/c")
+            self.t_geo.draw()
+            return
         ax.plot(af.x, af.y, "-", color="#1f77b4", lw=1.5)
         ax.plot(af.x, af.y, ".", color="#1f77b4", ms=2)
         ax.set_aspect("equal")
@@ -255,16 +314,22 @@ class App(tk.Tk):
         if self.worker and self.worker.is_alive():
             return
         try:
-            af = self.get_airfoil()
+            af = self.get_config()
             mach, alphas, niter, re_, ncrit, xtr = self._params()
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("Ошибка", str(e))
             return
         self.airfoil = af
         method, grid = self.method.get(), self.grid_name.get()
+        if isinstance(af, list):
+            if method != "panel":
+                messagebox.showinfo("Механизация", "Для многоэлементного профиля пока доступен только "
+                                    "невязкий панельный расчёт (распределение давления и нагрузки "
+                                    "по элементам). Вязкий расчёт механизации — следующий этап.")
+            method = "multi"
         self.stop_flag.clear()
         self.btn_run.configure(state="disabled")
-        self.btn_stop.configure(state="normal" if method != "panel" else "disabled")
+        self.btn_stop.configure(state="normal" if method not in ("panel", "multi") else "disabled")
         self.progress["value"] = 0
         self.status.set("Расчёт…")
 
@@ -273,7 +338,11 @@ class App(tk.Tk):
                 def cb(text, frac):
                     self.q.put(("progress", text, frac))
                     return self.stop_flag.is_set()
-                if method == "panel":
+                if method == "multi":
+                    nm = "закрылок δ=" + self.flap_d.get() + "°" if self.src.get() != "mfile" else \
+                        os.path.basename(self.mfile.get())
+                    p = core.run_multi(af, alphas, mach, nm, chord=1.0 if self.src.get() != "mfile" else None)
+                elif method == "panel":
                     p = core.run_panel(af, alphas, mach)
                 elif method == "viscous":
                     p = core.run_viscous(af, alphas, mach, re_, ncrit, xtr, cb)
@@ -510,7 +579,8 @@ class App(tk.Tk):
             U = np.nan_to_num(f["U"]); V = np.nan_to_num(f["V"])
             ax.streamplot(X, Y, U, V, start_points=seeds, density=4, color="k", linewidth=0.55,
                           arrowsize=0.5, broken_streamlines=False)
-        ax.fill(*f["body"], color="#444", zorder=3)
+        for bx, by in f.get("bodies", [f["body"]]):
+            ax.fill(bx, by, color="#444", zorder=3)
         if "disp" in f:
             for dx, dy in f["disp"]:
                 ax.plot(dx, dy, "-", color="#ffd400", lw=1.0, zorder=4)
