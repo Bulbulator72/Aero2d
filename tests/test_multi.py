@@ -93,3 +93,20 @@ def test_unwrapped_source_psi_single_valued():
     U, V = Ya @ qa + Yw @ qw, -(Xa @ qa + Xw @ qw)
     dp = np.sum(0.5 * (U[1:] + U[:-1]) * np.diff(cy) - 0.5 * (V[1:] + V[:-1]) * np.diff(cx))
     assert abs((p[-1] - p[0]) - dp) < 1e-6
+
+
+def test_merge_residual_reduces_to_interval():
+    """Отрезок со слиянием следа при нулевой доле следа совпадает с обычным."""
+    from aero2d.geometry import naca4
+    from aero2d.mviscous import MultiViscousSolver
+    ms = MultiViscousSolver([naca4("0012", 60)], 1e6, n_panels=100)
+    A = np.array([2e-4, 3e-4, 10.0, 0.05, 1.2, 0.30])
+    B = np.array([2.2e-4, 3.4e-4, 10.5, 0.05, 1.15, 0.31])
+    W = np.array([1e-3, 1.3e-3, 10.0, 0.04, 1.3, 0.5])
+    V = np.concatenate([A, B, W])[:, None].astype(complex)
+    ex = (np.array([0.3]), np.array([0.31]), np.array([False]), np.array([0.0]))
+    r0 = ms._interval_res(np.concatenate([A, B])[:, None].astype(complex), *ex)
+    r1 = ms._merge_res(V, *ex, np.array([0.0]))
+    assert np.allclose(r0, r1)
+    r2 = ms._merge_res(V, *ex, np.array([0.5]))
+    assert not np.allclose(r0, r2)

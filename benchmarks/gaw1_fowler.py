@@ -94,7 +94,13 @@ def flap_nested():
     # поверхности, плавно по всей хорде: верх закрылка, где развивается
     # отрыв, не искажается
     dz = zu[-1] - zl[-1]
-    zl = zl + dz * (t / t[-1]) ** 2
+    import os
+    mode = os.environ.get("FLAP_TE", "lower")
+    if mode == "lower":
+        zl = zl + dz * (t / t[-1]) ** 2
+    else:                                    # симметрично на последних 10 %
+        w = np.clip((t - 0.9 * t[-1]) / (0.1 * t[-1]), 0, 1) ** 2
+        zu, zl = zu - 0.5 * dz * w, zl + 0.5 * dz * w
     xu, xl = t + FLAP_X0, t + FLAP_X0
     x = np.concatenate([xu[::-1], xl[1:]])
     z = np.concatenate([zu[::-1], zl[1:]])

@@ -21,15 +21,22 @@ def _wrap(a):
     return (a + np.pi) % (2 * np.pi) - np.pi
 
 
-def unwrapped_angles(path_x, path_y, xp, yp):
+def cut_angle(dx, dy, cut=0.0):
+    """Полярный угол вектора (dx, dy) с разрезом вдоль направления cut (рад):
+    значения в (cut, cut + 2π]."""
+    return cut + np.mod(np.arctan2(dy, dx) - cut - 1e-300, 2 * np.pi)
+
+
+def unwrapped_angles(path_x, path_y, xp, yp, cut=0.0):
     """Полярные углы точек (xp, yp) относительно узлов пути (тело + его след,
     путь заканчивается в конце следа), непрерывные вдоль пути. Разрез — луч
-    из конца следа по +x (вниз по потоку), он не пересекает ни одно тело."""
+    из конца следа в направлении cut (по умолчанию +x, вниз по потоку); он не
+    должен пересекать тела."""
     dx = xp[:, None] - path_x[None, :]
     dy = yp[:, None] - path_y[None, :]
     raw = np.arctan2(dy, dx)
     phi = np.empty_like(raw)
-    phi[:, -1] = np.arctan2(-dy[:, -1], -dx[:, -1]) + np.pi      # ∈ (0, 2π], разрез по +x
+    phi[:, -1] = cut_angle(dx[:, -1], dy[:, -1], cut)
     for j in range(raw.shape[1] - 2, -1, -1):
         phi[:, j] = phi[:, j + 1] + _wrap(raw[:, j] - raw[:, j + 1])
     return phi

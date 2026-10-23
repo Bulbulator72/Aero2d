@@ -26,7 +26,7 @@ import gaw1_fowler as G   # noqa: E402
 
 def run(task):
     np.seterr(all="ignore")
-    d, alphas, ncrit = task
+    d, alphas, ncrit, conf, mf = task
     from aero2d.multi import MultiPanelSolver
     from aero2d.mviscous import MultiViscousSolver, default_transition
     t0 = time.time()
@@ -42,7 +42,8 @@ def run(task):
     els = G.configuration(d, n_main=200, n_flap=100)
     inv = MultiPanelSolver(els, chord=1.0)
     ms = MultiViscousSolver(els, G.RE, ncrit=ncrit, mach=G.MACH, xtr=default_transition(els, (G.XTR, G.XTR)),
-                            n_panels=[180, 100])
+                            n_panels=[180, 100], confluent=conf)
+    ms.merge_factor = mf
     res = ms.polar(alphas)
     return dict(d=d, alpha=list(alphas), cl=[r.cl for r in res], cd=[r.cd for r in res],
                 cl_main=[r.elements[0]["cl"] for r in res], cl_flap=[r.elements[1]["cl"] for r in res],
@@ -55,6 +56,9 @@ def main():
     ap.add_argument("--defl", type=int, nargs="+", default=[0, 10, 20, 30, 40])
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--ncrit", type=float, default=9.0)
+    ap.add_argument("--confluent", action="store_true", help="со слиянием следа со слоем закрылка (экспериментально)")
+    ap.add_argument("--merge-factor", type=float, default=1.0)
+    ap.add_argument("--tag", default="", help="суффикс имён файлов результата")
     args = ap.parse_args()
     tasks = []
     for d in args.defl:
@@ -62,11 +66,12 @@ def main():
         alphas = np.round(e[:, 0], 2)
         if d:
             alphas = alphas[alphas < 12]              # до срыва
-        tasks.append((d, alphas, args.ncrit))
+        tasks.append((d, alphas, args.ncrit, args.confluent, args.merge_factor))
     with mp.get_context("fork").Pool(args.workers) as pool:
         out = pool.map(run, tasks)
     lines = ["GA(W)-1 + 29% Fowler (NASA CR-2443), Re 2.2e6, M 0.21, переход 5% (осн. элемент)",
-             f"Ñкрит = {args.ncrit}",
+             f"Ñкрит = {args.ncrit}; слияние следа со слоем закрылка: "
+             f"{'нет' if not args.confluent else f'да (коэфф. {args.merge_factor:g})'}",
              " δf    α      Cl эксп  Cl расч  Cl невязк  ΔCl     Cd расч  сошлось"]
     allerr = []
     for o in out:
@@ -84,7 +89,7 @@ def main():
         lines.append(f"сошлось точек: {len(d_)}, ΔCl ср. {d_.mean():+.3f}, |ΔCl| ср. {np.abs(d_).mean():.3f}")
     txt = "\n".join(lines)
     print(txt)
-    open(os.path.join(HERE, "vs_gaw1_fowler.txt"), "w").write(txt + "\n")
+    open(os.path.join(HERE, f"vs_gaw1_fowler{args.tag}.txt"), "w").write(txt + "\n")
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -102,7 +107,7 @@ def main():
     ax.grid(alpha=0.3)
     ax.legend(fontsize=7, ncol=2)
     ax.set_title("GA(W)-1 + закрылок Фаулера 29 %, Re 2.2e6 (точки — CR-2443, пунктир — невязкий)")
-    fig.savefig(os.path.join(HERE, "vs_gaw1_fowler.png"), dpi=110)
+    fig.savefig(os.path.join(HERE, f"vs_gaw1_fowler{args.tag}.png"), dpi=110)
 
 
 if __name__ == "__main__":

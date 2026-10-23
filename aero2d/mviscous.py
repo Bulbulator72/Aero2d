@@ -29,7 +29,7 @@ import numpy as np
 from . import blclosure as bc
 from .geometry import Airfoil, repanel
 from .panel import psi_influence, vortex_velocity_influence, panel_geometry, karman_tsien
-from .sources import lin_source, unwrapped_angles
+from .sources import lin_source, unwrapped_angles, cut_angle
 from .viscous import ViscousSolver
 
 
@@ -129,7 +129,7 @@ class MultiViscousSolver(ViscousSolver):
 
     def __init__(self, elements, re: float, ncrit: float = 9.0, mach: float = 0.0, xtr=None,
                  chord: float = 1.0, xref=None, n_panels=None, wake_length: float = 1.0,
-                 n_wake: int | None = None):
+                 n_wake: int | None = None, confluent: bool = False):
         els = []
         for i, e in enumerate(elements):
             if n_panels:
@@ -167,6 +167,13 @@ class MultiViscousSolver(ViscousSolver):
                                   s=np.concatenate([[0.0], np.cumsum(L)]), N=len(L)))
         self.wake_length = wake_length
         self.n_wake = n_wake
+        self._init_args = dict(re=re, ncrit=ncrit, mach=mach, xtr=xtr, chord=chord, xref=xref,
+                               wake_length=wake_length, n_wake=n_wake)
+        # слияние следа переднего элемента со слоем закрылка (confluent layer)
+        self.confluent = confluent
+        self.merges = []
+        self.merge_factor = 1.0
+        self.merge_ramp = 4
         self._g_cur = None
         self._wake_alpha = None
         # влияние источников каждого тела на свои узлы (не зависит от α)
@@ -262,9 +269,17 @@ class MultiViscousSolver(ViscousSolver):
                                   getattr(self, "sig", None) if self._g_cur is not None else None)
         self.sig = tuple((k, len(up), len(lo)) for k, _, up, lo in topo)
         if self._wake_alpha != alpha:
-            self.wakes = self._wakes(g_inv)
+            self.wakes_full = self._wakes(g_inv)
             self._wake_alpha = alpha
             self._wake_cache = None
+        mkey = tuple((m["e"], m["j"]) for m in self.merges)
+        if getattr(self, "_merge_key", None) != mkey:
+            self._merge_key = mkey
+            self._wake_cache = None
+        self.wakes = list(self.wakes_full)
+        for m in self.merges:
+            wx, wy = self.wakes_full[m["e"]]
+            self.wakes[m["e"]] = (wx[:m["j"] + 1], wy[:m["j"] + 1])
         E = self.E
         # нумерация станций: элемент e — верх, низ, след
         st_up, st_lo, st_wk, node_g, el_of, xc, xi_sign, xtr_st = [], [], [], [], [], [], [], []
@@ -291,6 +306,8 @@ class MultiViscousSolver(ViscousSolver):
             o += nu + nl + nw
         self.Ns = Ns = o
         self.st_up_el, self.st_lo_el, self.st_wk_el = st_up, st_lo, st_wk
+        self.up_el = [t[2] for t in topo]
+        self._merge_rows()
         self.up_el = [t[2] for t in topo]
         self.lo_el = [t[3] for t in topo]
         self.node = np.concatenate(node_g)
@@ -341,6 +358,164 @@ class MultiViscousSolver(ViscousSolver):
         self.ue_inv = ue0
         self._set_dsst(g_inv if self._g_cur is None else self._g_cur)
 
+    # ------------------------------------------------------------------
+    # слияние следа со слоем следующего элемента
+    # ------------------------------------------------------------------
+    def _ramp(self):
+        K = self.merge_ramp
+        w = 0.5 * (1 - np.cos(np.pi * np.arange(K + 1) / K))
+        return np.diff(w)
+
+    def _merge_rows(self):
+        """Станции верха закрылка, на которых к его слою добавляется след:
+        дефицит импульса и массы следа вводится плавно на merge_ramp отрезках."""
+        rows, wst, dws = [], [], []
+        dw = self._ramp()
+        for m in self.merges:
+            ups = self.st_up_el[m["f"]]
+            nodes = self.up_el[m["f"]]
+            km = int(np.argmin(np.abs(nodes - m["node"])))
+            km = min(km, len(ups) - 1 - len(dw))
+            if km < 1:
+                m["km"] = -1
+                continue
+            m["km"] = km
+            for i, d in enumerate(dw):
+                rows.append(ups[km + 1 + i])
+                wst.append(self.st_wk_el[m["e"]][-1])
+                dws.append(d)
+        self.merge_rows = np.array(rows, int)
+        self.merge_wst = np.array(wst, int)
+        self.merge_dw = np.array(dws, float)
+
+    def _merge_res(self, V, xca, xcb, wake, xtr_f, dw):
+        """Отрезок a→b верха закрылка, в начале которого к слою добавляется доля
+        dw следа: дефицит импульса ue²θ и массы ue·δ* сохраняются."""
+        A, B, W = V[0:6], V[6:12], V[12:18]
+        th_a, m_a, n_a, s_a, u_a, xi_a = A
+        th_w, m_w, _, s_w, u_w, _ = W
+        thw = dw * th_w * (u_w / u_a) ** 2
+        th1 = th_a + thw
+        m1 = m_a + u_a * (m_w / u_w / th_w) * thw      # добавка с формпараметром следа
+        s1 = (s_a * th_a + s_w * thw) / th1
+        V12 = np.concatenate([np.stack([th1, m1, n_a, s1, u_a, xi_a]), B])
+        return self._interval_res(V12, xca, xcb, wake, xtr_f)
+
+    def _sink_cut(self, P, t):
+        """Направление разреза функции тока для стока в конце оборванного следа:
+        луч не должен пересекать тела."""
+        from matplotlib.path import Path
+        base = np.arctan2(t[1], t[0])
+        paths = [Path(np.column_stack([x, y])) for x, y in self.els]
+        ts = np.linspace(1e-3, 3.0, 800)
+        for d in (0, 30, -30, 60, -60, 90, -90, 120, -120, 150, -150, 180):
+            ang = base + np.radians(d)
+            pts = np.column_stack([P[0] + ts * np.cos(ang), P[1] + ts * np.sin(ang)])
+            if not any(pa.contains_points(pts).any() for pa in paths):
+                return ang
+        return base
+
+    def _find_merges(self, X):
+        """След элемента e сливается со слоем элемента f там, где расстояние от
+        линии следа до верха f меньше толщины слоя f плюс нижней полуширины
+        следа (толщины — по оценке δ = θ(3,15 + 1,72/(Hk − 1)) + δ*, как в XFOIL;
+        нижняя полуширина у кромки — толщина слоя нижней поверхности элемента e,
+        дальше растёт на половину прироста ширины следа)."""
+        ue = self.ue_inv + self.D @ X[:, 1]
+        with np.errstate(all="ignore"):
+            st = self._stations(X, ue)
+            hk = np.maximum(np.real(st["hk"]), 1.05)
+            delta = np.real(X[:, 0] * (3.15 + 1.72 / (hk - 1.0)) + X[:, 1] / np.maximum(np.abs(ue), 1e-6))
+        out = []
+        K = self.merge_ramp
+        for e in range(self.E):
+            wx, wy = self.wakes[e]
+            sts = self.st_wk_el[e]
+            found = None
+            for jj in range(2, len(sts)):
+                for f in range(self.E):
+                    if f == e:
+                        continue
+                    xf, yf = self.els[f]
+                    if wx[jj] > xf[0] or wx[jj] < np.min(xf):
+                        continue
+                    nodes = self.up_el[f]
+                    d = np.hypot(xf[nodes] - wx[jj], yf[nodes] - wy[jj])
+                    i = int(np.argmin(d))
+                    if i >= len(nodes) - 1 - K:
+                        continue
+                    # след несимметричен: его нижняя (обращённая к закрылку) половина
+                    # начинается с тонкого слоя нижней поверхности и растёт вниз по
+                    # потоку вместе со следом
+                    h_lo = delta[self.st_lo_el[e][-1]] + 0.5 * max(delta[sts[jj]] - delta[sts[0]], 0.0)
+                    thr = self.merge_factor * (delta[self.st_up_el[f][i]] + h_lo)
+                    if d[i] < thr:
+                        found = dict(e=e, j=jj, f=f, node=int(nodes[i]))
+                        break
+                if found:
+                    break
+            if found:
+                out.append(found)
+        return out
+
+    def _apply_merge_init(self, X):
+        X = X.copy()
+        ue = np.maximum(np.abs(self.ue_inv + self.D @ X[:, 1]), 1e-3)
+        w = np.concatenate([np.cumsum(self._ramp()), []])
+        for m in self.merges:
+            if m.get("km", -1) < 1:
+                continue
+            ws = self.st_wk_el[m["e"]][-1]
+            ups = self.st_up_el[m["f"]]
+            for i, s_ in enumerate(ups[m["km"] + 1:]):
+                wi = w[i] if i < len(w) else 1.0
+                tha = wi * X[ws, 0] * (ue[ws] / ue[s_]) ** 2
+                X[s_, 0] += tha
+                X[s_, 1] += ue[s_] * X[ws, 1] / ue[ws] / X[ws, 0] * tha
+        return X
+
+    def _solve(self, alpha, init, max_iter, tol, verbose):
+        self.merges = [dict(m) for m in init.get("merges", [])] if init is not None else []
+        return ViscousSolver._solve(self, alpha, init, max_iter, tol, verbose)
+
+    def solve(self, alpha: float, init=None, max_iter: int = 60, tol: float = 1e-5,
+              verbose: bool = False, homotopy: bool = True):
+        """Сначала — решение без слияния следов (по нему продолжение по α);
+        затем, если след переднего элемента по этому решению касается слоя
+        закрылка (_find_merges), — решение со слиянием от него же. В результате
+        state — решение без слияния (для продолжения), state_merged — со
+        слиянием."""
+        if init is not None and init.get("merges"):
+            init = {k: v for k, v in init.items() if k != "merges"}
+        r = ViscousSolver.solve(self, alpha, init=init, max_iter=max_iter, tol=tol,
+                                verbose=verbose, homotopy=homotopy)
+        r.merged = False
+        if not (self.confluent and r.converged):
+            return r
+        X = self._x_from_state(r.state)
+        mg = self._find_merges(X)
+        if not mg:
+            return r
+        with np.errstate(all="ignore"):
+            r2 = self._solve(alpha, dict(r.state, merges=mg), max_iter, tol, verbose)
+        if not r2.converged:
+            r.notes_merge = "слияние следа не сошлось — результат без слияния"
+            return r
+        r2.merged = True
+        r2.state_merged = r2.state
+        r2.state = r.state
+        return r2
+
+    def _x_from_state(self, state):
+        X = np.zeros((self.Ns, 4))
+        surf = ~self.is_wake
+        X[surf] = state["node"][self.node[surf]]
+        for e in range(self.E):
+            w = state["wake"][e]
+            n = min(len(w), len(self.st_wk_el[e]))
+            X[self.st_wk_el[e][:n]] = w[:n]
+        return X
+
     def _set_xi(self):
         E = self.E
         xi = np.empty(self.Ns)
@@ -359,8 +534,20 @@ class MultiViscousSolver(ViscousSolver):
         E, offs = self.E, self.offs
         a = np.radians(self._alpha)
         if self._wake_cache is None:
-            c = dict(psi_air={}, psi_w={}, Pxw={}, Pyw={}, UVv=[], UVv2=[], tw=[])
+            c = dict(psi_air={}, psi_w={}, Pxw={}, Pyw={}, UVv=[], UVv2=[], tw=[], sink_psi={}, sink_uv={})
             paths = []
+            cuts = [0.0] * E
+            self.sinks = []
+            for m in self.merges:
+                wx, wy = self.wakes[m["e"]]
+                fx_, fy_ = self.wakes_full[m["e"]]
+                # сток — в следующем узле полного следа (не в самой станции:
+                # там его скорость сингулярна)
+                jn = min(m["j"] + 1, len(fx_) - 1)
+                P = np.array([fx_[jn], fy_[jn]])
+                t = np.array([wx[-1] - wx[-2], wy[-1] - wy[-2]])
+                cuts[m["e"]] = self._sink_cut(P, t)
+                self.sinks.append(dict(e=m["e"], P=P, cut=cuts[m["e"]]))
             for e in range(E):
                 x, y = self.els[e]
                 wx, wy = self.wakes[e]
@@ -375,7 +562,7 @@ class MultiViscousSolver(ViscousSolver):
                         c["psi_air"][f, e] = self._self_psi[f]
                         c["psi_w"][f, e] = lin_source(wx, wy, xe[:-1], ye[:-1], wake_sheet=True)[0]
                     else:
-                        phi = unwrapped_angles(*paths[f], xe[:-1], ye[:-1])
+                        phi = unwrapped_angles(*paths[f], xe[:-1], ye[:-1], cut=cuts[f])
                         c["psi_air"][f, e] = lin_source(xs, ys, xe[:-1], ye[:-1], phi=phi[:, :nN])[0]
                         c["psi_w"][f, e] = lin_source(wx, wy, xe[:-1], ye[:-1], wake_sheet=True,
                                                       phi=phi[:, nN - 1:])[0]
@@ -401,6 +588,19 @@ class MultiViscousSolver(ViscousSolver):
                 c["UVv"].append(Uv)
                 c["UVv2"].append(Vv)
                 c["tw"].append(self._wake_tangent(*self.wakes[e]))
+            # сток в конце оборванного следа (масса следа переходит в слой закрылка)
+            for sk in self.sinks:
+                Px_, Py_ = sk["P"]
+                for e in range(E):
+                    xe, ye = self.els[e]
+                    c["sink_psi"][sk["e"], e] = -cut_angle(xe[:-1] - Px_, ye[:-1] - Py_, sk["cut"]) / (2 * np.pi)
+                    pxw, pyw = self.wakes[e][0][1:], self.wakes[e][1][1:]
+                    dx, dy = pxw - Px_, pyw - Py_
+                    r2 = dx**2 + dy**2
+                    ok = r2 > 1e-20
+                    r2 = np.where(ok, r2, 1.0)
+                    c["sink_uv"][sk["e"], e] = (np.where(ok, -dx / r2, 0) / (2 * np.pi),
+                                                np.where(ok, -dy / r2, 0) / (2 * np.pi))
             self._wake_cache = c
         c = self._wake_cache
         self._wcache = c
@@ -411,6 +611,8 @@ class MultiViscousSolver(ViscousSolver):
             acc = np.zeros((len(self.els[e][0]) - 1, Ns))
             for f in range(E):
                 acc += c["psi_air"][f, e] @ Qa[offs[f]:offs[f + 1]] + c["psi_w"][f, e] @ Qw[f]
+            for sk in self.sinks:
+                acc[:, self.st_wk_el[sk["e"]][-1]] += c["sink_psi"][sk["e"], e]
             dpsi.append(acc)
         dpsi = np.vstack(dpsi)
         Ainv = self.mp.Ainv
@@ -428,6 +630,10 @@ class MultiViscousSolver(ViscousSolver):
                 Px, Py = c["Pxw"][("wk", f, e)]
                 Ux += Py @ Qw[f]
                 Vy -= Px @ Qw[f]
+            for sk in self.sinks:
+                su, sv = c["sink_uv"][sk["e"], e]
+                Ux[:, self.st_wk_el[sk["e"]][-1]] += su
+                Vy[:, self.st_wk_el[sk["e"]][-1]] += sv
             Ux += c["UVv"][e] @ dg_dm
             Vy += c["UVv2"][e] @ dg_dm
             tw = c["tw"][e]
@@ -501,6 +707,7 @@ class MultiViscousSolver(ViscousSolver):
                 X = X2
             X = self._relocate(X, alpha, g_inv)
             X = self._fix_stagnation(X)
+            X = self._hk_limit(X)
         finally:
             self._in_march = False
         return X
@@ -602,6 +809,14 @@ class MultiViscousSolver(ViscousSolver):
         scatter(rows, rows[:, None], dR)
         rows = np.concatenate([np.concatenate([self.st_up_el[e][1:], self.st_lo_el[e][1:], self.st_wk_el[e][1:]])
                                for e in range(E)])
+        if len(self.merge_rows):
+            rows = rows[~np.isin(rows, self.merge_rows)]
+            mr = self.merge_rows
+            deps = np.column_stack([mr - 1, mr, self.merge_wst])
+            extra = (self.xc[mr - 1], self.xc[mr], self.is_wake[mr], self.xtr_st[mr], self.merge_dw)
+            base, dR = cs(lambda V, *ex: self._merge_res(V, *ex), deps, extra)
+            R[mr] = base.T
+            scatter(mr, deps, dR)
         prev = rows - 1
         deps = np.column_stack([prev, rows])
         extra = (self.xc[prev], self.xc[rows], self.is_wake[rows], self.xtr_st[rows])
@@ -714,7 +929,13 @@ class MultiViscousSolver(ViscousSolver):
                     return rc
             finally:
                 self.cross = 1.0
-        # 2) продолжение по числу Рейнольдса
+        # 2) продолжение по геометрии: закрылки поворачиваются вокруг носка на
+        #    меньший угол (где решение находится легче), затем шагами — к заданному
+        if init is None and self.E > 1 and getattr(self, "morph", True):
+            rm = self._morph_solve(alpha, max_iter, tol)
+            if rm is not None:
+                return rm
+        # 3) продолжение по числу Рейнольдса
         re_t = self.re
         try:
             best = None
@@ -743,6 +964,50 @@ class MultiViscousSolver(ViscousSolver):
         finally:
             self.re = re_t
 
+    def _trailing(self):
+        """Элементы за основным (закрылки, дефлекторы)."""
+        ch = [x.max() - x.min() for x, _ in self.els]
+        im = int(np.argmax(ch))
+        x0m = self.els[im][0].min()
+        return [i for i, (x, _) in enumerate(self.els) if i != im and x.min() > x0m + 0.5 * ch[im]]
+
+    def _morph_solve(self, alpha, max_iter, tol, steps=((12.0, 6.0, 3.0, 0.0), (20.0, 12.0, 6.0, 3.0, 0.0))):
+        """Продолжение по углу отклонения закрылков: решение для закрылков,
+        повёрнутых носком вверх на Δ (меньше нагрузка, нет отрыва), затем Δ
+        уменьшается до нуля. Узлы тех же элементов — состояние переносится."""
+        tr = self._trailing()
+        if not tr:
+            return None
+        a = dict(self._init_args)
+        for seq in steps:
+            st = None
+            ok = True
+            for k, dd in enumerate(seq):
+                if dd == 0.0:
+                    r = self._solve(alpha, st, max_iter, tol, False)
+                else:
+                    els = []
+                    for i, (x, y) in enumerate(self.els):
+                        if i in tr:
+                            j = int(np.argmin(x))
+                            c, s_ = np.cos(np.radians(dd)), np.sin(np.radians(dd))
+                            px, py = x[j], y[j]
+                            x, y = px + (x - px) * c - (y - py) * s_, py + (x - px) * s_ + (y - py) * c
+                        els.append(Airfoil(x, y, "morph"))
+                    tmp = MultiViscousSolver(els, a["re"], ncrit=a["ncrit"], mach=a["mach"], xtr=self.xtr_el,
+                                             chord=a["chord"], xref=a["xref"], n_panels=None,
+                                             wake_length=a["wake_length"], n_wake=a["n_wake"])
+                    tmp.re = self.re
+                    tmp.morph = False
+                    r = tmp.solve(alpha, init=st, max_iter=max_iter, tol=tol, homotopy=(k == 0))
+                if not r.converged:
+                    ok = False
+                    break
+                st = r.state
+            if ok:
+                return r
+        return None
+
     # шаг ξ при поиске вдоль направления Ньютона в базовом _solve сохраняет
     # (s_st, xi, dsst_dm) — здесь s_st заменён списком
     @property
@@ -757,7 +1022,8 @@ class MultiViscousSolver(ViscousSolver):
         Xn = np.full((self.offs[-1], 4), np.nan)
         surf = ~self.is_wake
         Xn[self.node[surf]] = X[surf]
-        return dict(node=Xn, wake=[X[s].copy() for s in self.st_wk_el])
+        return dict(node=Xn, wake=[X[s].copy() for s in self.st_wk_el],
+                    merges=[dict(m) for m in self.merges])
 
     def _from_state(self, state):
         Xn = state["node"]
@@ -785,7 +1051,8 @@ class MultiViscousSolver(ViscousSolver):
     @staticmethod
     def _scale_state(state, re_ratio):
         f = re_ratio ** 0.4
-        st = dict(node=state["node"].copy(), wake=[w.copy() for w in state["wake"]])
+        st = dict(node=state["node"].copy(), wake=[w.copy() for w in state["wake"]],
+                  merges=[dict(m) for m in state.get("merges", [])])
         st["node"][:, :2] *= f
         for w in st["wake"]:
             w[:, :2] *= f
@@ -821,6 +1088,8 @@ class MultiViscousSolver(ViscousSolver):
             h_end = np.real(st["h"][last])
             ue_end = np.real(self._edge(ue[last])[0])
             cd_e = 2.0 * X[last, 0] * ue_end ** ((h_end + 5.0) / 2.0) / c
+            if any(m["e"] == e for m in self.merges):
+                cd_e = 0.0                     # след влился в слой закрылка — учтён в его следе
             cd += cd_e
             tau = cf * ue**2
             cdf_e = 0.0
