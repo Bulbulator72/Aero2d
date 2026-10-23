@@ -80,3 +80,23 @@ def test_smooth_airfoil_removes_noise_keeps_shape():
     true = upper(af)
     assert np.max(np.abs(upper(ref) - true)) < 3e-4          # гладкий контур почти не меняется
     assert np.std(upper(sm) - true) < 0.6 * 3e-4             # шум уменьшен
+
+
+def test_parallel_polar_matches_sequential():
+    """Поляра, разбитая на куски по α и посчитанная в двух процессах, совпадает
+    с последовательной."""
+    import numpy as np
+    from aero2d import core
+    af = core.make_airfoil("naca", "0012")
+    al = np.arange(0.0, 8.0, 1.0)
+    p1 = core.run_viscous(af, al, 0.0, 1e6, workers=1)
+    p2 = core.run_viscous(af, al, 0.0, 1e6, workers=2)
+    assert p1.ok.all() and p2.ok.all()
+    assert np.abs(p1.cl - p2.cl).max() < 1e-4 and np.abs(p1.cd - p2.cd).max() < 1e-5
+
+
+def test_resolve_workers():
+    from aero2d.parallel import resolve_workers, cpu_count, auto_workers
+    assert resolve_workers("авто") == auto_workers() >= 1
+    assert resolve_workers("1") == 1
+    assert resolve_workers(10 ** 6) == cpu_count()

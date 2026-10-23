@@ -125,7 +125,7 @@ class App(tk.Tk):
         self.ncrit = tk.StringVar(value="9")
         self.xtru = tk.StringVar(value="1")
         self.xtrl = tk.StringVar(value="1")
-        for r, (lbl, var) in enumerate([("   Re", self.re), ("   Ñкрит", self.ncrit),
+        for r, (lbl, var) in enumerate([("   Re (можно несколько: 1e5; 3e5)", self.re), ("   Ñкрит", self.ncrit),
                                         ("   переход верх ≤ x/c", self.xtru),
                                         ("   переход низ ≤ x/c", self.xtrl)], start=1):
             ttk.Label(f, text=lbl).grid(row=r, column=0, sticky="w")
@@ -141,6 +141,13 @@ class App(tk.Tk):
         ttk.Label(f, text="   Итераций:").grid(row=8, column=0, sticky="w")
         self.niter = tk.StringVar(value="100")
         ttk.Entry(f, textvariable=self.niter, width=8).grid(row=8, column=1, sticky="w")
+        from .parallel import cpu_count, auto_workers
+        ttk.Label(f, text=f"Ядер процессора (на этом ПК {cpu_count()}, авто = {auto_workers()}):").grid(
+            row=9, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.cores = tk.StringVar(value="авто")
+        ttk.Combobox(f, textvariable=self.cores, width=8,
+                     values=["авто"] + [str(n) for n in (1, 2, 4, 8, 12, 16, 24, 32) if n <= cpu_count()]
+                     ).grid(row=10, column=0, sticky="w")
 
         # --- кнопки
         f = ttk.Frame(left, padding=(0, 6))
@@ -469,7 +476,12 @@ class App(tk.Tk):
             mach = num(self.mach)
             alphas = core.alpha_range(num(self.a0), num(self.a1), num(self.da))
             niter = int(self.niter.get())
-            re_ = num(self.re)
+            txt = self.re.get().strip().replace(", ", ";").replace(" ", ";")
+            re_ = [float(t.replace(",", ".")) for t in txt.split(";") if t.strip()]
+            if not re_:
+                raise ValueError("не задано Re")
+            from .parallel import resolve_workers
+            self._workers = resolve_workers(self.cores.get())
             ncrit = num(self.ncrit)
             xtr = (num(self.xtru), num(self.xtrl))
         except ValueError as e:
@@ -507,22 +519,27 @@ class App(tk.Tk):
                 def cb(text, frac):
                     self.q.put(("progress", text, frac))
                     return self.stop_flag.is_set()
+                nw = self._workers
                 if method in ("multi", "multi_viscous"):
                     nm = self.hl_desc.get() if self.src.get() != "mfile" else os.path.basename(self.mfile.get())
                     ch = 1.0 if self.src.get() != "mfile" else None
                     if method == "multi":
-                        p = core.run_multi(af, alphas, mach, nm, chord=ch)
+                        ps = [core.run_multi(af, alphas, mach, nm, chord=ch)]
                     else:
-                        p = core.run_multi_viscous(af, alphas, mach, re_, ncrit, xtr, cb, nm, chord=ch)
+                        ps = core.run_multi_viscous_batch(af, alphas, mach, re_, ncrit, xtr, cb, nm,
+                                                          chord=ch, workers=nw)
                 elif method == "panel":
-                    p = core.run_panel(af, alphas, mach, control=control)
+                    ps = [core.run_panel(af, alphas, mach, control=control)]
                 elif method == "viscous":
-                    p = core.run_viscous(af, alphas, mach, re_, ncrit, xtr, cb, control=control)
+                    ps = core.run_viscous_batch(af, alphas, mach, re_, ncrit, xtr, cb, control=control,
+                                                workers=nw)
                 else:
                     p = core.run_euler(af, alphas, mach, grid, niter, cb)
                     if self.stop_flag.is_set():
                         p.label += " (остановлен)"
-                self.q.put(("done", p))
+                    ps = [p]
+                for k, p in enumerate(ps):
+                    self.q.put(("done" if k == len(ps) - 1 else "partial", p))
             except Exception as e:  # noqa: BLE001
                 self.q.put(("error", f"{e}\n\n{traceback.format_exc(limit=3)}"))
 
@@ -540,6 +557,8 @@ class App(tk.Tk):
                 if msg[0] == "progress":
                     self.status.set(msg[1])
                     self.progress["value"] = msg[2]
+                elif msg[0] == "partial":
+                    self.add_polar(msg[1])
                 elif msg[0] == "done":
                     self._finish()
                     self.add_polar(msg[1])

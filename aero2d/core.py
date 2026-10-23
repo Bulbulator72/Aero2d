@@ -209,33 +209,71 @@ def run_euler(af: Airfoil, alphas, mach: float, grid: str = "грубая (бы�
 
 
 def run_viscous(af: Airfoil, alphas, mach: float, re: float, ncrit: float = 9.0,
-                xtr=(1.0, 1.0), callback=None, control=None) -> Polar:
+                xtr=(1.0, 1.0), callback=None, control=None, workers=None) -> Polar:
     """Панели + интегральный пограничный слой (как XFOIL). callback(text, fraction)
-    -> True для остановки."""
-    from .viscous import polar_robust
-    if not 1e3 <= re <= 1e9:
-        raise ValueError("Число Рейнольдса должно быть в диапазоне 1e3…1e9")
+    -> True для остановки. workers — число процессов (None — авто)."""
+    return run_viscous_batch(af, alphas, mach, [re], ncrit, xtr, callback, control, workers)[0]
+
+
+def _check_viscous(re_list, mach):
+    for re in re_list:
+        if not 1e3 <= re <= 1e9:
+            raise ValueError("Число Рейнольдса должно быть в диапазоне 1e3…1e9")
     if mach >= 0.8:
         raise ValueError("Вязкий панельный метод применим при M < 0,8 (сжимаемость — поправкой "
                          "Кармана–Цяня); для трансзвука используйте Эйлер.")
-    alphas = np.asarray(alphas, float)
-    stop = {"flag": False}
 
-    def cb(i, n, r):
+
+def _run_parallel(kind, make_payload, alphas, re_list, workers, min_len, callback):
+    """Общая часть: куски по α × числа Re → процессы; сборка результатов."""
+    from .parallel import resolve_workers, split_alphas, run_tasks
+    alphas = np.asarray(alphas, float)
+    nw = resolve_workers(workers)
+    per_re = max(1, nw // len(re_list))
+    chunks = split_alphas(alphas, per_re, min_len)
+    tasks = []
+    for ir, re in enumerate(re_list):
+        for ic, idx in enumerate(chunks):
+            tasks.append((kind, make_payload(re, alphas[idx]), (ir, ic)))
+    total = len(alphas) * len(re_list)
+    done = {"n": 0}
+
+    def on_done(key, res):
+        done["n"] += len(res)
+        nconv = sum(bool(r.converged) for r in res)
         if callback:
-            stop["flag"] = bool(callback(f"Точка {i}/{n}: α = {r.alpha:g}° — "
-                                         f"{'сошлась' if r.converged else 'НЕ сошлась'}", i / n))
-        if stop["flag"]:
-            raise _Stop()
+            return bool(callback(f"Готово {done['n']}/{total} точек ({min(nw, len(tasks))} процесс(ов) "
+                                 f"из {nw}); в последнем куске сошлось {nconv}/{len(res)}",
+                                 done["n"] / total))
+        return False
 
     if callback:
-        callback("Первая точка (маршевое начальное приближение)…", 0.0)
-    try:
-        res = polar_robust(af, re, alphas, ncrit=ncrit, mach=mach, xtr=xtr, callback=cb)
-    except _Stop:
-        res = None
-    if res is None or any(r is None for r in res):
+        callback(f"Расчёт на {min(nw, len(tasks))} процессах (ядер для расчёта: {nw})…", 0.0)
+    out = run_tasks(tasks, nw, on_done)
+    if len(out) < len(tasks):
         raise RuntimeError("Расчёт остановлен")
+    results = []
+    for ir in range(len(re_list)):
+        res = [None] * len(alphas)
+        for ic, idx in enumerate(chunks):
+            for j, r in zip(idx, out[(ir, ic)]):
+                res[j] = r
+        results.append(res)
+    return alphas, results, min(nw, len(tasks))
+
+
+def run_viscous_batch(af: Airfoil, alphas, mach: float, re_list, ncrit: float = 9.0,
+                      xtr=(1.0, 1.0), callback=None, control=None, workers=None):
+    """Поляры для нескольких Re сразу, параллельно на ядрах процессора."""
+    re_list = [float(r) for r in np.atleast_1d(re_list)]
+    _check_viscous(re_list, mach)
+    alphas, results, nproc = _run_parallel(
+        "single", lambda re, al: (af, re, al, ncrit, mach, tuple(xtr)), alphas, re_list, workers, 4, callback)
+    return [_viscous_polar(af, alphas, res, mach, re, ncrit, xtr, control, nproc)
+            for re, res in zip(re_list, results)]
+
+
+def _viscous_polar(af, alphas, res, mach, re, ncrit, xtr, control, nproc):
     ok = np.array([r.converged for r in res])
     cpstar = critical_cp(mach)
     sup = np.array([np.min(r.cp) < cpstar for r in res]) if mach > 0 else np.zeros(len(res), bool)
@@ -254,6 +292,8 @@ def run_viscous(af: Airfoil, alphas, mach: float, re: float, ncrit: float = 9.0,
                  "сверке с продувками UIUC и NASA LTPT сопротивление при Re 1e5–3e5 ближе всего "
                  "при 10–11), 4–7 — турбулентный поток. Cd — по Сквайру–Янгу в конце следа, "
                  "Cdf — трение. Срыв на больших углах описывается приближённо.")
+    notes.append(f"Считалось параллельно: {nproc} процесс(ов); поляра разбита на куски по α, "
+                 "внутри куска — продолжение от соседней точки.")
     notes += _control_note(control)
     label = f"{af.name}, вязкий, Re={re:.3g}, M={mach:g}"
     return Polar(label, "viscous", mach, alphas, np.array([r.cl for r in res]),
@@ -269,62 +309,60 @@ def run_viscous(af: Airfoil, alphas, mach: float, re: float, ncrit: float = 9.0,
 
 
 def run_multi_viscous(elements, alphas, mach: float, re: float, ncrit: float = 9.0, xtr=(1.0, 1.0),
-                      callback=None, name: str = "многоэлементный", chord=None) -> Polar:
+                      callback=None, name: str = "многоэлементный", chord=None, workers=None) -> Polar:
     """Вязкий расчёт многоэлементного профиля (mviscous.py). Принудительный
     переход xtr (доля хорды по x) задаётся для основного (самого длинного)
     элемента; верх закрылков — турбулентный от носка (mviscous.default_transition)."""
-    from .mviscous import MultiViscousSolver
-    if not 1e4 <= re <= 1e9:
-        raise ValueError("Число Рейнольдса должно быть в диапазоне 1e4…1e9")
+    return run_multi_viscous_batch(elements, alphas, mach, [re], ncrit, xtr, callback, name, chord, workers)[0]
+
+
+def run_multi_viscous_batch(elements, alphas, mach: float, re_list, ncrit: float = 9.0, xtr=(1.0, 1.0),
+                            callback=None, name: str = "многоэлементный", chord=None, workers=None):
+    from .mviscous import default_transition
+    re_list = [float(r) for r in np.atleast_1d(re_list)]
+    for re in re_list:
+        if not 1e4 <= re <= 1e9:
+            raise ValueError("Число Рейнольдса должно быть в диапазоне 1e4…1e9")
     if mach >= 0.6:
         raise ValueError("Вязкий расчёт механизации — при M < 0,6")
-    alphas = np.asarray(alphas, float)
-    from .mviscous import default_transition
     chords = [float(np.max(e.x) - np.min(e.x)) for e in elements]
     imain = int(np.argmax(chords))
     xt = default_transition(elements, xtr)
     npn = [max(80, int(round(180 * c / max(chords) / 20)) * 20) for c in chords]
     if not chord:
         chord = float(max(np.max(e.x) for e in elements) - min(np.min(e.x) for e in elements))
-    ms = MultiViscousSolver(elements, re, ncrit=ncrit, mach=mach, xtr=xt, chord=chord, n_panels=npn)
-    stop = {"flag": False}
-
-    def cb(i, n, r):
-        if callback:
-            stop["flag"] = bool(callback(f"Точка {i}/{n}: α = {r.alpha:g}° — "
-                                         f"{'сошлась' if r.converged else 'НЕ сошлась'}", i / n))
-        if stop["flag"]:
-            raise _Stop()
-
-    if callback:
-        callback("Первая точка (маршевое начальное приближение по всем элементам)…", 0.0)
-    try:
-        res = ms.polar(alphas, callback=cb)
-    except _Stop:
-        raise RuntimeError("Расчёт остановлен") from None
-    ok = np.array([r.converged for r in res])
-    notes = [f"Вязкий расчёт механизации: {len(elements)} элемента(ов), у каждого свой пограничный "
-             "слой и след. Re = {re:.3g}, Ñкрит = {ncrit:g}; принудительный переход xtr — на основном "
-             "элементе, верх закрылков — турбулентный от носка. След переднего элемента идёт над закрылком отдельным слоем (слияние со слоем "
-             "закрылка не моделируется). Сверка с продувками GA(W)-1 + закрылок Фаулера 29 % "
-             "(NASA CR-2443) — в README. Срыв закрылка и Cl_max — приближённо."]
-    notes[0] = notes[0].format(re=re, ncrit=ncrit)
-    if not ok.all():
-        notes.append(f"Не сошлись: α = {', '.join(f'{a:g}' for a in alphas[~ok])}°.")
-    notes.append("Cl по элементам: " + "; ".join(
-        f"{r.alpha:g}°: " + ", ".join(f"{e['cl']:.3f}" for e in r.elements) for r in res))
-    xs = [np.concatenate([np.append(e["x"], np.nan) for e in r.elements]) for r in res]
-    cps = [np.concatenate([np.append(e["cp"], np.nan) for e in r.elements]) for r in res]
-    cpi = [np.concatenate([np.append(e["cp_inv"], np.nan) for e in r.elements]) for r in res]
-    return Polar(f"{name}, вязкий, Re={re:.3g}, M={mach:g}", "multi_viscous", mach, alphas,
-                 np.array([r.cl for r in res]), np.array([r.cd for r in res]), np.array([r.cm for r in res]),
-                 ok, xs, cps, notes, re=re, cdf=np.array([r.cdf for r in res]),
-                 xtr_u=np.array([r.elements[imain]["xtr_u"] for r in res]),
-                 xtr_l=np.array([r.elements[imain]["xtr_l"] for r in res]),
-                 bl=[r.elements[imain]["side"] for r in res], cp_inv=cpi,
-                 field_ctx=dict(method="multi_viscous", elements=elements, mach=mach, chord=chord,
-                                alpha=alphas, re=re, ncrit=ncrit, xtr=xt, n_panels=npn,
-                                states=[r.state for r in res]))
+    # холодный старт механизации дорогой (20–90 с) — куски по α не короче 3 точек
+    alphas, results, nproc = _run_parallel(
+        "multi", lambda re, al: (elements, re, al, ncrit, mach, xt, chord, npn), alphas, re_list, workers, 3,
+        callback)
+    out = []
+    for re, res in zip(re_list, results):
+        ok = np.array([r.converged for r in res])
+        notes = [f"Вязкий расчёт механизации: {len(elements)} элемента(ов), у каждого свой пограничный "
+                 f"слой и след. Re = {re:.3g}, Ñкрит = {ncrit:g}; принудительный переход xtr — на основном "
+                 "элементе, верх закрылков — турбулентный от носка. След переднего элемента идёт над "
+                 "закрылком отдельным слоем (слияние со слоем закрылка не моделируется). Сверка с "
+                 "продувками GA(W)-1 + закрылок Фаулера 29 % (NASA CR-2443) — в README. Срыв закрылка "
+                 "и Cl_max — приближённо.",
+                 f"Считалось параллельно: {nproc} процесс(ов)."]
+        if not ok.all():
+            notes.append(f"Не сошлись: α = {', '.join(f'{a:g}' for a in alphas[~ok])}°.")
+        notes.append("Cl по элементам: " + "; ".join(
+            f"{r.alpha:g}°: " + ", ".join(f"{e['cl']:.3f}" for e in r.elements) for r in res))
+        xs = [np.concatenate([np.append(e["x"], np.nan) for e in r.elements]) for r in res]
+        cps = [np.concatenate([np.append(e["cp"], np.nan) for e in r.elements]) for r in res]
+        cpi = [np.concatenate([np.append(e["cp_inv"], np.nan) for e in r.elements]) for r in res]
+        out.append(Polar(f"{name}, вязкий, Re={re:.3g}, M={mach:g}", "multi_viscous", mach, alphas,
+                         np.array([r.cl for r in res]), np.array([r.cd for r in res]),
+                         np.array([r.cm for r in res]), ok, xs, cps, notes, re=re,
+                         cdf=np.array([r.cdf for r in res]),
+                         xtr_u=np.array([r.elements[imain]["xtr_u"] for r in res]),
+                         xtr_l=np.array([r.elements[imain]["xtr_l"] for r in res]),
+                         bl=[r.elements[imain]["side"] for r in res], cp_inv=cpi,
+                         field_ctx=dict(method="multi_viscous", elements=elements, mach=mach, chord=chord,
+                                        alpha=alphas, re=re, ncrit=ncrit, xtr=xt, n_panels=npn,
+                                        states=[r.state for r in res])))
+    return out
 
 
 class _Stop(Exception):
