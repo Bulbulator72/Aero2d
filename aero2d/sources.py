@@ -17,11 +17,33 @@ import numpy as np
 QOPI = 0.25 / np.pi
 
 
-def lin_source(xs, ys, xp, yp, self_idx=None, on_sheet=False, wake_sheet=False):
+def _wrap(a):
+    return (a + np.pi) % (2 * np.pi) - np.pi
+
+
+def unwrapped_angles(path_x, path_y, xp, yp):
+    """Полярные углы точек (xp, yp) относительно узлов пути (тело + его след,
+    путь заканчивается в конце следа), непрерывные вдоль пути. Разрез — луч
+    из конца следа по +x (вниз по потоку), он не пересекает ни одно тело."""
+    dx = xp[:, None] - path_x[None, :]
+    dy = yp[:, None] - path_y[None, :]
+    raw = np.arctan2(dy, dx)
+    phi = np.empty_like(raw)
+    phi[:, -1] = np.arctan2(-dy[:, -1], -dx[:, -1]) + np.pi      # ∈ (0, 2π], разрез по +x
+    for j in range(raw.shape[1] - 2, -1, -1):
+        phi[:, j] = phi[:, j + 1] + _wrap(raw[:, j] - raw[:, j + 1])
+    return phi
+
+
+def lin_source(xs, ys, xp, yp, self_idx=None, on_sheet=False, wake_sheet=False, phi=None):
     """xs, ys — узлы слоя (ns); xp, yp — точки (np). self_idx[p] — индекс узла
     слоя, совпадающего с точкой p (или -1). on_sheet — точки лежат на этом же
     слое (тогда SGN = 1, как в XFOIL). wake_sheet — слой следа (ветвь арктангенса
-    как в PSWLIN)."""
+    как в PSWLIN).
+    phi (np, ns) — заданные полярные углы точек относительно узлов слоя
+    (непрерывные вдоль слоя): функция тока многозначна, и для точек на другом
+    теле разрез нужно провести так, чтобы он это тело не пересекал (см.
+    unwrapped_angles)."""
     xs, ys = np.asarray(xs, float), np.asarray(ys, float)
     xp, yp = np.asarray(xp, float), np.asarray(yp, float)
     ns, npt = len(xs), len(xp)
@@ -59,6 +81,13 @@ def lin_source(xs, ys, xp, yp, self_idx=None, on_sheet=False, wake_sheet=False):
         rs0 = x0 * x0 + yy * yy
         g0 = np.log(rs0)
         t0 = np.arctan2(sgn * x0, sgn * yy) + shift_sign * (0.5 - 0.5 * sgn) * np.pi
+        if phi is not None:
+            # t − apan ≡ −φ (φ — полярный угол точки относительно узла)
+            ph1 = phi[:, jo]
+            ph0r = np.arctan2(yp - 0.5 * (ys[jo] + ys[jp]), xp - 0.5 * (xs[jo] + xs[jp]))
+            ph0 = ph1 + _wrap(ph0r - ph1)
+            ph2 = phi[:, jp]
+            t1, t0, t2 = apan - ph1, apan - ph0, apan - ph2
         # производные локальных координат по координатам точки:
         # для направления n: x1i = x2i = s·n, yyi = s × n
         dirs = ((1.0, 0.0), (0.0, 1.0))

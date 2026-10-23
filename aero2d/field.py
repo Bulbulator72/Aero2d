@@ -74,6 +74,47 @@ def compute_field(ctx: dict, k: int, box=None, n: int = 220) -> dict:
             disp.append((x[nd] + ds * nx_[nd], y[nd] + ds * ny_[nd]))
         extra["disp"] = disp
         extra["converged"] = bool(r.converged)
+    elif ctx["method"] == "multi_viscous":
+        from .mviscous import MultiViscousSolver
+        from .sources import lin_source
+        ms = MultiViscousSolver(ctx["elements"], ctx["re"], ncrit=ctx["ncrit"], mach=ctx["mach"],
+                                xtr=ctx["xtr"], chord=ctx.get("chord") or 1.0, n_panels=ctx["n_panels"])
+        with np.errstate(all="ignore"):
+            r = ms.solve(alpha, init=ctx["states"][k], homotopy=False, max_iter=15)
+            g_inv = ms.mp.gamma(alpha)
+            ms._g_cur = None
+            ms._build(alpha, g_inv)
+            Xs = ms._from_state(r.state)
+            Xs = ms._relocate(Xs, alpha, g_inv)
+        m = Xs[:, 1]
+        g = g_inv + ms.dg_dm @ m
+        q = np.zeros(ms.offs[-1])
+        nodes = np.where(ms.st_of_node >= 0)[0]
+        q[nodes] = ms.sgm[nodes] * m[ms.st_of_node[nodes]]
+        U = np.full(xp.shape, np.cos(a))
+        V = np.full(xp.shape, np.sin(a))
+        inside = np.zeros(xp.shape, bool)
+        bodies, disp, wakes = [], [], []
+        ue = ms.ue_inv + ms.D @ m
+        for e, (x, y) in enumerate(ms.els):
+            sl = slice(ms.offs[e], ms.offs[e + 1])
+            Uv, Vv = vortex_velocity_influence(x, y, xp, yp)
+            _, Px, Py = lin_source(x, y, xp, yp)
+            wx, wy = ms.wakes[e]
+            _, Pxw, Pyw = lin_source(wx, wy, xp, yp, wake_sheet=True)
+            qw = m[ms.st_wk_el[e]]
+            U += Uv @ g[sl] + Py @ q[sl] + Pyw @ qw
+            V += Vv @ g[sl] - (Px @ q[sl] + Pxw @ qw)
+            inside |= Path(np.column_stack([x, y])).contains_points(np.column_stack([xp, yp]))
+            bodies.append((x, y))
+            wakes.append((wx, wy))
+            nx_, ny_ = _node_normals(x, y)
+            for sts in (ms.st_up_el[e], ms.st_lo_el[e]):
+                nd = ms.node[sts] - ms.offs[e]
+                ds = Xs[sts, 1] / np.maximum(np.abs(ue[sts]), 1e-6)
+                disp.append((x[nd] + ds * nx_[nd], y[nd] + ds * ny_[nd]))
+        extra.update(bodies=bodies, disp=disp, wakes=wakes, converged=bool(r.converged))
+        x, y = bodies[0]
     elif ctx["method"] == "multi":
         from .multi import MultiPanelSolver
         ms = MultiPanelSolver(ctx["elements"], chord=ctx.get("chord"))
@@ -98,7 +139,7 @@ def compute_field(ctx: dict, k: int, box=None, n: int = 220) -> dict:
         U = np.cos(a) + Uv @ g
         V = np.sin(a) + Vv @ g
         extra["converged"] = True
-    if ctx["method"] != "multi":
+    if ctx["method"] not in ("multi", "multi_viscous"):
         inside = Path(np.column_stack([x, y])).contains_points(np.column_stack([xp, yp]))
     q2 = U**2 + V**2
     cp0 = 1.0 - q2

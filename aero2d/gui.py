@@ -490,11 +490,10 @@ class App(tk.Tk):
         self.airfoil = af
         method, grid = self.method.get(), self.grid_name.get()
         if isinstance(af, list):
-            if method != "panel":
-                messagebox.showinfo("Механизация", "Для многоэлементного профиля пока доступен только "
-                                    "невязкий панельный расчёт (распределение давления и нагрузки "
-                                    "по элементам). Вязкий расчёт механизации — следующий этап.")
-            method = "multi"
+            if method == "euler":
+                messagebox.showinfo("Механизация", "Для многоэлементного профиля доступны вязкий и "
+                                    "невязкий панельный расчёты; выполняется вязкий.")
+            method = "multi" if method == "panel" else "multi_viscous"
         self.stop_flag.clear()
         self.btn_run.configure(state="disabled")
         self.btn_stop.configure(state="normal" if method not in ("panel", "multi") else "disabled")
@@ -508,9 +507,13 @@ class App(tk.Tk):
                 def cb(text, frac):
                     self.q.put(("progress", text, frac))
                     return self.stop_flag.is_set()
-                if method == "multi":
+                if method in ("multi", "multi_viscous"):
                     nm = self.hl_desc.get() if self.src.get() != "mfile" else os.path.basename(self.mfile.get())
-                    p = core.run_multi(af, alphas, mach, nm, chord=1.0 if self.src.get() != "mfile" else None)
+                    ch = 1.0 if self.src.get() != "mfile" else None
+                    if method == "multi":
+                        p = core.run_multi(af, alphas, mach, nm, chord=ch)
+                    else:
+                        p = core.run_multi_viscous(af, alphas, mach, re_, ncrit, xtr, cb, nm, chord=ch)
                 elif method == "panel":
                     p = core.run_panel(af, alphas, mach, control=control)
                 elif method == "viscous":
@@ -775,7 +778,9 @@ class App(tk.Tk):
         if "disp" in f:
             for dx, dy in f["disp"]:
                 ax.plot(dx, dy, "-", color="#ffd400", lw=1.0, zorder=4)
-            ax.plot(*f["wake"], "--", color="#ffd400", lw=0.9, zorder=4)
+            for wk in f.get("wakes", [f.get("wake")]):
+                if wk is not None:
+                    ax.plot(*wk, "--", color="#ffd400", lw=0.9, zorder=4)
         ax.set_xlim(X.min(), X.max())
         ax.set_ylim(Y.min(), Y.max())
         ax.set_aspect("equal")

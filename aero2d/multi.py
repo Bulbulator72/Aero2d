@@ -153,6 +153,31 @@ def _segment(fu, fl, x0, x1, round_le=True, te_taper=0.0, close_te=True):
     return _contour(t, yc + 0.5 * th, yc - 0.5 * th)
 
 
+def _cove_fairing(t, up, lo, xa, xb, wedge=8.0):
+    """Нижняя поверхность основной части над нишей закрылка: кубика Эрмита от
+    начала ниши (касательно к низу профиля) к кромке козырька (угол клина
+    кромки — wedge градусов). Реальная ниша занята застойной зоной с примерно
+    такой границей; тонкий «язык» над нишей (верх минус 0,2 %) делает
+    вязкий расчёт плохо обусловленным."""
+    lo = lo.copy()
+    m = t >= xa
+    if m.sum() < 3:
+        return lo
+    ia = int(np.argmax(m))
+    h = 1e-3
+    s_lo = (np.interp(xa + h, t, lo) - np.interp(xa - h, t, lo)) / (2 * h)
+    s_up = (np.interp(xb, t, up) - np.interp(xb - 2 * h, t, up)) / (2 * h)
+    s_te = np.tan(np.arctan(s_up) + np.radians(wedge))
+    p0, p1 = np.array([xa, lo[ia]]), np.array([xb, np.interp(xb, t, up)])
+    L = xb - xa
+    u = (t[m] - xa) / L
+    h00, h10, h01, h11 = 2*u**3 - 3*u**2 + 1, u**3 - 2*u**2 + u, -2*u**3 + 3*u**2, u**3 - u**2
+    lo[m] = h00 * p0[1] + h10 * L * s_lo + h01 * p1[1] + h11 * L * s_te
+    lo[m] = np.minimum(lo[m], up[m] - 0.004 * (1 - u) ** 0.5)
+    lo[-1] = up[-1]
+    return lo
+
+
 def _rotate(x, y, px, py, deg):
     """Поворот по часовой стрелке на deg градусов (положительный угол — задняя
     часть элемента вниз, если точка поворота спереди)."""
@@ -239,19 +264,22 @@ def highlift(af: Airfoil, flap: dict | None = None, slat: dict | None = None, n_
     x_cut = 1.0 - (flap or {}).get("chord", 0.0) if flap else 1.0
     if flap:
         ftype = flap.get("type", "slotted")
-        cove = min(flap["chord"], 0.25) if ftype == "fowler" else min(0.12, 0.5 * flap["chord"])
-        t = _cos_pts(x_le_main, x_cut, 400)
+        cf = flap["chord"]
+        # Фаулер: верхняя обшивка (козырёк) нависает над убранным закрылком почти
+        # до задней кромки (как у GA(W)-1: козырёк до 0,96 при закрылке 0,29),
+        # ниша закрыта обтекателем от носка убранного закрылка до кромки
+        # козырька; однощелевой/двухщелевой — короткий козырёк, обтекатель
+        # ниши длиной 0,85 хорды закрылка перед ним
+        x_lip = x_cut + 0.85 * cf if ftype == "fowler" else x_cut
+        xa = x_cut if ftype == "fowler" else x_cut - 0.85 * cf
+        t = _cos_pts(x_le_main, x_lip, 400)
         if slat:
-            mx, my = _segment(fu, fl, x_le_main, x_cut, round_le=True, close_te=False)
-            t2 = _cos_pts(x_le_main, x_cut, 400)
-            up = np.interp(t2, *_upper_of(mx, my))
-            lo = np.interp(t2, *_lower_of(mx, my))
-            t = t2
+            mx, my = _segment(fu, fl, x_le_main, x_lip, round_le=True, close_te=False)
+            up = np.interp(t, *_upper_of(mx, my))
+            lo = np.interp(t, *_lower_of(mx, my))
         else:
             up, lo = fu(t), fl(t)
-        w = _smooth((t - (x_cut - cove)) / cove)
-        lo = lo * (1 - w) + (up - 0.002 * (1 - w)) * w
-        lo[-1] = up[-1]
+        lo = _cove_fairing(t, up, lo, xa, x_lip)
         mx, my = _contour(t, up, lo)
     else:
         mx, my = _segment(fu, fl, x_le_main, 1.0, round_le=bool(slat))

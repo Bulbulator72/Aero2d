@@ -417,6 +417,18 @@ class ViscousSolver:
             vd, ok = self._local_newton(fint, v, [TH, M, N_, S_])
             if not np.all(np.isfinite(vd)):
                 vd, ok = v.copy(), False
+            if not ok:
+                # другие начальные приближения (у точки торможения при резком
+                # разгоне потока Ньютон от θ_a может уйти в S → 0)
+                for fth in (0.8, 0.6, 1.25):
+                    g2 = v.copy()
+                    g2[TH] = fth * v[0]
+                    g2[M] = v[1] / v[4] / v[0] * g2[TH] * v[U]
+                    g2[S_] = max(v[3], 0.01) if (xtr_f is None or v[2] >= self.ncrit) else v[3]
+                    v2, ok2 = self._local_newton(fint, g2, [TH, M, N_, S_])
+                    if ok2 and np.all(np.isfinite(v2)):
+                        vd, ok = v2, True
+                        break
             hk = vd[M] / vd[U] / vd[TH]
             if xtr_f is None:
                 hmax = hmax_t                      # след

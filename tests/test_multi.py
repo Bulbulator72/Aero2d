@@ -58,3 +58,38 @@ def test_highlift_types_valid_and_converged():
         r2 = MultiPanelSolver(highlift(af, n_side=120, **c), chord=1.0).solve(8.0).cl
         assert abs(r1 / r2 - 1) < 5e-3
         assert r1 > base + 0.5
+
+
+def test_multi_viscous_single_matches_viscous():
+    """Один элемент в многоэлементном вязком решателе = обычный вязкий расчёт."""
+    import warnings
+    warnings.filterwarnings("ignore")
+    from aero2d.geometry import naca4
+    from aero2d.viscous import ViscousSolver
+    from aero2d.mviscous import MultiViscousSolver
+    af = naca4("2412", 120)
+    r1 = ViscousSolver(af, 3e6, n_panels=160).solve(4.0)
+    r2 = MultiViscousSolver([af], 3e6, n_panels=160).solve(4.0)
+    assert r1.converged and r2.converged
+    assert abs(r1.cl - r2.cl) < 1e-4 and abs(r1.cd - r2.cd) < 1e-5
+
+
+def test_unwrapped_source_psi_single_valued():
+    """Функция тока источников с разрезом за концом следа однозначна вокруг тела."""
+    from aero2d.geometry import naca4
+    from aero2d.sources import lin_source, unwrapped_angles
+    af = naca4("0012", 40)
+    x, y = af.x, af.y
+    wx, wy = np.linspace(1.0, 2, 10), np.zeros(10)
+    rng = np.random.default_rng(1)
+    qa, qw = rng.random(len(x)), rng.random(10) + 1
+    t = np.linspace(np.pi / 2, 3 * np.pi / 2, 4001)
+    cx, cy = 0.5 + 0.8 * np.cos(t), 0.35 * np.sin(t)
+    px, py = np.concatenate([x, wx[1:]]), np.concatenate([y, wy[1:]])
+    phi = unwrapped_angles(px, py, cx, cy)
+    Pa, Xa, Ya = lin_source(x, y, cx, cy, phi=phi[:, :len(x)])
+    Pw, Xw, Yw = lin_source(wx, wy, cx, cy, wake_sheet=True, phi=phi[:, len(x) - 1:])
+    p = Pa @ qa + Pw @ qw
+    U, V = Ya @ qa + Yw @ qw, -(Xa @ qa + Xw @ qw)
+    dp = np.sum(0.5 * (U[1:] + U[:-1]) * np.diff(cy) - 0.5 * (V[1:] + V[:-1]) * np.diff(cx))
+    assert abs((p[-1] - p[0]) - dp) < 1e-6
