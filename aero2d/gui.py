@@ -62,7 +62,7 @@ class App(tk.Tk):
         f = ttk.LabelFrame(left, text="Профиль", padding=6)
         f.pack(fill="x", pady=4)
         self.src = tk.StringVar(value="naca")
-        ttk.Radiobutton(f, text="NACA, 4 цифры:", variable=self.src, value="naca",
+        ttk.Radiobutton(f, text="NACA (2412, 0012-64, 16-012):", variable=self.src, value="naca",
                         command=self.preview_airfoil).grid(row=0, column=0, sticky="w")
         self.naca = tk.StringVar(value="2412")
         e = ttk.Entry(f, textvariable=self.naca, width=8)
@@ -82,16 +82,28 @@ class App(tk.Tk):
         ttk.Label(f, textvariable=self.file_disp, foreground="#555", wraplength=250).grid(
             row=3, column=0, columnspan=2, sticky="w")
         ttk.Checkbutton(f, text="сгладить контур (измеренные координаты)", variable=self.smooth,
-                        command=self.preview_airfoil).grid(row=4, column=0, columnspan=2, sticky="w")
+                        command=self.preview_airfoil).grid(row=5, column=0, columnspan=2, sticky="w")
+        # --- встроенный набор (симметричные профили 6-й серии для оперения и др.)
+        lib = core.library()
+        self._lib = dict(lib)
+        lf = ttk.Frame(f)
+        lf.grid(row=4, column=0, columnspan=2, sticky="w")
+        ttk.Radiobutton(lf, text="Из набора:", variable=self.src, value="lib",
+                        command=self.preview_airfoil).pack(side="left")
+        self.lib_name = tk.StringVar(value=lib[0][0] if lib else "")
+        cl_ = ttk.Combobox(lf, textvariable=self.lib_name, values=[n for n, _ in lib], state="readonly", width=20)
+        cl_.pack(side="left")
+        cl_.bind("<<ComboboxSelected>>", lambda _: (self.src.set("lib"), self.preview_airfoil()))
+        self._control = None
         # --- механизация из одного профиля
         self.hl_cfg = {"flap": None, "slat": None}
         hf = ttk.Frame(f)
-        hf.grid(row=5, column=0, columnspan=2, sticky="we", pady=(4, 0))
+        hf.grid(row=6, column=0, columnspan=2, sticky="we", pady=(4, 0))
         ttk.Label(hf, text="Механизация:").pack(side="left")
         ttk.Button(hf, text="Настроить…", command=self.open_highlift).pack(side="right")
         self.hl_desc = tk.StringVar(value="нет")
         ttk.Label(f, textvariable=self.hl_desc, foreground="#555", wraplength=250).grid(
-            row=6, column=0, columnspan=2, sticky="w")
+            row=7, column=0, columnspan=2, sticky="w")
 
         # --- режим
         f = ttk.LabelFrame(left, text="Режим", padding=6)
@@ -152,7 +164,7 @@ class App(tk.Tk):
         self.t_geo = PlotTab(nb, "Профиль")
         self.t_cl = PlotTab(nb, "Cl(α)")
         self.t_cd = PlotTab(nb, "Cd(α), Cl(Cd)")
-        self.t_cm = PlotTab(nb, "Cm(α)")
+        self.t_cm = PlotTab(nb, "Cm(α), Ch(α)")
         self.t_cp = PlotTab(nb, "Распределение Cp")
         bar = ttk.Frame(self.t_cp.frame)
         bar.pack(side="top", fill="x", before=self.t_cp.canvas.get_tk_widget())
@@ -196,10 +208,10 @@ class App(tk.Tk):
         # таблица
         tf = ttk.Frame(nb)
         nb.add(tf, text="Таблица")
-        cols = ("calc", "alpha", "cl", "cd", "cdf", "cm", "xu", "xl", "ok")
+        cols = ("calc", "alpha", "cl", "cd", "cdf", "cm", "ch", "xu", "xl", "ok")
         self.table = ttk.Treeview(tf, columns=cols, show="headings")
-        for c, t, w in zip(cols, ["Расчёт", "α, °", "Cl", "Cd", "Cd трения", "Cm", "Переход верх",
-                                  "Переход низ", "Надёжно"], [330, 50, 75, 80, 80, 75, 85, 85, 65]):
+        for c, t, w in zip(cols, ["Расчёт", "α, °", "Cl", "Cd", "Cd трения", "Cm", "Ch руля", "Переход верх",
+                                  "Переход низ", "Надёжно"], [300, 50, 75, 80, 80, 75, 75, 85, 85, 65]):
             self.table.heading(c, text=t)
             self.table.column(c, width=w, anchor="w" if c == "calc" else "e")
         sb = ttk.Scrollbar(tf, orient="vertical", command=self.table.yview)
@@ -246,6 +258,7 @@ class App(tk.Tk):
             "Фаулера": dict(chord=0.30, deflection=30, gap=0.02, overlap=0.0),
             "двухщелевой": dict(chord=0.35, deflection=45, gap=0.012, overlap=0.0,
                                 vane_chord=0.12, vane_deflection=20, vane_gap=0.015, vane_overlap=0.0),
+            "руль/элерон (поворотный)": dict(chord=0.30, deflection=10, balance=0.20),
         }
         fl = self.hl_cfg["flap"] or {}
         sl = self.hl_cfg["slat"] or {}
@@ -262,8 +275,10 @@ class App(tk.Tk):
         ttk.Label(frm, text="тип").grid(row=0, column=0, sticky="w")
         cb = ttk.Combobox(frm, textvariable=ftype, values=list(FLAP_TYPES), state="readonly", width=14)
         cb.grid(row=0, column=1, sticky="w")
-        rows = [("хорда закрылка (всего), доли хорды", "chord", 0.30), ("угол отклонения δ, °", "deflection", 30),
-                ("зазор, доли хорды", "gap", 0.015), ("перекрытие, доли хорды", "overlap", 0.0)]
+        rows = [("хорда закрылка/руля (от оси), доли хорды", "chord", 0.30),
+                ("угол отклонения δ, °", "deflection", 30),
+                ("зазор, доли хорды", "gap", 0.015), ("перекрытие, доли хорды", "overlap", 0.0),
+                ("осевая компенсация руля, доли хорды руля", "balance", 0.0)]
         for r, (lbl, k, d) in enumerate(rows, start=1):
             ttk.Label(frm, text=lbl).grid(row=r, column=0, sticky="w")
             ttk.Entry(frm, textvariable=var("f_" + k, fl.get(k, d)), width=8).grid(row=r, column=1, sticky="w")
@@ -289,7 +304,11 @@ class App(tk.Tk):
             "выдвинут вперёд за эту кромку; у предкрылка — на сколько его кромка позади "
             "носка основной части. Однощелевой: короткая ниша, перекрытие ~0,01–0,03. "
             "Фаулера: закрылок убран в глубокую нишу и выдвинут назад (перекрытие ~0 — "
-            "наибольшее увеличение хорды). Коэффициенты отнесены к хорде исходного профиля.")
+            "наибольшее увеличение хорды). Коэффициенты отнесены к хорде исходного профиля.\n"
+            "Руль/элерон: задняя часть поворачивается вокруг оси (одним контуром, щель "
+            "герметична), считается вязким или невязким методом; зазор и перекрытие не "
+            "используются. Осевая компенсация — длина носка руля впереди оси в долях хорды "
+            "руля (обычно 0,15–0,30); влияет на шарнирный момент Ch.")
                   ).grid(row=3, column=0, padx=6, pady=4, sticky="w")
 
         def on_type(_=None):
@@ -304,7 +323,12 @@ class App(tk.Tk):
             try:
                 t = FLAP_TYPES[ftype.get()]
                 flap = None
-                if t:
+                if t == "control":
+                    flap = dict(type=t, chord=num("f_chord"), deflection=num("f_deflection"),
+                                balance=num("f_balance"))
+                    if not 0.0 <= flap["balance"] <= 0.6:
+                        raise ValueError("осевая компенсация — от 0 до 0,6 хорды руля")
+                elif t:
                     flap = dict(type=t, **{k: num("f_" + k) for k in ("chord", "deflection", "gap", "overlap")})
                     if t == "double":
                         flap.update({k: num("f_" + k) for k in
@@ -314,6 +338,8 @@ class App(tk.Tk):
                     if not 0.05 <= flap["chord"] <= 0.5:
                         raise ValueError("хорда закрылка — от 0,05 до 0,5")
                 slat = None
+                if slat_on.get() and t == "control":
+                    raise ValueError("руль считается одним контуром — предкрылок с ним пока не поддерживается")
                 if slat_on.get():
                     slat = {k: num("s_" + k) for k in ("chord", "deflection", "gap", "overlap")}
                     if not 0.05 <= slat["chord"] <= 0.3:
@@ -328,7 +354,10 @@ class App(tk.Tk):
             if flap:
                 nm = ftype.get()
                 d = f"{flap['vane_deflection']:g}/{flap['deflection']:g}" if t == "double" else f"{flap['deflection']:g}"
-                parts.append(f"закрылок {nm} {d}°")
+                if t == "control":
+                    parts.append(f"руль {flap['chord']:g}c, δ {d}°, компенсация {100 * flap['balance']:g} %")
+                else:
+                    parts.append(f"закрылок {nm} {d}°")
             self.hl_desc.set(", ".join(parts) if parts else "нет")
             if self.src.get() == "mfile":
                 self.src.set("naca")
@@ -359,12 +388,24 @@ class App(tk.Tk):
             els = load_multi(self.mfile.get())
             return [repanel(e, 80, keep_frame=True) for e in els]
         af = self.get_airfoil()
-        if self.hl_cfg["flap"] or self.hl_cfg["slat"]:
+        self._control = None
+        fl = self.hl_cfg["flap"]
+        if fl and fl.get("type") == "control":
+            from .controls import deflect, hinge_point
+            xh = 1.0 - fl["chord"]
+            self._control = dict(x_hinge=xh, deflection=fl["deflection"], balance=fl.get("balance", 0.0),
+                                 hinge=hinge_point(af, xh))
+            out = deflect(af, xh, fl["deflection"])
+            out.name = af.name + f", руль {fl['deflection']:g}°"
+            return out
+        if fl or self.hl_cfg["slat"]:
             from .multi import highlift
-            return highlift(af, flap=self.hl_cfg["flap"], slat=self.hl_cfg["slat"])
+            return highlift(af, flap=fl, slat=self.hl_cfg["slat"])
         return af
 
     def get_airfoil(self):
+        if self.src.get() == "lib":
+            return core.make_airfoil("lib", self._lib[self.lib_name.get()])
         if self.src.get() == "file":
             if not self.file.get():
                 raise ValueError("Выберите файл координат")
@@ -399,6 +440,14 @@ class App(tk.Tk):
         ax.plot(af.x, af.y, ".", color="#1f77b4", ms=2)
         ax.set_aspect("equal")
         ax.grid(alpha=0.3)
+        if self._control:
+            h = self._control["hinge"]
+            ax.plot([h[0]], [h[1]], "o", color="#d62728", ms=5, label="ось руля")
+            b = self._control["balance"] * (1 - self._control["x_hinge"])
+            if b > 0:
+                ax.plot([h[0] - b, h[0]], [h[1], h[1]], "-", color="#d62728", lw=2.5,
+                        label="осевая компенсация (носок руля в нише)")
+            ax.legend(fontsize=8)
         tmax = self._thickness(af)
         ax.set_title(f"{af.name}: {len(af.x) - 1} панелей, наибольшая толщина {100 * tmax:.1f} %")
         ax.set_xlabel("x/c")
@@ -452,6 +501,8 @@ class App(tk.Tk):
         self.progress["value"] = 0
         self.status.set("Расчёт…")
 
+        control = self._control
+
         def job():
             try:
                 def cb(text, frac):
@@ -461,9 +512,9 @@ class App(tk.Tk):
                     nm = self.hl_desc.get() if self.src.get() != "mfile" else os.path.basename(self.mfile.get())
                     p = core.run_multi(af, alphas, mach, nm, chord=1.0 if self.src.get() != "mfile" else None)
                 elif method == "panel":
-                    p = core.run_panel(af, alphas, mach)
+                    p = core.run_panel(af, alphas, mach, control=control)
                 elif method == "viscous":
-                    p = core.run_viscous(af, alphas, mach, re_, ncrit, xtr, cb)
+                    p = core.run_viscous(af, alphas, mach, re_, ncrit, xtr, cb, control=control)
                 else:
                     p = core.run_euler(af, alphas, mach, grid, niter, cb)
                     if self.stop_flag.is_set():
@@ -516,7 +567,7 @@ class App(tk.Tk):
         for k in range(len(p.alpha)):
             self.table.insert("", "end", values=(
                 p.label, f"{p.alpha[k]:g}", f"{p.cl[k]:.4f}", fmt(p.cd, k, ".5f"), fmt(p.cdf, k, ".5f"),
-                f"{p.cm[k]:.4f}", fmt(p.xtr_u, k, ".3f"), fmt(p.xtr_l, k, ".3f"),
+                f"{p.cm[k]:.4f}", fmt(p.ch, k, ".4f"), fmt(p.xtr_u, k, ".3f"), fmt(p.xtr_l, k, ".3f"),
                 "да" if p.ok[k] else "НЕТ"))
         alphas = sorted({f"{a:g}" for q in self.polars for a in q.alpha}, key=float)
         self.cb_alpha["values"] = alphas
@@ -545,7 +596,9 @@ class App(tk.Tk):
         for t in (self.t_cl, self.t_cd, self.t_cm):
             t.fig.clear()
         axl = self.t_cl.fig.add_subplot(111)
-        axm = self.t_cm.fig.add_subplot(111)
+        any_ch = any(p.ch is not None for p in self.polars)
+        axm = self.t_cm.fig.add_subplot(121 if any_ch else 111)
+        axh = self.t_cm.fig.add_subplot(122) if any_ch else None
         axd1 = self.t_cd.fig.add_subplot(121)
         axd2 = self.t_cd.fig.add_subplot(122)
         any_cd = False
@@ -553,12 +606,16 @@ class App(tk.Tk):
             c = COLORS[i % len(COLORS)]
             self._series(axl, p.alpha, p.cl, p.ok, c, p.label)
             self._series(axm, p.alpha, p.cm, p.ok, c, p.label)
+            if axh is not None and p.ch is not None:
+                self._series(axh, p.alpha, p.ch, p.ok, c, p.label)
             if not np.all(np.isnan(p.cd)):
                 any_cd = True
                 self._series(axd1, p.alpha, p.cd, p.ok, c, p.label)
                 self._series(axd2, p.cd, p.cl, p.ok, c, p.label)
         self._style(axl, "α, °", "Cl")
         self._style(axm, "α, °", "Cm (относительно 1/4 хорды)")
+        if axh is not None:
+            self._style(axh, "α, °", "Ch руля (> 0 — задней кромкой вниз)")
         if any_cd:
             self._style(axd1, "α, °", "Cd")
             self._style(axd2, "Cd", "Cl")

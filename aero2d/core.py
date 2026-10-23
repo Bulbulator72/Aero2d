@@ -38,11 +38,21 @@ class Polar:
     bl: list = field(default_factory=list)  # распределения пограничного слоя по углам
     cp_inv: list = field(default_factory=list)
     field_ctx: dict | None = None          # данные для расчёта поля течения (field.py)
+    ch: np.ndarray | None = None           # шарнирный момент руля (controls.py)
 
 
 def make_airfoil(source: str, value: str, n_side: int = 100, smooth: bool = False) -> Airfoil:
     """source = 'naca' (value — 4 цифры) или 'file' (value — путь). smooth —
     сгладить контур (для измеренных координат)."""
+    if source == "lib":
+        return close_trailing_edge(load_airfoil(value, n_side))
+    if source == "naca" and "-" in value:
+        from .geometry import naca_sym
+        try:
+            return naca_sym(value, n_side)
+        except (ValueError, IndexError):
+            raise ValueError("Симметричный профиль оперения: «0012-64» (модифицированный 4-значный: "
+                             "толщина, индекс носка, положение наибольшей толщины) или «16-012»") from None
     if source == "naca":
         code = value.strip().upper().replace("NACA", "").strip()
         if len(code) != 4 or not code.isdigit():
@@ -52,6 +62,19 @@ def make_airfoil(source: str, value: str, n_side: int = 100, smooth: bool = Fals
         return naca4(code, n_side)
     af = load_airfoil(value, n_side, smooth=smooth)
     return close_trailing_edge(af)
+
+
+def library():
+    """Встроенный набор профилей (симметричные 6-й серии для оперения и др.):
+    список (название, путь)."""
+    import glob
+    import os
+    out = []
+    for f in sorted(glob.glob(os.path.join(os.path.dirname(__file__), "data", "airfoils", "*.dat"))):
+        with open(f, encoding="utf-8", errors="replace") as fh:
+            name = fh.readline().strip().replace(" AIRFOIL", "").replace("NASA/LANGLEY ", "NACA ")
+        out.append((name, f))
+    return out
 
 
 def alpha_range(a0: float, a1: float, da: float) -> np.ndarray:
@@ -65,7 +88,26 @@ def alpha_range(a0: float, a1: float, da: float) -> np.ndarray:
     return a0 + da * np.arange(n)
 
 
-def run_panel(af: Airfoil, alphas, mach: float) -> Polar:
+def _hinge(control, xs, ys, cps):
+    from .controls import hinge_moment
+    if not control:
+        return None
+    return np.array([hinge_moment(x, y, cp, control["hinge"], control["x_hinge"],
+                                  control["deflection"], control.get("balance", 0.0))
+                     for x, y, cp in zip(xs, ys, cps)])
+
+
+def _control_note(control):
+    if not control:
+        return []
+    return [f"Руль: ось на x/c = {control['x_hinge']:g} (хорда руля {1 - control['x_hinge']:g}), "
+            f"δ = {control['deflection']:g}°, осевая компенсация {100 * control.get('balance', 0):g} % "
+            "хорды руля. Ch = M_ш/(q∞·c_р²), c_р — хорда руля за осью; Ch > 0 — момент отклоняет "
+            "руль задней кромкой вниз. Щель считается герметичной, давление в нише компенсации — "
+            "равным давлению у кромок ниши (инженерная модель)."]
+
+
+def run_panel(af: Airfoil, alphas, mach: float, control=None) -> Polar:
     if mach >= 1:
         raise ValueError("Панельный метод с поправкой Кармана–Цяня применим только при M < 1")
     s = PanelSolver(af)
@@ -83,8 +125,11 @@ def run_panel(af: Airfoil, alphas, mach: float) -> Polar:
         notes.append(f"При α = {bad.min():g}…{bad.max():g}° на профиле есть сверхзвуковая зона "
                      f"(Cp < Cp* = {cpstar:.2f}): панели+КЦ там неприменимы, нужен Эйлер.")
     notes.append("Панельный метод невязкий: сопротивление и срыв не рассчитываются.")
+    notes += _control_note(control)
+    ys = [s.y for _ in alphas]
     return Polar(f"{af.name}, панели, M={mach:g}", "panel", mach, np.asarray(alphas, float),
                  np.array(cl), np.full(len(cl), np.nan), np.array(cm), ok, xs, cps, notes,
+                 ch=_hinge(control, xs, ys, cps),
                  field_ctx=dict(method="panel", airfoil=af, mach=mach, alpha=np.asarray(alphas, float)))
 
 
@@ -164,7 +209,7 @@ def run_euler(af: Airfoil, alphas, mach: float, grid: str = "грубая (бы�
 
 
 def run_viscous(af: Airfoil, alphas, mach: float, re: float, ncrit: float = 9.0,
-                xtr=(1.0, 1.0), callback=None) -> Polar:
+                xtr=(1.0, 1.0), callback=None, control=None) -> Polar:
     """Панели + интегральный пограничный слой (как XFOIL). callback(text, fraction)
     -> True для остановки."""
     from .viscous import polar_robust
@@ -209,6 +254,7 @@ def run_viscous(af: Airfoil, alphas, mach: float, re: float, ncrit: float = 9.0,
                  "сверке с продувками UIUC и NASA LTPT сопротивление при Re 1e5–3e5 ближе всего "
                  "при 10–11), 4–7 — турбулентный поток. Cd — по Сквайру–Янгу в конце следа, "
                  "Cdf — трение. Срыв на больших углах описывается приближённо.")
+    notes += _control_note(control)
     label = f"{af.name}, вязкий, Re={re:.3g}, M={mach:g}"
     return Polar(label, "viscous", mach, alphas, np.array([r.cl for r in res]),
                  np.array([r.cd for r in res]), np.array([r.cm for r in res]), ok & ~sup,
@@ -216,6 +262,7 @@ def run_viscous(af: Airfoil, alphas, mach: float, re: float, ncrit: float = 9.0,
                  cdf=np.array([r.cdf for r in res]),
                  xtr_u=np.array([r.xtr_u for r in res]), xtr_l=np.array([r.xtr_l for r in res]),
                  bl=[r.side for r in res], cp_inv=[r.cp_inv for r in res],
+                 ch=_hinge(control, [r.x for r in res], [r.y for r in res], [r.cp for r in res]),
                  field_ctx=dict(method="viscous", airfoil=af, re=re, ncrit=ncrit, mach=mach, xtr=xtr,
                                 alpha=alphas, states=[r.state for r in res],
                                 n_panels=[getattr(r, "n_panels", 160) for r in res]))

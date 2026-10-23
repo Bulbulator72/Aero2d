@@ -71,6 +71,49 @@ def naca4(code: str, n_side: int = 100, closed_te: bool = True) -> Airfoil:
     return Airfoil(x, y, f"NACA {code}")
 
 
+def _naca_mod_thickness(x, t, le_index, xmax):
+    """Толщина модифицированного 4-значного профиля NACA 00tt-IT (Stack, 1939;
+    формулы — NASA TM-4741, Ladson): I — индекс радиуса носка, T = 10·xmax —
+    положение наибольшей толщины. Возвращает полутолщину."""
+    m = xmax
+    d1 = float(np.interp(m, [0.2, 0.3, 0.4, 0.5, 0.6], [0.200, 0.234, 0.315, 0.465, 0.700]))
+    d0 = 0.002
+    e = 1 - m
+    # хвостовая часть: y(m) = 0.1, y'(m) = 0
+    d2 = (0.294 - 2 * d1 * e) / e**2
+    d3 = (d1 * e - 0.196) / e**3
+    chi = le_index / 6.0 if le_index < 9 else 10.3933
+    a0 = 0.296904 * chi
+    # носовая часть: y(m) = 0.1, y'(m) = 0, кривизна в m как у хвостовой
+    ypp = 2 * d2 + 6 * d3 * e
+    A = np.array([[m, m**2, m**3], [1, 2 * m, 3 * m**2], [0, 2, 6 * m]])
+    rhs = np.array([0.1 - a0 * np.sqrt(m), -0.5 * a0 / np.sqrt(m), ypp + 0.25 * a0 * m**-1.5])
+    a1, a2, a3 = np.linalg.solve(A, rhs)
+    yf = a0 * np.sqrt(x) + a1 * x + a2 * x**2 + a3 * x**3
+    xa = 1 - x
+    ya = d0 + d1 * xa + d2 * xa**2 + d3 * xa**3
+    return (t / 0.2) * np.where(x < m, yf, ya)
+
+
+def naca_sym(code: str, n_side: int = 100) -> Airfoil:
+    """Симметричные профили оперения: «0012-64» (модифицированный 4-значный:
+    толщина 12 %, индекс носка 6, наибольшая толщина на 40 %) и «16-012»
+    (серия 16: толщина = модифицированный 4-значный с I = 4, T = 5).
+    Задняя кромка замыкается."""
+    c = code.upper().replace("NACA", "").replace(" ", "")
+    if c.startswith("16-"):
+        t, le, xm = int(c[3:]) / 100.0, 4, 0.5
+    else:
+        base, it = c.split("-")
+        t, le, xm = int(base[2:]) / 100.0, int(it[0]), int(it[1]) / 10.0
+    xc = _cosine_spacing(n_side)
+    yt = _naca_mod_thickness(xc, t, le, xm)
+    yt = yt - yt[-1] * np.clip((xc - 0.8) / 0.2, 0, 1) ** 2   # острая кромка (меняет только x > 0,8)
+    x = np.concatenate([xc[::-1], xc[1:]])
+    y = np.concatenate([yt[::-1], -yt[1:]])
+    return Airfoil(x, y, f"NACA {c}")
+
+
 # ---------------------------------------------------------------------------
 # CST (Kulfan)
 # ---------------------------------------------------------------------------

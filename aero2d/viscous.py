@@ -60,7 +60,7 @@ class ViscousSolver:
                  n_panels: int = 160):
         from .geometry import repanel
         if n_panels:
-            airfoil = repanel(airfoil, n_panels // 2 + 1, spacing="viscous")
+            airfoil = repanel(airfoil, n_panels // 2 + 1, spacing="viscous", keep_frame=True)
         self.ps = PanelSolver(airfoil)
         self.af = airfoil
         self.re = float(re)
