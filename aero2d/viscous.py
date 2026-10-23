@@ -822,25 +822,39 @@ class ViscousSolver:
             seq.append(re_k)
         seq = seq[::-1]
         try:
-            best = None
-            for i, re_k in enumerate(seq):
+            best, best_re = None, None
+            vh = getattr(self, "verbose_homotopy", False)
+            # опорное решение — при наибольшем Re, где сходится
+            for re_k in seq:
                 self.re = re_k
-                start = self._scale_state(best.state, 2.0) if best else init
-                rk = self._solve(alpha, start, max_iter, tol, verbose)
-                if getattr(self, "verbose_homotopy", False):
+                rk = self._solve(alpha, init, max_iter, tol, verbose)
+                if vh:
+                    print(f"      Re={re_k:.3g}: {'ok' if rk.converged else 'нет'} it={rk.iterations}")
+                if rk.converged:
+                    best, best_re = rk, re_k
+                    break
+            if best is None:
+                return r
+            # спуск к заданному Re с адаптивным шагом: при неудаче шаг дробится
+            ratio, tries = 2.0, 0
+            while best_re > re_target * 1.0001 and tries < 8:
+                tries += 1
+                re_k = max(best_re / ratio, re_target)
+                self.re = re_k
+                rk = self._solve(alpha, self._scale_state(best.state, best_re / re_k), max_iter, tol, verbose)
+                if vh:
                     print(f"      Re={re_k:.3g}: {'ok' if rk.converged else 'нет'} it={rk.iterations} "
                           f"Cl={rk.cl:.4f} Cd={rk.cd:.5f} xtr={rk.xtr_u:.3f}/{rk.xtr_l:.3f}")
                 if rk.converged:
-                    best = rk
-                elif best is None:
-                    continue
+                    best, best_re = rk, re_k
+                    ratio = min(2.0, ratio ** 1.5)
                 else:
-                    return r
-            if best is None:
-                return r
-            self.re = re_target
-            r2 = self._solve(alpha, self._scale_state(best.state, 2.0), max_iter, tol, verbose)
-            return r2 if r2.converged or not r.converged else r
+                    ratio = ratio ** 0.5
+                    if ratio < 1.08:
+                        break
+            if best_re <= re_target * 1.0001:
+                return best
+            return r
         finally:
             self.re = re_target
 
@@ -896,7 +910,7 @@ class ViscousSolver:
             rels = (("θ", dX[:, 0] / np.maximum(np.abs(X[:, 0]), 1e-12)),
                     ("δ*", ddstar / np.maximum(np.abs(dstar), np.abs(X[:, 0]))),
                     ("Ue", due / np.maximum(np.abs(ue_old), 0.02)),
-                    ("S", np.where(turb, dX[:, 3] / np.maximum(np.abs(X[:, 3]), 1e-6), 0.0)))
+                    ("S", np.where(turb, dX[:, 3] / np.maximum(np.abs(X[:, 3]), 0.01), 0.0)))
             for nm, rr in rels:
                 if rr.min() < dlo and dlo / rr.min() < rl:
                     rl = dlo / rr.min(); why = f"{nm} st{rr.argmin()} {rr.min():.2g}"
@@ -1193,3 +1207,39 @@ class ViscousSolver:
                 if r.converged:
                     out[i] = r
         return out
+
+
+def polar_robust(airfoil, re, alphas, ncrit=9.0, mach=0.0, xtr=(1.0, 1.0), callback=None,
+                 n_panels=160, alt_panels=(170, 140), max_iter=50):
+    """Поляра с запасным вариантом: одиночные несошедшиеся точки (соседи по α
+    сошлись) и случай, когда не сошлось ничего, пересчитываются на слегка
+    другой панельной сетке. Иногда дискретная система вблизи точки торможения
+    или перехода почти вырождена, и сдвиг узлов это устраняет."""
+    alphas = np.asarray(alphas, float)
+    solver = ViscousSolver(airfoil, re, ncrit=ncrit, mach=mach, xtr=xtr, n_panels=n_panels)
+    res = solver.polar(alphas, callback=callback, max_iter=max_iter)
+    order = np.argsort(alphas)
+    ok = np.array([r.converged for r in res])
+    if ok.all():
+        return res
+    retry = []
+    for pos, i in enumerate(order):
+        if ok[i]:
+            continue
+        left = pos > 0 and ok[order[pos - 1]]
+        right = pos + 1 < len(order) and ok[order[pos + 1]]
+        if (left and right) or not ok.any():
+            retry.append(i)
+    for npn in alt_panels:
+        if not retry:
+            break
+        s2 = ViscousSolver(airfoil, re, ncrit=ncrit, mach=mach, xtr=xtr, n_panels=npn)
+        still = []
+        for i in retry:
+            r = s2.solve(alphas[i], max_iter=max_iter)
+            if r.converged:
+                res[i] = r
+            else:
+                still.append(i)
+        retry = still
+    return res

@@ -132,14 +132,13 @@ def run_viscous(af: Airfoil, alphas, mach: float, re: float, ncrit: float = 9.0,
                 xtr=(1.0, 1.0), callback=None) -> Polar:
     """Панели + интегральный пограничный слой (как XFOIL). callback(text, fraction)
     -> True для остановки."""
-    from .viscous import ViscousSolver
+    from .viscous import polar_robust
     if not 1e3 <= re <= 1e9:
         raise ValueError("Число Рейнольдса должно быть в диапазоне 1e3…1e9")
     if mach >= 0.8:
         raise ValueError("Вязкий панельный метод применим при M < 0,8 (сжимаемость — поправкой "
                          "Кармана–Цяня); для трансзвука используйте Эйлер.")
     alphas = np.asarray(alphas, float)
-    solver = ViscousSolver(af, re, ncrit=ncrit, mach=mach, xtr=xtr)
     stop = {"flag": False}
 
     def cb(i, n, r):
@@ -152,7 +151,7 @@ def run_viscous(af: Airfoil, alphas, mach: float, re: float, ncrit: float = 9.0,
     if callback:
         callback("Первая точка (маршевое начальное приближение)…", 0.0)
     try:
-        res = solver.polar(alphas, callback=cb)
+        res = polar_robust(af, re, alphas, ncrit=ncrit, mach=mach, xtr=xtr, callback=cb)
     except _Stop:
         res = None
     if res is None or any(r is None for r in res):

@@ -33,7 +33,6 @@ def make_airfoil(coords, n_side=100):
 
 
 def run_case(task):
-    from aero2d.viscous import ViscousSolver
     np.seterr(all="ignore")
     name, re_exp, rows, coords, ncrit, use_xf, opts = task
     rows = np.asarray(rows)
@@ -42,15 +41,13 @@ def run_case(task):
                cl_exp=rows[:, 1].tolist(), cd_exp=rows[:, 2].tolist())
     try:
         af = make_airfoil(coords)
-        v = ViscousSolver(af, re_exp, ncrit=ncrit)
         from aero2d import blclosure as bc
+        from aero2d.viscous import polar_robust
         for k, val in (opts or {}).items():
             if k.startswith("bc."):
                 setattr(bc, k[3:], val)
                 bc.CTCON = 0.5 / (bc.GACON**2 * bc.GBCON)
-            else:
-                setattr(v, k, val)
-        pol = v.polar(rows[:, 0])
+        pol = polar_robust(af, re_exp, rows[:, 0], ncrit=ncrit)
         out.update(cl=[p.cl for p in pol], cd=[p.cd for p in pol], cm=[p.cm for p in pol],
                    conv=[bool(p.converged) for p in pol], xtr_u=[p.xtr_u for p in pol],
                    xtr_l=[p.xtr_l for p in pol])
@@ -78,6 +75,8 @@ def main():
     ap.add_argument("--only", default="")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--full", action="store_true", help="все углы, а не только до срыва")
+    ap.add_argument("--amax", type=float, default=None, help="верхний предел α")
+    ap.add_argument("--stride", type=int, default=1, help="брать каждую k-ю точку")
     ap.add_argument("--opts", default="", help="JSON: атрибуты ViscousSolver для эксперимента")
     args = ap.parse_args()
     data = json.load(open(os.path.join(HERE, "data", "uiuc", "dataset.json")))
@@ -109,6 +108,9 @@ def main():
             if not args.full:                    # только до срыва: α ∈ [−2°, α(Cl_max) − 1°]
                 amax = rows[np.argmax(rows[:, 1]), 0]
                 rows = rows[(rows[:, 0] >= -2.0) & (rows[:, 0] <= amax - 1.0)]
+                if args.amax is not None:
+                    rows = rows[rows[:, 0] <= args.amax]
+                rows = rows[::args.stride]
                 if len(rows) < 3:
                     continue
             tasks.append((d["name"], float(best), rows.tolist(), d["coords"], args.ncrit, args.xfoil,
