@@ -155,6 +155,17 @@ def dampl(hk, th, rt):
     return af * dadr / th * rfac
 
 
+def axset(ax1, ax2, t1, t2, a1, a2, acrit):
+    """Средний темп роста Ñ на отрезке (AXSET в XFOIL 6.99): среднеквадратичное
+    ax двух концов плюс малая добавка, гарантирующая dÑ/dξ > 0 у Ñкрит."""
+    axsq = 0.5 * (ax1**2 + ax2**2)
+    pos = _re(axsq) > 1e-30
+    axa = _where(pos, np.sqrt(_where(pos, axsq, 1.0 + 0 * axsq)), 0.0 * axsq)
+    arg = _min(20.0 * (acrit - 0.5 * (a1 + a2)), 20.0 + 0 * axsq)
+    exn = _where(_re(arg) <= 0.0, 1.0 + 0 * arg, np.exp(-arg))
+    return axa + exn * 0.002 / (t1 + t2)
+
+
 # ---------------------------- состояние станции ---------------------------
 def station(th, ds, ue, s, re, msq, turb, wake):
     """Все вторичные величины станции. turb, wake — булевы массивы."""

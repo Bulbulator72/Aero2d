@@ -569,7 +569,7 @@ class ViscousSolver:
         # экстраполяция Ñ на конец отрезка достигает Ñкрит; решение не зависит
         # от неизвестной Ñ₂, поэтому области «ламинарный»/«переходный» не
         # перекрываются (иначе возможны два решения).
-        phi1 = np.real(n1 + 0.5 * (A_l["ax"] + B_l["ax"]) * (xb - xa))
+        phi1 = np.real(n1 + bc.axset(A_l["ax"], B_l["ax"], th1, th2, n1, nc + 0 * n1, nc) * (xb - xa))
         forced = (xcb >= xtr_f) & ~wake
         turb_start = wake | (n1r >= nc) | ((xca >= xtr_f) & ~wake)
         lam_end = ~turb_start & ~forced & (phi1 < nc)
@@ -578,7 +578,7 @@ class ViscousSolver:
         B_t = bc.station(th2, m2 / u2, u2, s2, re2, msq2, ~F, wake)
         # --- ламинарный отрезок
         rt_l, rh_l, _ = self._segment(A_l, B_l, xa, xb, wake, F)
-        ra_l = n2 - n1 - 0.5 * (A_l["ax"] + B_l["ax"]) * (xb - xa)
+        ra_l = n2 - n1 - bc.axset(A_l["ax"], B_l["ax"], th1, th2, n1, n2, nc) * (xb - xa)
         rs_l = s2 - bc.s_transition(B_l["hk"], B_l["cq"])
         # --- турбулентный отрезок
         rt_t, rh_t, rc_t = self._segment(A_t, B_t, xa, xb, wake, ~F)
@@ -588,19 +588,76 @@ class ViscousSolver:
         ra_t = np.where(wake, n2 - n1, n2 - n1 - 20.0 * (xb - xa))
         # --- переходный отрезок: точка перехода внутри
         # доля ламинарного участка по Ñ и по принудительному x
-        dn = n2 - n1
-        dn = np.where(np.abs(np.real(dn)) < 1e-12, 1e-12 + 0 * dn, dn)
-        fn = (nc - n1) / dn
-        fn = np.where((n2r >= nc) & (phi1 >= nc), fn, 1.0 + 0 * fn)
+        # естественный переход (как TRCHEK2 в XFOIL): точка перехода — где
+        # Ñкрит = Ñ₁ + ½(ax_A + ax_T)·(x_t − x_a), ax_T — в самой точке перехода.
+        # Решается простыми итерациями от линейной оценки; при f → 1 совпадает с
+        # условием ламинарного отрезка (phi1 = Ñкрит), при f → 0 — с турбулентным.
+        # От Ñ₂ точка перехода не зависит (иначе возможен цикл переключений).
+        dx_ = xb - xa
+        shape = np.shape(th1)
+
+        def bcast(x):
+            return np.broadcast_to(np.asarray(x), shape)
+
+        def clip01(v):
+            return bc._max(bc._min(v, 1.0 + 0 * v), 0.0 + 0 * v)
+
+        def tstate(ft, P):
+            a1, a2, d1_, d2_, v1, v2, r1_, r2_ = P
+            return (a1 + ft * (a2 - a1), d1_ + ft * (d2_ - d1_), v1 + ft * (v2 - v1),
+                    r1_ + ft * (r2_ - r1_))
+
+        natural = phi1 >= nc
+        fn = np.ones(shape, dtype=np.result_type(th1, float))
+        sel = np.where(bcast(trans & natural))[0] if len(shape) else np.array([], int)
+        if sel.size:
+            # точка перехода только для переходных отрезков: Ньютон по
+            # вещественным частям (производная по f — разностью), затем одна
+            # поправка в комплексной арифметике — она даёт правильные
+            # производные f по неизвестным (теорема о неявной функции)
+            Pc = tuple(bcast(q)[sel] for q in (th1, th2, m1 / u1, m2 / u2, u1, u2, re1, re2))
+            Pr = tuple(np.real(q) for q in Pc)
+            s1c, msc, axac, n1c, dxc = (bcast(q)[sel] for q in (s1, msq + 0 * th1, A_l["ax"], n1, dx_))
+            wk = bcast(wake)[sel]
+            phic = bcast(phi1)[sel]
+
+            def gfun(ft, cplx):
+                P = Pc if cplx else Pr
+                tht, dst, uet, ret = tstate(ft, P)
+                if cplx:
+                    s_, ms_, axa, n1_, dx2, t1_ = s1c, msc, axac, n1c, dxc, Pc[0]
+                else:
+                    s_, ms_, axa, n1_, dx2, t1_ = (np.real(q) for q in (s1c, msc, axac, n1c, dxc, Pc[0]))
+                axt = bc.station(tht, dst, uet, s_, ret, ms_, F, wk)["ax"]
+                return n1_ + bc.axset(axa, axt, t1_, tht, n1_, nc + 0 * n1_, nc) * ft * dx2 - nc
+
+            n1re = np.real(n1c)
+            den = np.where(np.abs(phic - n1re) < 1e-12, 1e-12, phic - n1re)
+            fr = np.clip((nc - n1re) / den, 0.0, 1.0)
+            for _ in range(8):
+                g0 = gfun(fr, False)
+                gp = (gfun(fr + 1e-6, False) - g0) / 1e-6
+                gp = np.where(np.abs(gp) < 1e-9, 1e-9, gp)
+                fr_new = np.clip(fr - g0 / gp, 0.0, 1.0)
+                done_ = np.max(np.abs(fr_new - fr)) < 1e-10
+                fr = fr_new
+                if done_:
+                    break
+            g0 = gfun(fr, False)
+            gp = (gfun(fr + 1e-6, False) - g0) / 1e-6
+            gp = np.where(np.abs(gp) < 1e-9, 1e-9, gp)
+            if np.iscomplexobj(fn):
+                fc = fr - (gfun(fr + 0j, True) - g0) / gp
+                fc = np.where((fr <= 0.0) | (fr >= 1.0), fr + 0j, fc)
+            else:
+                fc = fr
+            fn[sel] = fc
         fx = np.where(forced, (xtr_f - xca) / np.where(np.abs(xcb - xca) < 1e-12, 1e-12, xcb - xca), 1.0)
-        f = bc._min(fn, fx + 0 * fn)
-        f = bc._max(bc._min(f, 1.0 + 0 * f), 0.0 + 0 * f)
-        ft = f          # f → 1 и f → 0 непрерывно переходят в ламинарный / турбулентный отрезок
-        tht = th1 + ft * (th2 - th1)
-        dst = m1 / u1 + ft * (m2 / u2 - m1 / u1)
-        uet = u1 + ft * (u2 - u1)
+        use_nat = natural & (np.real(fn) <= fx)
+        f = np.where(use_nat, fn, fx + 0 * fn)
+        ft = clip01(f)    # f → 1 и f → 0 непрерывно переходят в ламинарный / турбулентный отрезок
+        tht, dst, uet, ret = tstate(ft, (th1, th2, m1 / u1, m2 / u2, u1, u2, re1, re2))
         xt = xa + ft * (xb - xa)
-        ret = re1 + ft * (re2 - re1)
         T_l = bc.station(tht, dst, uet, s1, ret, msq, F, wake)
         T_t0 = bc.station(tht, dst, uet, s1, ret, msq, ~F, wake)
         st_tr = bc.s_transition(T_t0["hk"], T_t0["cq"])
@@ -609,9 +666,9 @@ class ViscousSolver:
         r2t, r2h, r2c = self._segment(T_t, B_t, xt, xb, wake, ~F)
         # Ñ: при естественном переходе — до точки перехода (по ней же и Ñ = Ñкрит),
         # при принудительном — обычное уравнение роста по всему отрезку
-        ra_tr = np.where(forced & (phi1 < nc),
-                         n2 - n1 - 0.5 * (A_l["ax"] + B_l["ax"]) * (xb - xa),
-                         n2 - n1 - 0.5 * (A_l["ax"] + T_l["ax"]) * (xb - xa))
+        ra_tr = np.where(use_nat,
+                         n2 - nc - 20.0 * (1.0 - ft) * dx_,
+                         n2 - n1 - bc.axset(A_l["ax"], B_l["ax"], th1, th2, n1, n2, nc) * dx_)
         R = np.empty((4,) + th1.shape, dtype=np.result_type(th1, float))
         R[0] = np.where(lam_end, rt_l, np.where(trans, r1t + r2t, rt_t))
         R[1] = np.where(lam_end, rh_l, np.where(trans, r1h + r2h, rh_t))
@@ -801,10 +858,20 @@ class ViscousSolver:
             X = self._march()
         X = self._relocate(X, alpha, g_inv)
         converged = False
-        hist, damp = [], 1.0
+        hist, damp, rhist = [], 1.0, []
         it = 0
+        best_r, best_it = np.inf, 0
         for it in range(1, max_iter + 1):
             R, J = self._assemble(X)
+            rmax_ = float(np.abs(R).max())
+            if not np.isfinite(rmax_):
+                break
+            # застой: за 20 итераций невязка не уменьшилась вдвое — дальше не
+            # тратить время (сработают продолжение по α или по Re)
+            if rmax_ < 0.5 * best_r:
+                best_r, best_it = rmax_, it
+            elif it - best_it > 20 and rmax_ > 1e-3:
+                break
             try:
                 dX = np.linalg.solve(J, -R.ravel()).reshape(self.Ns, 4)
             except np.linalg.LinAlgError:
@@ -835,18 +902,44 @@ class ViscousSolver:
                 rl = min(rl, dnmax / dn)
             # разрыв циклов: если размер шага перестал уменьшаться (Ньютон «скачет»
             # через излом замыкающих соотношений), шаги постепенно демпфируются
-            if (len(hist) >= 8 and max(hist[-6:]) < 0.3
+            # невязка уменьшилась так, как обещал (демпфированный) шаг Ньютона —
+            # направление верное, демпфирование ослабляется
+            rmax = float(np.abs(R).max())
+            good = (len(rhist) >= 1 and rhist[-1][1] < 1
+                    and rmax <= (1.0 - 0.5 * rhist[-1][1]) * rhist[-1][0])
+            rhist.append((rmax, 1.0))
+            if good:
+                damp = min(1.0, damp * 2.0)
+            elif (len(hist) >= 8 and max(hist[-6:]) < 0.3
                     and min(hist[-3:]) > 0.7 * min(hist[-6:-3])):
                 damp = max(damp * 0.6, 0.1)
             elif len(hist) >= 2 and hist[-1] < 0.7 * hist[-2]:
                 damp = min(1.0, damp * 2.0)
             rl *= damp
+            rhist[-1] = (rhist[-1][0], rl)
             if damp < 1:
                 why += f" damp {damp:.2f}"
-            X = X + rl * dX
-            X[:, 0] = np.maximum(X[:, 0], 1e-10)
-            X[:, 1] = np.maximum(X[:, 1], 1e-12)
-            X[:, 3] = np.maximum(X[:, 3], 1e-6)
+            # вблизи решения — поиск вдоль направления Ньютона: шаг, не уменьшающий
+            # ‖R‖, укорачивается (сильная нелинейность в ламинарном пузыре)
+            r2 = float(np.linalg.norm(R))
+            ue_keep = self._ue
+            for ls in range(5):
+                X1 = self._apply_step(X, rl * dX)
+                if np.abs(R).max() > 0.5 or ls == 4:
+                    break
+                saved = (self.s_st, self.xi.copy(), self.dsst_dm.copy())
+                if not self._shift_xi(X1, g_inv):
+                    self.s_st, self.xi, self.dsst_dm = saved
+                    break
+                R1 = self._assemble(X1, jac=False)
+                R1 = R1[0] if isinstance(R1, tuple) else R1
+                self.s_st, self.xi, self.dsst_dm = saved
+                if np.all(np.isfinite(R1)) and np.linalg.norm(R1) < r2:
+                    break
+                rl *= 0.35
+                why += " ls"
+            self._ue = ue_keep
+            X = X1
             rms = np.sqrt(np.mean(np.concatenate([rels[0][1], rels[1][1], rels[2][1]]) ** 2))
             hist.append(rms)
             if verbose:
@@ -868,6 +961,46 @@ class ViscousSolver:
                 converged = True
                 break
         return self._result(alpha, X, converged, it, g_inv)
+
+    def _shift_xi(self, X, g_inv):
+        """Сдвиг ξ по новому положению точки торможения без смены топологии
+        (False — если топология изменилась бы)."""
+        g = g_inv + self.dg_dm @ X[:, 1]
+        try:
+            k, s_st, up, lo = self._topology(g, self.sig)
+        except RuntimeError:
+            return False
+        if (k, len(up), len(lo)) != self.sig:
+            return False
+        self.s_st = s_st
+        self._set_dsst(g)
+        self.xi = self.xi.copy()
+        self.xi[self.st_up] = np.maximum(s_st - self.s[self.up], 1e-9)
+        self.xi[self.st_lo] = np.maximum(self.s[self.lo] - s_st, 1e-9)
+        wl = self.xi[self.st_wk] - self.xi[self.st_wk[0]]
+        self.xi[self.st_wk] = self.xi[self.st_lo[-1]] + wl
+        return True
+
+    def _apply_step(self, X, dX):
+        X = X + dX
+        X[:, 0] = np.maximum(X[:, 0], 1e-10)
+        X[:, 1] = np.maximum(X[:, 1], 1e-12)
+        X[:, 3] = np.maximum(X[:, 3], 1e-6)
+        return self._hk_limit(X)
+
+    def _hk_limit(self, X):
+        """Как DSLIM в XFOIL: после шага Ньютона H = δ*/θ не меньше 1.02 на
+        профиле и 1.00005 в следе (иначе замыкания вырождаются: H → 0 даёт
+        бесконечную диссипацию). Ue зависит от m, поэтому — пара проходов."""
+        hlim = np.where(self.is_wake, 1.00005, 1.02)
+        for _ in range(3):
+            ue = np.maximum(np.abs(self.ue_inv + self.D @ X[:, 1]), 1e-6)
+            mmin = hlim * X[:, 0] * ue
+            low = X[:, 1] < mmin
+            if not low.any():
+                break
+            X[low, 1] = mmin[low]
+        return X
 
     def _to_state(self, X):
         """Состояние по узлам профиля и следу (не зависит от точки торможения)."""
@@ -1012,26 +1145,45 @@ class ViscousSolver:
                 if out[i] is None:
                     report(i, self.solve(alphas[i], verbose=verbose, max_iter=max_iter))
             return out
+        def advance(a_t, r0, depth=0):
+            """Переход от сошедшегося решения r0 к углу a_t; при неудаче — через
+            промежуточные углы (деление шага пополам, до 3 уровней)."""
+            r = self.solve(a_t, init=r0.state, verbose=verbose, max_iter=max_iter, homotopy=False)
+            if r.converged or depth >= 3:
+                return r
+            rm = advance(0.5 * (a_t + r0.alpha), r0, depth + 1)
+            if not rm.converged:
+                return r
+            r2 = advance(a_t, rm, depth + 1)
+            return r2 if r2.converged else r
+
         for direction in (1, -1):
             last_ok = out[anchor]
             idx = [i for i in np.argsort(alphas * direction)
                    if direction * (alphas[i] - alphas[anchor]) > 0]
             for i in idx:
                 prev = out[i]
-                r = self.solve(alphas[i], init=last_ok.state, verbose=verbose, max_iter=max_iter)
-                if not r.converged:
-                    am = 0.5 * (alphas[i] + last_ok.alpha)
-                    rm = self.solve(am, init=last_ok.state, verbose=verbose, max_iter=max_iter)
-                    if rm.converged:
-                        r = self.solve(alphas[i], init=rm.state, verbose=verbose, max_iter=max_iter)
-                if not r.converged and prev is None:
-                    r2 = self.solve(alphas[i], init=None, verbose=verbose, max_iter=max_iter)
-                    if r2.converged:
-                        r = r2
+                r = advance(alphas[i], last_ok)
                 if prev is not None:
                     out[i] = r
                 else:
                     report(i, r)
                 if r.converged:
                     last_ok = r
+        # повторная попытка для несошедшихся точек — от соседей с другой стороны
+        order = np.argsort(alphas)
+        for pos, i in enumerate(order):
+            if out[i] is not None and out[i].converged:
+                continue
+            for nb in (order[pos + 1] if pos + 1 < n else None, order[pos - 1] if pos > 0 else None):
+                if nb is not None and out[nb] is not None and out[nb].converged:
+                    r = advance(alphas[i], out[nb], 1)
+                    if r.converged:
+                        out[i] = r
+                        break
+            else:
+                # последнее средство — холодный старт с продолжением по Re
+                r = self.solve(alphas[i], init=None, verbose=verbose, max_iter=max_iter)
+                if r.converged:
+                    out[i] = r
         return out
