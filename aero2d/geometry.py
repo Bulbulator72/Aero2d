@@ -258,7 +258,37 @@ def repanel(af: Airfoil, n_side: int = 100, spacing: str = "cosine", keep_frame:
     return out
 
 
-def load_airfoil(path: str, n_side: int = 100) -> Airfoil:
+def smooth_airfoil(af: Airfoil, strength: float = 1.0) -> Airfoil:
+    """Сглаживание измеренных/оцифрованных координат (шум ~0,1 мм делает
+    расчёт пограничного слоя у передней кромки неустойчивым). Каждая сторона —
+    сглаживающий сплайн y(u), u = sqrt(x − x_пк) (так передняя кромка гладкая),
+    параметр сглаживания — по обобщённой перекрёстной проверке (GCV),
+    strength > 1 — сильнее. Контур предварительно нормирован (normalize)."""
+    from scipy.interpolate import make_smoothing_spline
+    af = normalize(af)
+    x, y = np.asarray(af.x, float), np.asarray(af.y, float)
+    ile = int(np.argmin(x))
+    xle, yle = x[ile], y[ile]
+    out = []
+    for xs, ys in ((x[:ile + 1][::-1], y[:ile + 1][::-1]), (x[ile:], y[ile:])):
+        u = np.sqrt(np.maximum(xs - xle, 0.0))
+        keep = np.concatenate([[True], np.diff(u) > 1e-9])
+        u, ys = u[keep], ys[keep]
+        spl = make_smoothing_spline(u, ys)
+        if strength != 1.0:
+            lam0 = getattr(spl, "lam", None)
+            if lam0 is not None:
+                spl = make_smoothing_spline(u, ys, lam=lam0 * strength)
+        ysm = spl(u)
+        ysm[0] = yle
+        out.append((xle + u**2, ysm))
+    (xu, yu), (xl, yl) = out
+    xx = np.concatenate([xu[::-1], xl[1:]])
+    yy = np.concatenate([yu[::-1], yl[1:]])
+    return Airfoil(xx, yy, af.name)
+
+
+def load_airfoil(path: str, n_side: int = 100, smooth: bool = False) -> Airfoil:
     """Чтение файла координат (Selig или Lednicer, с заголовком или без),
     нормировка и перепанелизация."""
     rows, name = [], None
@@ -280,5 +310,6 @@ def load_airfoil(path: str, n_side: int = 100) -> Airfoil:
         pts = pts[1:]
     if len(pts) < 10:
         raise ValueError("В файле слишком мало точек контура")
-    af = normalize(Airfoil(pts[:, 0], pts[:, 1], name or "airfoil"))
+    af = Airfoil(pts[:, 0], pts[:, 1], name or "airfoil")
+    af = smooth_airfoil(af) if smooth else normalize(af)
     return repanel(af, n_side)

@@ -20,8 +20,9 @@ def load(paths, ncrit=None):
     for p in paths:
         for ln in open(p):
             d = json.loads(ln)
-            if "cl" not in d:
-                continue
+            if "cl" not in d:            # ошибка или превышено время — все точки не сошлись
+                n = len(d["alpha"])
+                d = dict(d, cl=[float("nan")] * n, cd=[float("nan")] * n, conv=[False] * n)
             if ncrit is not None and abs(d["ncrit"] - ncrit) > 1e-6:
                 continue
             rows.append(d)
@@ -33,7 +34,7 @@ def points(rows, key_cl="cl", key_cd="cd"):
     for d in rows:
         a = np.array(d["alpha"])
         cle, cde = np.array(d["cl_exp"]), np.array(d["cd_exp"])
-        if key_cl not in d:
+        if key_cl not in d:                          # XFOIL не считался (таймаут aero2d)
             continue
         cl = np.array(d[key_cl], float)
         cd = np.array(d[key_cd], float)

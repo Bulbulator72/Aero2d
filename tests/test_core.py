@@ -63,3 +63,20 @@ def test_run_panel_and_csv(tmp_path):
 def test_euler_low_mach_rejected():
     with pytest.raises(ValueError):
         core.run_euler(naca4("0012", 60), [0.0], 0.1)
+
+
+def test_smooth_airfoil_removes_noise_keeps_shape():
+    import numpy as np
+    from aero2d.geometry import naca4, smooth_airfoil, Airfoil
+    af = naca4("2412", 81)
+    rng = np.random.default_rng(0)
+    noisy = Airfoil(af.x, af.y + rng.normal(0, 3e-4, len(af.y)) * (af.x > 0.002))
+    sm = smooth_airfoil(noisy)
+    ref = smooth_airfoil(af)
+
+    def upper(a):
+        i = int(np.argmin(a.x))
+        return np.interp(np.linspace(0.01, 0.95, 200), a.x[:i + 1][::-1], a.y[:i + 1][::-1])
+    true = upper(af)
+    assert np.max(np.abs(upper(ref) - true)) < 3e-4          # гладкий контур почти не меняется
+    assert np.std(upper(sm) - true) < 0.6 * 3e-4             # шум уменьшен

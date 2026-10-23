@@ -40,8 +40,9 @@ class Polar:
     field_ctx: dict | None = None          # данные для расчёта поля течения (field.py)
 
 
-def make_airfoil(source: str, value: str, n_side: int = 100) -> Airfoil:
-    """source = 'naca' (value — 4 цифры) или 'file' (value — путь)."""
+def make_airfoil(source: str, value: str, n_side: int = 100, smooth: bool = False) -> Airfoil:
+    """source = 'naca' (value — 4 цифры) или 'file' (value — путь). smooth —
+    сгладить контур (для измеренных координат)."""
     if source == "naca":
         code = value.strip().upper().replace("NACA", "").strip()
         if len(code) != 4 or not code.isdigit():
@@ -49,7 +50,7 @@ def make_airfoil(source: str, value: str, n_side: int = 100) -> Airfoil:
         if int(code[2:]) == 0:
             raise ValueError("Толщина профиля не может быть нулевой")
         return naca4(code, n_side)
-    af = load_airfoil(value, n_side)
+    af = load_airfoil(value, n_side, smooth=smooth)
     return close_trailing_edge(af)
 
 
@@ -197,7 +198,9 @@ def run_viscous(af: Airfoil, alphas, mach: float, re: float, ncrit: float = 9.0,
     if not ok.all():
         notes.append(f"Не сошлись: α = {', '.join(f'{a:g}' for a in alphas[~ok])}°. Обычно это "
                      "срыв (вязко-невязкий метод его описывает только до начала) или сильные "
-                     "отрывные пузыри при малых Re.")
+                     "отрывные пузыри при малых Re. Если не сходятся и умеренные углы, а "
+                     "координаты измеренные или оцифрованные, — включите «сгладить контур»: "
+                     "шум координат у передней кромки делает расчёт слоя неустойчивым.")
     if sup.any():
         notes.append(f"При α = {', '.join(f'{a:g}' for a in alphas[sup])}° на профиле есть "
                      "сверхзвуковая зона: поправка Кармана–Цяня там неточна.")

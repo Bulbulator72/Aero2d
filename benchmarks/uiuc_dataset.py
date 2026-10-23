@@ -76,14 +76,22 @@ def main(root):
             c = coords.get(stem + ".dap")
             if c is None or len(c) < 30 or not pol:
                 continue
+            # координаты по проекту (гладкие): stem.dat, без буквы модели, *sm.dat
+            design = None
+            for cand in (stem + "sm.dat", stem[:-1] + "sm.dat", stem + ".dat", stem[:-1] + ".dat",
+                         stem.split("-")[0] + ".dat"):
+                if cand in coords and len(coords[cand]) >= 30:
+                    design = coords[cand]
+                    break
             data.append(dict(name=head.get("airfoil", stem), file=fname, volume=int(vol),
-                             comment=comment, coords=c, polars=pol))
+                             comment=comment, coords=c, coords_design=design, polars=pol))
     out = os.path.join(HERE, "data", "uiuc", "dataset.json")
     with open(out, "w") as fh:
         json.dump(data, fh)
     nre = sum(len(d["polars"]) for d in data)
     npt = sum(len(r) for d in data for r in d["polars"].values())
-    print(f"{len(data)} профилей, {nre} поляр, {npt} точек -> {out}")
+    nd = sum(d["coords_design"] is not None for d in data)
+    print(f"{len(data)} профилей ({nd} с проектными координатами), {nre} поляр, {npt} точек -> {out}")
     for d in data:
         print(f"  {d['name']:<22} vol{d['volume']}  Re: {', '.join(sorted(d['polars'], key=float))}")
 

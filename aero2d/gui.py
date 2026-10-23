@@ -71,6 +71,7 @@ class App(tk.Tk):
         e.bind("<FocusOut>", lambda _: self.preview_airfoil())
         ttk.Radiobutton(f, text="Файл координат", variable=self.src, value="file",
                         command=self.preview_airfoil).grid(row=1, column=0, sticky="w")
+        self.smooth = tk.BooleanVar(value=False)
         ttk.Button(f, text="Открыть…", command=self.open_file).grid(row=1, column=1, sticky="w")
         self.file = tk.StringVar(value="")
         ttk.Radiobutton(f, text="Многоэлементный файл", variable=self.src, value="mfile",
@@ -80,6 +81,8 @@ class App(tk.Tk):
         self.file_disp = tk.StringVar(value="")
         ttk.Label(f, textvariable=self.file_disp, foreground="#555", wraplength=250).grid(
             row=3, column=0, columnspan=2, sticky="w")
+        ttk.Checkbutton(f, text="сгладить контур (измеренные координаты)", variable=self.smooth,
+                        command=self.preview_airfoil).grid(row=4, column=0, columnspan=2, sticky="w")
         # --- механизация из одного профиля
         self.flap_on = tk.BooleanVar(value=False)
         ttk.Checkbutton(f, text="Щелевой закрылок (из профиля NACA/файла)", variable=self.flap_on,
@@ -249,7 +252,7 @@ class App(tk.Tk):
         if self.src.get() == "file":
             if not self.file.get():
                 raise ValueError("Выберите файл координат")
-            return core.make_airfoil("file", self.file.get())
+            return core.make_airfoil("file", self.file.get(), smooth=self.smooth.get())
         return core.make_airfoil("naca", self.naca.get())
 
     def preview_airfoil(self):

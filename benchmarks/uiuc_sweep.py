@@ -26,18 +26,19 @@ sys.path.insert(0, os.path.join(HERE, ".."))
 warnings.filterwarnings("ignore")
 
 
-def make_airfoil(coords, n_side=100):
-    from aero2d.geometry import Airfoil, normalize, repanel
+def make_airfoil(coords, n_side=100, smooth=False):
+    from aero2d.geometry import Airfoil, normalize, repanel, smooth_airfoil
     c = np.asarray(coords, float)
-    return repanel(normalize(Airfoil(c[:, 0], c[:, 1], "uiuc")), n_side)
+    af = Airfoil(c[:, 0], c[:, 1], "uiuc")
+    return repanel(smooth_airfoil(af) if smooth else normalize(af), n_side)
 
 
 def run_case(task):
     np.seterr(all="ignore")
-    name, re_exp, rows, coords, ncrit, use_xf, opts = task
+    name, re_exp, rows, coords, ncrit, use_xf, opts, coords_kind = task
     rows = np.asarray(rows)
     t0 = time.time()
-    out = dict(name=name, re=re_exp, ncrit=ncrit, opts=opts, alpha=rows[:, 0].tolist(),
+    out = dict(name=name, re=re_exp, ncrit=ncrit, opts=opts, coords=coords_kind, alpha=rows[:, 0].tolist(),
                cl_exp=rows[:, 1].tolist(), cd_exp=rows[:, 2].tolist())
     import signal
 
@@ -46,7 +47,7 @@ def run_case(task):
     signal.signal(signal.SIGALRM, _alarm)
     signal.alarm(int(os.environ.get("CASE_TIMEOUT", "600")))
     try:
-        af = make_airfoil(coords)
+        af = make_airfoil(coords, smooth=coords_kind.endswith("+smooth"))
         from aero2d import blclosure as bc
         from aero2d.viscous import polar_robust
         for k, val in (opts or {}).items():
@@ -65,7 +66,7 @@ def run_case(task):
     if use_xf:
         try:
             from benchmarks.xfoil_ref import xfoil_polar
-            af = make_airfoil(coords, 80)
+            af = make_airfoil(coords, 80, smooth=coords_kind.endswith("+smooth"))
             xf = xfoil_polar(name, rows[:, 0], re_exp, coords=(af.x, af.y), ncrit=ncrit)
             out.update(cl_xf=[x["cl"] for x in xf], cd_xf=[x["cd"] for x in xf])
         except Exception as e:                   # noqa: BLE001
@@ -85,6 +86,10 @@ def main():
     ap.add_argument("--full", action="store_true", help="все углы, а не только до срыва")
     ap.add_argument("--amax", type=float, default=None, help="верхний предел α")
     ap.add_argument("--stride", type=int, default=1, help="брать каждую k-ю точку")
+    ap.add_argument("--coords", default="tested", choices=["tested", "design"],
+                    help="координаты: как испытано (*.dap) или по проекту (*.dat)")
+    ap.add_argument("--smooth", action="store_true", help="сглаживать контур (smooth_airfoil)")
+    ap.add_argument("--retry-from", default="", help="пересчитать случаи, где сошлось < 50 %% точек")
     ap.add_argument("--opts", default="", help="JSON: атрибуты ViscousSolver для эксперимента")
     args = ap.parse_args()
     data = json.load(open(os.path.join(HERE, "data", "uiuc", "dataset.json")))
@@ -97,6 +102,13 @@ def main():
                 done.add((d["name"], round(d["re"]), d["ncrit"], json.dumps(d.get("opts"), sort_keys=True)))
             except Exception:                    # noqa: BLE001
                 pass
+    retry = set()
+    if args.retry_from:
+        for ln in open(args.retry_from):
+            d = json.loads(ln)
+            if "conv" not in d or sum(d["conv"]) < 0.5 * len(d["alpha"]):
+                retry.add((d["name"], round(d["re"])))
+        done = set()
     tasks, seen = [], set()
     for d in data:
         if only and not any(o in d["name"].lower() for o in only):
@@ -121,8 +133,15 @@ def main():
                 rows = rows[::args.stride]
                 if len(rows) < 3:
                     continue
-            tasks.append((d["name"], float(best), rows.tolist(), d["coords"], args.ncrit, args.xfoil,
-                          json.loads(args.opts) if args.opts else None))
+            crd = d["coords"]
+            if args.coords == "design" and d.get("coords_design"):
+                crd = d["coords_design"]
+            if args.retry_from:
+                if (d["name"], round(float(best))) not in retry:
+                    continue
+            tasks.append((d["name"], float(best), rows.tolist(), crd, args.ncrit, args.xfoil,
+                          json.loads(args.opts) if args.opts else None,
+                          args.coords + ("+smooth" if args.smooth else "")))
     if args.limit:
         tasks = tasks[:args.limit]
     print(f"{len(tasks)} случаев, {sum(len(t[2]) for t in tasks)} точек", flush=True)
