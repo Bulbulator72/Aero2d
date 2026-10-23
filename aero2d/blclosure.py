@@ -193,6 +193,10 @@ def station(th, ds, ue, s, re, msq, turb, wake):
                 th=th, ds=ds, ue=ue, s=s, msq=msq, re=re)
 
 
+CTRCON = 1.8
+CTRCEX = 3.3
+
+
 def s_transition(hk, cq):
     """sqrt(C_τ) сразу после перехода (XFOIL: CTR = 1.8 exp(-3.3/(Hk-1)))."""
-    return 1.8 * np.exp(-3.3 / (hk - 1.0)) * cq
+    return CTRCON * np.exp(-CTRCEX / (hk - 1.0)) * cq

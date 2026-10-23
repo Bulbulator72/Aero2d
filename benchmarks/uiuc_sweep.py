@@ -38,13 +38,18 @@ def run_case(task):
     name, re_exp, rows, coords, ncrit, use_xf, opts = task
     rows = np.asarray(rows)
     t0 = time.time()
-    out = dict(name=name, re=re_exp, ncrit=ncrit, alpha=rows[:, 0].tolist(),
+    out = dict(name=name, re=re_exp, ncrit=ncrit, opts=opts, alpha=rows[:, 0].tolist(),
                cl_exp=rows[:, 1].tolist(), cd_exp=rows[:, 2].tolist())
     try:
         af = make_airfoil(coords)
         v = ViscousSolver(af, re_exp, ncrit=ncrit)
+        from aero2d import blclosure as bc
         for k, val in (opts or {}).items():
-            setattr(v, k, val)
+            if k.startswith("bc."):
+                setattr(bc, k[3:], val)
+                bc.CTCON = 0.5 / (bc.GACON**2 * bc.GBCON)
+            else:
+                setattr(v, k, val)
         pol = v.polar(rows[:, 0])
         out.update(cl=[p.cl for p in pol], cd=[p.cd for p in pol], cm=[p.cm for p in pol],
                    conv=[bool(p.converged) for p in pol], xtr_u=[p.xtr_u for p in pol],
@@ -72,6 +77,7 @@ def main():
     ap.add_argument("--ncrit", type=float, default=9.0)
     ap.add_argument("--only", default="")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--full", action="store_true", help="все углы, а не только до срыва")
     ap.add_argument("--opts", default="", help="JSON: атрибуты ViscousSolver для эксперимента")
     args = ap.parse_args()
     data = json.load(open(os.path.join(HERE, "data", "uiuc", "dataset.json")))
@@ -81,7 +87,7 @@ def main():
         for ln in open(args.out):
             try:
                 d = json.loads(ln)
-                done.add((d["name"], round(d["re"]), d["ncrit"]))
+                done.add((d["name"], round(d["re"]), d["ncrit"], json.dumps(d.get("opts"), sort_keys=True)))
             except Exception:                    # noqa: BLE001
                 pass
     tasks, seen = [], set()
@@ -95,10 +101,17 @@ def main():
             best = min(d["polars"], key=lambda r: abs(float(r) / target - 1))
             if abs(float(best) / target - 1) > 0.15 or len(d["polars"][best]) < 4:
                 continue
-            key = (d["name"], round(float(best)), args.ncrit)
+            key = (d["name"], round(float(best)), args.ncrit,
+                   json.dumps(json.loads(args.opts) if args.opts else None, sort_keys=True))
             if key in done:
                 continue
-            tasks.append((d["name"], float(best), d["polars"][best], d["coords"], args.ncrit, args.xfoil,
+            rows = np.asarray(d["polars"][best])
+            if not args.full:                    # только до срыва: α ∈ [−2°, α(Cl_max) − 1°]
+                amax = rows[np.argmax(rows[:, 1]), 0]
+                rows = rows[(rows[:, 0] >= -2.0) & (rows[:, 0] <= amax - 1.0)]
+                if len(rows) < 3:
+                    continue
+            tasks.append((d["name"], float(best), rows.tolist(), d["coords"], args.ncrit, args.xfoil,
                           json.loads(args.opts) if args.opts else None))
     if args.limit:
         tasks = tasks[:args.limit]

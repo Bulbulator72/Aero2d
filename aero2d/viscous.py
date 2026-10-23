@@ -749,12 +749,18 @@ class ViscousSolver:
             base = np.real(fun(V0, *extra))
             if not jac:
                 return base, None
-            dR = np.zeros((4, kdep * NV, n))
+            Q = kdep * NV
             scale = np.maximum(np.abs(np.real(V0)), 1e-12)
-            for q in range(kdep * NV):
-                Vq = V0.copy()
-                Vq[q] = Vq[q] + 1j * CSTEP * scale[q]
-                dR[:, q, :] = np.imag(fun(Vq, *extra)) / (CSTEP * scale[q])
+            # все возмущения — одним векторным вызовом: блок q столбцов
+            # содержит мнимое возмущение q-го входа
+            Vb = np.tile(V0, (1, Q))
+            for q in range(Q):
+                Vb[q, q * n:(q + 1) * n] += 1j * CSTEP * scale[q]
+            eb = tuple(np.tile(np.asarray(e), Q) if np.ndim(e) else e for e in extra)
+            types = getattr(self, "_last_types", None), getattr(self, "_last_ft", None)
+            out = np.imag(fun(Vb, *eb)).reshape(4, Q, n)
+            self._last_types, self._last_ft = types
+            dR = out / (CSTEP * scale)[None, :, :]
             return base, dR
 
         def scatter(rows, deps, dR):
