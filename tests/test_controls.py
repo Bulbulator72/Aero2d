@@ -50,3 +50,14 @@ def test_modified_naca_ordinates():
     xu, yu = a.x[:i + 1][::-1], a.y[:i + 1][::-1]
     for x, y in ((0.025, 0.02453), (0.3, 0.05827), (0.5, 0.05827), (0.7, 0.0448)):
         assert abs(np.interp(x, xu, yu) - y) < 4e-4
+
+
+def test_gapped_geometry_and_symmetry():
+    from aero2d.controls import gapped, solve_gapped
+    from aero2d.multi import _intersects
+    af = naca4("0009", 201)
+    for bal, d in ((0.0, 10.0), (0.2, 15.0)):
+        (fx, rd), _ = gapped(af, 0.7, d, bal, 0.005)
+        assert not _intersects(fx.x, fx.y, rd.x, rd.y)
+    cl, cm, ch, _ = solve_gapped(af, 0.0, 0.7, 0.0, 0.2, 0.005)
+    assert abs(cl) < 1e-6 and abs(ch) < 1e-6

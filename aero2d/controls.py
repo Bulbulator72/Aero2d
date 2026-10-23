@@ -126,3 +126,117 @@ def hinge_moment(x, y, cp, hinge, x_hinge, deflection, balance=0.0):
         cpu, cpl = np.interp(xe, xu, cu), np.interp(xe, xl, cl_)
         ch += (cpl - cpu) * (balance * cr) ** 2 * np.cos(d) / (2 * cr**2)
     return float(ch)
+
+
+# ---------------------------------------------------------------------------
+# Руль с открытой щелью: два элемента (неподвижная часть с нишей + руль)
+#
+# ЭКСПЕРИМЕНТАЛЬНО, в окно программы не выведено. В невязкой постановке
+# результат определяется тем, на какой губе ниши ставится условие Кутта, а
+# это решает вязкое течение в щели: при компенсации 0,20c_р переключение губы
+# меняет Cl на ±0,06 уже при α = δ = 0, а производные зависят от зазора не
+# так, как в опыте (NACA ARR L-301: зазор слегка уменьшает cl_α и τ и почти
+# не меняет ch). Для открытой щели нужен вязкий многоэлементный расчёт.
+# ---------------------------------------------------------------------------
+def _skin(af: Airfoil):
+    (xu, yu), (xl, yl) = _split(af)
+    return (lambda t: np.interp(t, xu, yu)), (lambda t: np.interp(t, xl, yl))
+
+
+def gapped(af: Airfoil, x_hinge: float, deflection: float, balance: float = 0.0, gap: float = 0.005,
+           lip: str = "upper", delta_max: float | None = None, n: int = 90):
+    """Руль с открытой щелью: [неподвижная часть, руль].
+
+    Носок руля — полуэллипс с центром на оси: вперёд на b = balance·c_р (но не
+    меньше местной полутолщины), по высоте — до обшивки. Ниша неподвижной части
+    повторяет огибающую носка при отклонениях ±delta_max, отстоящую на gap;
+    кромки ниши («губы») — там, где ниша выходит на обшивку. Условие Кутта для
+    неподвижной части ставится на той губе, через которую выходит поток из щели:
+    lip="upper" (нагрузка вверх, руль вниз) или "lower"."""
+    fu, fl = _skin(af)
+    h = hinge_point(af, x_hinge)
+    cr = 1.0 - x_hinge
+    if delta_max is None:                    # ниша — под фактический ход руля
+        delta_max = max(abs(deflection) + 5.0, 15.0)
+    ru, rl = fu(x_hinge) - h[1], h[1] - fl(x_hinge)
+    b = max(balance * cr, 0.5 * (ru + rl))
+    # --- носок руля (в собственной системе, до поворота): от верха через носик к низу
+    ph = np.linspace(0.5 * np.pi, 1.5 * np.pi, 61)
+    nx = h[0] + b * np.cos(ph)
+    ny = h[1] + np.where(np.sin(ph) > 0, ru, rl) * np.sin(ph)
+    # --- огибающая носка при повороте ±delta_max (в полярных координатах вокруг оси)
+    angs = np.linspace(0.40 * np.pi, 1.60 * np.pi, 361)
+    renv = np.zeros_like(angs)
+    for th in np.radians(np.linspace(-delta_max, delta_max, 25)):
+        rx, ry = _rot(nx, ny, h, np.degrees(th))
+        a = np.mod(np.arctan2(ry - h[1], rx - h[0]), 2 * np.pi)
+        r = np.hypot(rx - h[0], ry - h[1])
+        o = np.argsort(a)
+        renv = np.maximum(renv, np.interp(angs, a[o], r[o], left=0, right=0))
+    rc = renv + gap
+    # --- губы: где ниша выходит на обшивку
+    def lip_x(skin, upper):
+        xs = np.linspace(x_hinge - 3 * b - 0.05, x_hinge, 2000)
+        ys = skin(xs)
+        a = np.mod(np.arctan2(ys - h[1], xs - h[0]), 2 * np.pi)
+        d = np.hypot(xs - h[0], ys - h[1])
+        f = d - np.interp(a, angs, rc)
+        k = np.where((f[:-1] > 0) & (f[1:] <= 0))[0]
+        return xs[k[0]] if len(k) else x_hinge - b - gap
+    xlu, xll = lip_x(fu, True), lip_x(fl, False)
+    alu = np.mod(np.arctan2(fu(xlu) - h[1], xlu - h[0]), 2 * np.pi)
+    all_ = np.mod(np.arctan2(fl(xll) - h[1], xll - h[0]), 2 * np.pi)
+    # --- неподвижная часть: губа (верх) → верх → носок профиля → низ → губа (низ) → ниша → губа (верх)
+    t = 0.5 * (1 - np.cos(np.linspace(0, np.pi, n)))
+    tu, tl = t * xlu, t * xll
+    up_x, up_y = tu[::-1], fu(tu[::-1])
+    lo_x, lo_y = tl[1:], fl(tl[1:])
+    ca = np.linspace(all_, alu, 50)[1:-1]                  # от нижней губы через перёд к верхней
+    cr_ = np.interp(ca, angs, rc)
+    cx, cy = h[0] + cr_ * np.cos(ca), h[1] + cr_ * np.sin(ca)
+    fx = np.concatenate([up_x, lo_x, cx, [up_x[0]]])
+    fy = np.concatenate([up_y, lo_y, cy, [up_y[0]]])
+    if lip == "lower":                                      # кромка Кутта — на нижней губе
+        k = len(up_x) + len(lo_x) - 1
+        fx = np.concatenate([fx[k:-1], fx[:k + 1]])
+        fy = np.concatenate([fy[k:-1], fy[:k + 1]])
+    fixed = Airfoil(fx, fy, af.name + " — неподвижная часть")
+    # --- руль: кромка → верх → носок → низ → кромка, затем поворот
+    tr = x_hinge + 0.5 * (1 - np.cos(np.linspace(0, np.pi, n))) * cr
+    rx = np.concatenate([tr[::-1], nx[1:-1], tr])
+    ry = np.concatenate([fu(tr[::-1]), ny[1:-1], fl(tr)])
+    ry[0] = ry[-1] = 0.5 * (ry[0] + ry[-1])
+    rx, ry = _rot(rx, ry, h, deflection)
+    rudder = Airfoil(rx, ry, af.name + f" — руль {deflection:g}°")
+    return [fixed, rudder], h
+
+
+def hinge_moment_element(x, y, cp, hinge, x_hinge):
+    """Ch по полному контуру руля (включая носок впереди оси)."""
+    x, y, cp = (np.asarray(v, float) for v in (x, y, cp))
+    xm, ym = 0.5 * (x[:-1] + x[1:]), 0.5 * (y[:-1] + y[1:])
+    dx, dy = np.diff(x), np.diff(y)
+    cpm = 0.5 * (cp[:-1] + cp[1:])
+    fx, fy = -cpm * dy, cpm * dx
+    mz = np.sum((xm - hinge[0]) * fy - (ym - hinge[1]) * fx)
+    return float(-mz / (1.0 - x_hinge) ** 2)
+
+
+def solve_gapped(af: Airfoil, alpha: float, x_hinge: float, deflection: float, balance: float = 0.0,
+                 gap: float = 0.005, tau: float = 0.6, width: float = 2.0, mach: float = 0.0):
+    """Невязкий расчёт руля с открытой щелью. Поток через щель выходит через
+    верхнюю губу при нагрузке вверх и через нижнюю — при нагрузке вниз;
+    около нулевой нагрузки (|α + τδ| ≲ width) решения с условием Кутта на
+    верхней и нижней губе смешиваются плавно, чтобы симметричный профиль при
+    α = δ = 0 давал ноль. Возвращает (Cl, Cm, Ch, элементы верхнего варианта)."""
+    from .multi import MultiPanelSolver
+    load = alpha + tau * deflection
+    w = 0.5 + 0.5 * np.tanh(load / width)
+    out = []
+    for lip in ("upper", "lower"):
+        els, h = gapped(af, x_hinge, deflection, balance, gap, lip)
+        r = MultiPanelSolver(els, chord=1.0, xref=(0.25, 0.0)).solve(alpha, mach)
+        e = r.elements[1]
+        out.append((r.cl, r.cm, hinge_moment_element(e["x"], e["y"], e["cp"], h, x_hinge), r))
+    cl, cm, ch = (w * out[0][i] + (1 - w) * out[1][i] for i in range(3))
+    return cl, cm, ch, out[0][3] if w >= 0.5 else out[1][3]
