@@ -265,7 +265,7 @@ class App(tk.Tk):
             "Фаулера": dict(chord=0.30, deflection=30, gap=0.02, overlap=0.0),
             "двухщелевой": dict(chord=0.35, deflection=45, gap=0.012, overlap=0.0,
                                 vane_chord=0.12, vane_deflection=20, vane_gap=0.015, vane_overlap=0.0),
-            "руль/элерон (поворотный)": dict(chord=0.30, deflection=10, balance=0.20),
+            "руль/элерон (поворотный)": dict(chord=0.30, deflection=10, balance=0.20, gap=0.0),
         }
         fl = self.hl_cfg["flap"] or {}
         sl = self.hl_cfg["slat"] or {}
@@ -284,7 +284,8 @@ class App(tk.Tk):
         cb.grid(row=0, column=1, sticky="w")
         rows = [("хорда закрылка/руля (от оси), доли хорды", "chord", 0.30),
                 ("угол отклонения δ, °", "deflection", 30),
-                ("зазор, доли хорды", "gap", 0.015), ("перекрытие, доли хорды", "overlap", 0.0),
+                ("зазор, доли хорды (руль: щель у носка, 0 — герметична)", "gap", 0.015),
+                ("перекрытие, доли хорды", "overlap", 0.0),
                 ("осевая компенсация руля, доли хорды руля", "balance", 0.0)]
         for r, (lbl, k, d) in enumerate(rows, start=1):
             ttk.Label(frm, text=lbl).grid(row=r, column=0, sticky="w")
@@ -312,10 +313,12 @@ class App(tk.Tk):
             "носка основной части. Однощелевой: короткая ниша, перекрытие ~0,01–0,03. "
             "Фаулера: закрылок убран в глубокую нишу и выдвинут назад (перекрытие ~0 — "
             "наибольшее увеличение хорды). Коэффициенты отнесены к хорде исходного профиля.\n"
-            "Руль/элерон: задняя часть поворачивается вокруг оси (одним контуром, щель "
-            "герметична), считается вязким или невязким методом; зазор и перекрытие не "
-            "используются. Осевая компенсация — длина носка руля впереди оси в долях хорды "
-            "руля (обычно 0,15–0,30); влияет на шарнирный момент Ch.")
+            "Руль/элерон: задняя часть поворачивается вокруг оси (одним контуром), считается "
+            "вязким или невязким методом; перекрытие не используется. Зазор — щель у носка "
+            "руля: 0 — герметична; 0,001–0,01 — открытая щель, учитывается эмпирической "
+            "поправкой по продувкам NACA (меньше наклон cl(α) и эффективность руля). "
+            "Осевая компенсация — длина носка руля впереди оси в долях хорды руля "
+            "(обычно 0,15–0,30); влияет на шарнирный момент Ch.")
                   ).grid(row=3, column=0, padx=6, pady=4, sticky="w")
 
         def on_type(_=None):
@@ -332,9 +335,11 @@ class App(tk.Tk):
                 flap = None
                 if t == "control":
                     flap = dict(type=t, chord=num("f_chord"), deflection=num("f_deflection"),
-                                balance=num("f_balance"))
+                                balance=num("f_balance"), gap=num("f_gap"))
                     if not 0.0 <= flap["balance"] <= 0.6:
                         raise ValueError("осевая компенсация — от 0 до 0,6 хорды руля")
+                    if not 0.0 <= flap["gap"] <= 0.02:
+                        raise ValueError("щель у носка руля — от 0 (герметична) до 0,02 хорды")
                 elif t:
                     flap = dict(type=t, **{k: num("f_" + k) for k in ("chord", "deflection", "gap", "overlap")})
                     if t == "double":
@@ -362,7 +367,8 @@ class App(tk.Tk):
                 nm = ftype.get()
                 d = f"{flap['vane_deflection']:g}/{flap['deflection']:g}" if t == "double" else f"{flap['deflection']:g}"
                 if t == "control":
-                    parts.append(f"руль {flap['chord']:g}c, δ {d}°, компенсация {100 * flap['balance']:g} %")
+                    parts.append(f"руль {flap['chord']:g}c, δ {d}°, компенсация {100 * flap['balance']:g} %"
+                                 + (f", щель {flap['gap']:g}c" if flap.get("gap") else ""))
                 else:
                     parts.append(f"закрылок {nm} {d}°")
             self.hl_desc.set(", ".join(parts) if parts else "нет")
@@ -401,7 +407,7 @@ class App(tk.Tk):
             from .controls import deflect, hinge_point
             xh = 1.0 - fl["chord"]
             self._control = dict(x_hinge=xh, deflection=fl["deflection"], balance=fl.get("balance", 0.0),
-                                 hinge=hinge_point(af, xh))
+                                 hinge=hinge_point(af, xh), gap=fl.get("gap", 0.0), base=af)
             out = deflect(af, xh, fl["deflection"])
             out.name = af.name + f", руль {fl['deflection']:g}°"
             return out

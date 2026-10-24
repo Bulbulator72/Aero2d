@@ -97,14 +97,29 @@ def _hinge(control, xs, ys, cps):
                      for x, y, cp in zip(xs, ys, cps)])
 
 
+def _gap_note(control):
+    g = (control or {}).get("gap", 0.0)
+    if not g:
+        return []
+    from .controls import gap_factors
+    ka, kd = gap_factors(g)
+    return [f"Щель у носка руля открыта: {g:g}c. Учтена эмпирической поправкой по продувкам NACA "
+            f"(ARR L-301, NACA 0009, руль 0,30c, компенсация 0,20c_р): наклон cl(α) ×{ka:.3f}, "
+            f"приращение cl от руля ×{kd:.3f}; ch пересчитан при той же связи ch(cl), что при "
+            "герметичной щели (по опыту NACA она от щели почти не зависит). Для этого дополнительно "
+            "посчитана поляра без отклонения руля. Cm не исправлен. Поправка проверена на щелях "
+            "0,001–0,010c; для других профилей и рулей — оценка."]
+
+
 def _control_note(control):
     if not control:
         return []
-    return [f"Руль: ось на x/c = {control['x_hinge']:g} (хорда руля {1 - control['x_hinge']:g}), "
+    return _gap_note(control) + [f"Руль: ось на x/c = {control['x_hinge']:g} (хорда руля {1 - control['x_hinge']:g}), "
             f"δ = {control['deflection']:g}°, осевая компенсация {100 * control.get('balance', 0):g} % "
             "хорды руля. Ch = M_ш/(q∞·c_р²), c_р — хорда руля за осью; Ch > 0 — момент отклоняет "
-            "руль задней кромкой вниз. Щель считается герметичной, давление в нише компенсации — "
-            "равным давлению у кромок ниши (инженерная модель)."]
+            "руль задней кромкой вниз. Расчёт выполнен с герметичной щелью"
+            + (" (открытая — поправкой, см. выше)" if control.get("gap") else "") +
+            ", давление в нише компенсации — равным давлению у кромок ниши (инженерная модель)."]
 
 
 def run_panel(af: Airfoil, alphas, mach: float, control=None) -> Polar:
@@ -127,9 +142,14 @@ def run_panel(af: Airfoil, alphas, mach: float, control=None) -> Polar:
     notes.append("Панельный метод невязкий: сопротивление и срыв не рассчитываются.")
     notes += _control_note(control)
     ys = [s.y for _ in alphas]
+    cl, ch = np.array(cl), _hinge(control, xs, ys, cps)
+    if control and control.get("gap") and control.get("base") is not None:
+        from .controls import apply_gap
+        sb = PanelSolver(control["base"])
+        cl, ch = apply_gap(cl, ch, [sb.solve(float(a), mach).cl for a in alphas], control["gap"])
     return Polar(f"{af.name}, панели, M={mach:g}", "panel", mach, np.asarray(alphas, float),
-                 np.array(cl), np.full(len(cl), np.nan), np.array(cm), ok, xs, cps, notes,
-                 ch=_hinge(control, xs, ys, cps),
+                 cl, np.full(len(cl), np.nan), np.array(cm), ok, xs, cps, notes,
+                 ch=ch,
                  field_ctx=dict(method="panel", airfoil=af, mach=mach, alpha=np.asarray(alphas, float)))
 
 
@@ -269,11 +289,19 @@ def run_viscous_batch(af: Airfoil, alphas, mach: float, re_list, ncrit: float = 
     _check_viscous(re_list, mach)
     alphas, results, nproc = _run_parallel(
         "single", lambda re, al: (af, re, al, ncrit, mach, tuple(xtr)), alphas, re_list, workers, 4, callback)
-    return [_viscous_polar(af, alphas, res, mach, re, ncrit, xtr, control, nproc)
-            for re, res in zip(re_list, results)]
+    bases = [None] * len(re_list)
+    if control and control.get("gap") and control.get("base") is not None:
+        base = control["base"]
+        if callback:
+            callback("Открытая щель: поляра без отклонения руля…", 0.0)
+        _, rb, _ = _run_parallel("single", lambda re, al: (base, re, al, ncrit, mach, tuple(xtr)),
+                                 alphas, re_list, workers, 4, callback)
+        bases = [np.array([r.cl if r.converged else np.nan for r in res]) for res in rb]
+    return [_viscous_polar(af, alphas, res, mach, re, ncrit, xtr, control, nproc, cb)
+            for re, res, cb in zip(re_list, results, bases)]
 
 
-def _viscous_polar(af, alphas, res, mach, re, ncrit, xtr, control, nproc):
+def _viscous_polar(af, alphas, res, mach, re, ncrit, xtr, control, nproc, cl_base=None):
     ok = np.array([r.converged for r in res])
     cpstar = critical_cp(mach)
     sup = np.array([np.min(r.cp) < cpstar for r in res]) if mach > 0 else np.zeros(len(res), bool)
@@ -296,13 +324,20 @@ def _viscous_polar(af, alphas, res, mach, re, ncrit, xtr, control, nproc):
                  "внутри куска — продолжение от соседней точки.")
     notes += _control_note(control)
     label = f"{af.name}, вязкий, Re={re:.3g}, M={mach:g}"
-    return Polar(label, "viscous", mach, alphas, np.array([r.cl for r in res]),
+    cl = np.array([r.cl for r in res])
+    ch = _hinge(control, [r.x for r in res], [r.y for r in res], [r.cp for r in res])
+    if cl_base is not None:
+        from .controls import apply_gap
+        cl, ch = apply_gap(cl, ch, cl_base, control["gap"])
+        ok = ok & np.isfinite(cl)
+        label += f", щель {control['gap']:g}c"
+    return Polar(label, "viscous", mach, alphas, cl,
                  np.array([r.cd for r in res]), np.array([r.cm for r in res]), ok & ~sup,
                  [r.x for r in res], [r.cp for r in res], notes, re=re,
                  cdf=np.array([r.cdf for r in res]),
                  xtr_u=np.array([r.xtr_u for r in res]), xtr_l=np.array([r.xtr_l for r in res]),
                  bl=[r.side for r in res], cp_inv=[r.cp_inv for r in res],
-                 ch=_hinge(control, [r.x for r in res], [r.y for r in res], [r.cp for r in res]),
+                 ch=ch,
                  field_ctx=dict(method="viscous", airfoil=af, re=re, ncrit=ncrit, mach=mach, xtr=xtr,
                                 alpha=alphas, states=[r.state for r in res],
                                 n_panels=[getattr(r, "n_panels", 160) for r in res]))

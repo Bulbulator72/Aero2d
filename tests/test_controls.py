@@ -61,3 +61,19 @@ def test_gapped_geometry_and_symmetry():
         assert not _intersects(fx.x, fx.y, rd.x, rd.y)
     cl, cm, ch, _ = solve_gapped(af, 0.0, 0.7, 0.0, 0.2, 0.005)
     assert abs(cl) < 1e-6 and abs(ch) < 1e-6
+
+
+def test_gap_correction():
+    """Открытая щель: поправка по NACA L-301 — без щели ничего не меняет,
+    с щелью 0,005–0,010c уменьшает наклон cl(α) на 7–10 % (опыт: 0,104 → 0,094–0,096)."""
+    import numpy as np
+    from aero2d.controls import gap_factors, apply_gap
+    assert gap_factors(0.0) == (1.0, 1.0)
+    for g in (0.005, 0.010):
+        ka, kd = gap_factors(g)
+        assert 0.88 < ka < 0.94 and 0.90 < kd < 0.97
+    cl = np.array([0.1, 0.3, 0.5]); cb = np.array([-0.1, 0.1, 0.3]); ch = np.array([-0.05, -0.06, -0.07])
+    c0, h0 = apply_gap(cl, ch, cb, 0.0)
+    assert np.allclose(c0, cl) and np.allclose(h0, ch)
+    c1, _ = apply_gap(cl, ch, cb, 0.01)
+    assert np.all(c1 < cl)

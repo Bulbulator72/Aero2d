@@ -240,3 +240,47 @@ def solve_gapped(af: Airfoil, alpha: float, x_hinge: float, deflection: float, b
         out.append((r.cl, r.cm, hinge_moment_element(e["x"], e["y"], e["cp"], h, x_hinge), r))
     cl, cm, ch = (w * out[0][i] + (1 - w) * out[1][i] for i in range(3))
     return cl, cm, ch, out[0][3] if w >= 0.5 else out[1][3]
+
+
+# ---------------------------------------------------------------------------
+# Открытая щель у носка руля: эмпирическая поправка по продувкам NACA
+# ---------------------------------------------------------------------------
+# NACA ARR L-301 (Ames, 1941): NACA 0009, руль 0,30c, компенсация 0,20c_р, тупой
+# носок, Re ≈ 1,4·10⁶; щель герметична, 0,001c, 0,005c, 0,010c (рис. 3a–d).
+# Оцифровка при α = 0, δ = 0…15° (±0,02 по cl) и текст отчёта:
+#   cl_α:  0,104 (герм.) → 0,100 (0,001c) → 0,093…0,094 (0,005c) → 0,096 (0,010c)
+#   приращение от руля Δcl(δ)/Δcl_герм: ≈0,98 (0,001c), 0,90–0,94 (0,005c),
+#   0,93–0,95 (0,010c);
+#   «зависимость ch от cl при данном δ от щели практически не зависит».
+# Аппроксимация: k(g) = 1 − A·(1 − exp(−g/0,002)), g — щель в долях хорды.
+GAP_DATA = {0.0: (0.104, 1.00), 0.001: (0.100, 0.98), 0.005: (0.0935, 0.92), 0.010: (0.096, 0.94)}
+_GAP_A_ALPHA, _GAP_A_DELTA, _GAP_G0 = 0.085, 0.07, 0.002
+
+
+def gap_factors(gap: float):
+    """(k_α, k_δ): отношения наклона cl(α) и приращения cl от руля с открытой
+    щелью к значениям при герметичной щели."""
+    s = 1.0 - np.exp(-max(gap, 0.0) / _GAP_G0)
+    return 1.0 - _GAP_A_ALPHA * s, 1.0 - _GAP_A_DELTA * s
+
+
+def apply_gap(cl, ch, cl_base, gap: float):
+    """Поправка поляры руля с герметичной щелью на открытую щель.
+    cl, ch — расчёт с отклонённым рулём (герметичная щель) по углам атаки;
+    cl_base — тот же профиль без отклонения руля при тех же α.
+    cl_щ = k_α·[cl₀ + k_δ·(cl − cl₀)];  ch_щ = ch + (∂ch/∂cl)_δ·(cl_щ − cl)
+    (по опыту NACA связь ch(cl) при данном δ от щели почти не зависит).
+    Возвращает (cl, ch)."""
+    ka, kd = gap_factors(gap)
+    cl, cl_base = np.asarray(cl, float), np.asarray(cl_base, float)
+    cl_g = ka * (cl_base + kd * (cl - cl_base))
+    if ch is None:
+        return cl_g, None
+    ch = np.asarray(ch, float)
+    if len(cl) >= 2:
+        with np.errstate(all="ignore"):
+            dch = np.gradient(ch, cl)
+        dch = np.where(np.isfinite(dch), dch, 0.0)
+    else:
+        dch = np.zeros_like(ch)
+    return cl_g, ch + dch * (cl_g - cl)
