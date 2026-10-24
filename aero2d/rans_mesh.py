@@ -1,0 +1,224 @@
+"""Гибридная сетка для RANS вокруг одно- и многоэлементного профиля (gmsh).
+
+У стенок — слой четырёхугольников (первый шаг по нормали ~ y⁺ ≈ 1, рост
+ratio, «веер» на острых задних кромках), снаружи — треугольники, размер
+которых растёт от поверхности к внешней границе (окружность радиуса R хорд).
+Сгущение в следах — по расстоянию до линий следа (если заданы).
+
+Результат — словарь массивов (см. Mesh), независимый от gmsh: узлы,
+ячейки (3 или 4 вершины), грани с соседями и нормалями, метки границ.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+
+
+@dataclass
+class Mesh:
+    nodes: np.ndarray          # (Nn, 2)
+    cells: list                # списки вершин (против часовой стрелки)
+    centroid: np.ndarray       # (Nc, 2)
+    volume: np.ndarray         # (Nc,)
+    face_cells: np.ndarray     # (Nf, 2): левая, правая ячейка (−1 для граничной)
+    face_nodes: np.ndarray     # (Nf, 2)
+    face_normal: np.ndarray    # (Nf, 2) — единичная нормаль от левой к правой
+    face_area: np.ndarray      # (Nf,)
+    face_center: np.ndarray    # (Nf, 2)
+    face_tag: np.ndarray       # (Nf,) 0 — внутренняя, 1 — стенка, 2 — внешняя граница
+    face_body: np.ndarray      # (Nf,) номер элемента для стенок, −1 иначе
+    wall_dist: np.ndarray      # (Nc,) расстояние до ближайшей стенки
+
+    @property
+    def n_cells(self):
+        return len(self.volume)
+
+
+def build_mesh(elements, chord=1.0, re=1e6, yplus=1.0, ratio=1.2, bl_thickness=None,
+               far_radius=50.0, far_size=8.0, surf_ratio=1.0, wakes=None, wake_size=0.01,
+               slot_size=None, verbose=False):
+    """elements — список Airfoil (обход: ЗК → верх → носок → низ → ЗК), в общей
+    системе координат; Re — по хорде chord. Первый шаг у стенки — по оценке
+    y⁺ = yplus для турбулентной пластины (Cf ≈ 0,026 Re^(−1/7)).
+    wakes — список ломаных (x, y) линий следа для сгущения."""
+    import gmsh
+    cf = 0.026 * re ** (-1 / 7)
+    h0 = yplus * chord / (re * np.sqrt(cf / 2))
+    # толщина слоя четырёхугольников: не больше трети наименьшей щели
+    gaps = []
+    for i in range(len(elements)):
+        for j in range(i + 1, len(elements)):
+            a, b = elements[i], elements[j]
+            d = np.hypot(a.x[:, None] - b.x[None, :], a.y[:, None] - b.y[None, :]).min()
+            gaps.append(d)
+    min_gap = min(gaps) if gaps else np.inf
+    if bl_thickness is None:
+        bl_thickness = min(0.02 * chord, 0.3 * min_gap)
+    gmsh.initialize()
+    try:
+        gmsh.option.setNumber("General.Terminal", 1 if verbose else 0)
+        gmsh.option.setNumber("General.NumThreads", 1)        # воспроизводимая сетка
+        gmsh.option.setNumber("Mesh.RandomSeed", 1)
+        gmsh.model.add("aero2d")
+        geo = gmsh.model.geo
+        loops, wall_curves, fan_pts, body_curves = [], [], [], []
+        for e, af in enumerate(elements):
+            x, y = np.asarray(af.x, float), np.asarray(af.y, float)
+            if np.hypot(x[0] - x[-1], y[0] - y[-1]) < 1e-12:
+                x, y = x[:-1], y[:-1]
+            # шаг по поверхности — по соседним точкам контура
+            ds = np.hypot(np.diff(np.r_[x, x[0]]), np.diff(np.r_[y, y[0]]))
+            lc = surf_ratio * np.maximum(np.r_[ds[-1], ds[:-1]], ds)
+            pts = [geo.addPoint(xi, yi, 0, li) for xi, yi, li in zip(x, y, lc)]
+            curves = []
+            for k in range(len(pts)):
+                c = geo.addLine(pts[k], pts[(k + 1) % len(pts)])
+                curves.append(c)
+            loops.append(geo.addCurveLoop(curves))
+            wall_curves += curves
+            body_curves.append(curves)
+            fan_pts.append(pts[0])                      # задняя кромка
+        far = []
+        n_far = 64
+        cpt = geo.addPoint(0.5 * chord, 0, 0, far_size * chord)
+        fpts = [geo.addPoint(0.5 * chord + far_radius * chord * np.cos(t), far_radius * chord * np.sin(t), 0,
+                             far_size * chord) for t in np.linspace(0, 2 * np.pi, n_far, endpoint=False)]
+        for k in range(n_far):
+            far.append(geo.addCircleArc(fpts[k], cpt, fpts[(k + 1) % n_far]))
+        floop = geo.addCurveLoop(far)
+        surf = geo.addPlaneSurface([floop] + loops)
+        geo.synchronize()
+        for c in wall_curves:
+            gmsh.model.mesh.setTransfiniteCurve(c, 2)
+        # слой четырёхугольников
+        fbl = gmsh.model.mesh.field.add("BoundaryLayer")
+        gmsh.model.mesh.field.setNumbers(fbl, "CurvesList", wall_curves)
+        gmsh.model.mesh.field.setNumbers(fbl, "FanPointsList", fan_pts)
+        gmsh.model.mesh.field.setNumber(fbl, "Size", h0)
+        gmsh.model.mesh.field.setNumber(fbl, "Ratio", ratio)
+        gmsh.model.mesh.field.setNumber(fbl, "Thickness", bl_thickness)
+        gmsh.model.mesh.field.setNumber(fbl, "Quads", 1)
+        gmsh.model.mesh.field.setAsBoundaryLayer(fbl)
+        # размер треугольников: растёт с расстоянием от стенок и следов
+        fields = []
+        fd = gmsh.model.mesh.field.add("Distance")
+        gmsh.model.mesh.field.setNumbers(fd, "CurvesList", wall_curves)
+        gmsh.model.mesh.field.setNumber(fd, "Sampling", 20)
+        fm = gmsh.model.mesh.field.add("MathEval")
+        smin = 0.004 * chord if slot_size is None else slot_size
+        gmsh.model.mesh.field.setString(fm, "F", f"{smin} + 0.25*F{fd}")
+        fields.append(fm)
+        if wakes:
+            wpts = []
+            for wx, wy in wakes:
+                for xx, yy in zip(wx, wy):
+                    wpts.append(geo.addPoint(xx, yy, 0, wake_size * chord))
+            geo.synchronize()
+            fw = gmsh.model.mesh.field.add("Distance")
+            gmsh.model.mesh.field.setNumbers(fw, "PointsList", wpts)
+            fwm = gmsh.model.mesh.field.add("MathEval")
+            gmsh.model.mesh.field.setString(fwm, "F", f"{wake_size * chord} + 0.3*F{fw}")
+            fields.append(fwm)
+        fmin = gmsh.model.mesh.field.add("Min")
+        gmsh.model.mesh.field.setNumbers(fmin, "FieldsList", fields)
+        gmsh.model.mesh.field.setAsBackgroundMesh(fmin)
+        gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
+        gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 1)
+        gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
+        gmsh.option.setNumber("Mesh.Algorithm", 6)            # Frontal-Delaunay
+        gmsh.option.setNumber("Mesh.MeshSizeMax", far_size * chord)
+        gmsh.model.mesh.generate(2)
+        # --- извлечение
+        ntags, ncoord, _ = gmsh.model.mesh.getNodes()
+        nodes = ncoord.reshape(-1, 3)[:, :2]
+        idx = np.full(int(ntags.max()) + 1, -1)
+        idx[ntags.astype(int)] = np.arange(len(ntags))
+        cells = []
+        etypes, _, enodes = gmsh.model.mesh.getElements(2)
+        for et, en in zip(etypes, enodes):
+            nv = {2: 3, 3: 4}[int(et)]
+            cells += [list(idx[en.reshape(-1, nv)[k].astype(int)]) for k in range(len(en) // nv)]
+        # граничные рёбра
+        wall_edges = {}
+        for b, cs in enumerate(body_curves):
+            for c in cs:
+                _, _, en = gmsh.model.mesh.getElements(1, c)
+                for ed in en[0].reshape(-1, 2):
+                    wall_edges[tuple(sorted(idx[ed.astype(int)]))] = b
+        far_edges = set()
+        for c in far:
+            _, _, en = gmsh.model.mesh.getElements(1, c)
+            for ed in en[0].reshape(-1, 2):
+                far_edges.add(tuple(sorted(idx[ed.astype(int)])))
+    finally:
+        gmsh.finalize()
+    return _connectivity(nodes, cells, wall_edges, far_edges, elements)
+
+
+def _connectivity(nodes, cells, wall_edges, far_edges, elements):
+    # ориентация против часовой стрелки
+    cells2 = []
+    cen = np.zeros((len(cells), 2))
+    vol = np.zeros(len(cells))
+    for k, c in enumerate(cells):
+        p = nodes[c]
+        a = 0.5 * np.sum(p[:, 0] * np.roll(p[:, 1], -1) - np.roll(p[:, 0], -1) * p[:, 1])
+        if a < 0:
+            c = c[::-1]
+            p = p[::-1]
+            a = -a
+        cells2.append(c)
+        # центр масс многоугольника
+        cr = p[:, 0] * np.roll(p[:, 1], -1) - np.roll(p[:, 0], -1) * p[:, 1]
+        cen[k] = [np.sum((p[:, 0] + np.roll(p[:, 0], -1)) * cr), np.sum((p[:, 1] + np.roll(p[:, 1], -1)) * cr)]
+        cen[k] /= 6 * a
+        vol[k] = a
+    edges = {}
+    for k, c in enumerate(cells2):
+        n = len(c)
+        for i in range(n):
+            a, b = c[i], c[(i + 1) % n]
+            key = (min(a, b), max(a, b))
+            if key in edges:
+                edges[key][1] = k
+            else:
+                edges[key] = [k, -1, a, b]          # a→b — обход левой ячейки (против часовой)
+    nf = len(edges)
+    fc = np.zeros((nf, 2), int)
+    fn = np.zeros((nf, 2), int)
+    tag = np.zeros(nf, int)
+    body = -np.ones(nf, int)
+    for i, (key, (l, r, a, b)) in enumerate(edges.items()):
+        fc[i] = (l, r)
+        fn[i] = (a, b)
+        if r < 0:
+            if key in wall_edges:
+                tag[i], body[i] = 1, wall_edges[key]
+            elif key in far_edges:
+                tag[i] = 2
+            else:
+                raise RuntimeError("граничное ребро без метки")
+    pa, pb = nodes[fn[:, 0]], nodes[fn[:, 1]]
+    t = pb - pa
+    area = np.hypot(t[:, 0], t[:, 1])
+    normal = np.column_stack([t[:, 1], -t[:, 0]]) / area[:, None]     # наружу из левой ячейки
+    fcen = 0.5 * (pa + pb)
+    # расстояние до стенки — до отрезков стенок
+    from scipy.spatial import cKDTree
+    wf = np.where(tag == 1)[0]
+    sub = np.linspace(0, 1, 9)
+    wp = (pa[wf, None, :] + sub[None, :, None] * t[wf, None, :]).reshape(-1, 2)
+    d, _ = cKDTree(wp).query(cen)
+    return Mesh(nodes, cells2, cen, vol, fc, fn, normal, area, fcen, tag, body, d)
+
+
+def quality(mesh: Mesh) -> dict:
+    """Простые показатели: число ячеек, четырёхугольников, мин. объём, макс.
+    отношение соседних объёмов."""
+    l, r = mesh.face_cells.T
+    m = r >= 0
+    vr = mesh.volume[l[m]] / mesh.volume[r[m]]
+    return dict(cells=mesh.n_cells, quads=sum(len(c) == 4 for c in mesh.cells),
+                vmin=float(mesh.volume.min()), vol_ratio_max=float(np.max(np.maximum(vr, 1 / vr))),
+                wall_faces=int((mesh.face_tag == 1).sum()))

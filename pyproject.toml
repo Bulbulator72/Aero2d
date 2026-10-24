@@ -1,13 +1,14 @@
 [project]
 name = "aero2d"
 version = "0.1.0"
-description = "Расчёт аэродинамических характеристик двумерных профилей: панели, пакетный Эйлер на JAX"
+description = "Расчёт аэродинамических характеристик двумерных профилей: панели, вязкий метод, Эйлер и RANS на JAX"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24", "scipy>=1.10", "matplotlib>=3.7", "jax>=0.4.30"]
 
 [project.optional-dependencies]
 gpu = ["jax[cuda12]>=0.4.30"]
 test = ["pytest>=7"]
+rans = ["gmsh>=4.11"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

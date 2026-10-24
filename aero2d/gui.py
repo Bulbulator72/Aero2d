@@ -148,6 +148,12 @@ class App(tk.Tk):
         ttk.Combobox(f, textvariable=self.cores, width=8,
                      values=["авто"] + [str(n) for n in (1, 2, 4, 8, 12, 16, 24, 32) if n <= cpu_count()]
                      ).grid(row=10, column=0, sticky="w")
+        ttk.Radiobutton(f, text="RANS (Спаларт–Аллмарас): отрыв, Cl_max\n   механизации (медленно: минуты на угол)",
+                        variable=self.method, value="rans").grid(row=11, column=0, columnspan=2, sticky="w",
+                                                                 pady=(6, 0))
+        ttk.Label(f, text="   Итераций на угол:").grid(row=12, column=0, sticky="w")
+        self.rans_iter = tk.StringVar(value="300")
+        ttk.Entry(f, textvariable=self.rans_iter, width=8).grid(row=12, column=1, sticky="w")
 
         # --- кнопки
         f = ttk.Frame(left, padding=(0, 6))
@@ -507,9 +513,15 @@ class App(tk.Tk):
             return
         self.airfoil = af
         method, grid = self.method.get(), self.grid_name.get()
-        if isinstance(af, list):
+        if method == "rans":
+            try:
+                rit = int(self.rans_iter.get())
+            except ValueError:
+                messagebox.showerror("Ошибка", "Итераций на угол — целое число")
+                return
+        if isinstance(af, list) and method != "rans":
             if method == "euler":
-                messagebox.showinfo("Механизация", "Для многоэлементного профиля доступны вязкий и "
+                messagebox.showinfo("Механизация", "Для многоэлементного профиля доступны вязкий, RANS и "
                                     "невязкий панельный расчёты; выполняется вязкий.")
             method = "multi" if method == "panel" else "multi_viscous"
         self.stop_flag.clear()
@@ -534,6 +546,13 @@ class App(tk.Tk):
                     else:
                         ps = core.run_multi_viscous_batch(af, alphas, mach, re_, ncrit, xtr, cb, nm,
                                                           chord=ch, workers=nw)
+                elif method == "rans":
+                    nm = None
+                    if isinstance(af, list):
+                        nm = self.hl_desc.get() if self.src.get() != "mfile" else os.path.basename(self.mfile.get())
+                    ps = [core.run_rans(af, alphas, mach, r_, cb, rit, nm,
+                                        chord=(1.0 if isinstance(af, list) and self.src.get() != "mfile" else None))
+                          for r_ in re_]
                 elif method == "panel":
                     ps = [core.run_panel(af, alphas, mach, control=control)]
                 elif method == "viscous":
