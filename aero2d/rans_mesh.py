@@ -55,7 +55,12 @@ def build_mesh(elements, chord=1.0, re=1e6, yplus=1.0, ratio=1.2, bl_thickness=N
     min_gap = min(gaps) if gaps else np.inf
     if bl_thickness is None:
         bl_thickness = min(0.02 * chord, 0.3 * min_gap)
-    gmsh.initialize()
+    # interruptible=False: не ставить обработчик Ctrl+C — иначе gmsh падает,
+    # когда сетка строится не в главном потоке (расчёт из окна программы)
+    try:
+        gmsh.initialize(interruptible=False)
+    except TypeError:                                   # старые версии gmsh
+        gmsh.initialize()
     try:
         gmsh.option.setNumber("General.Terminal", 1 if verbose else 0)
         gmsh.option.setNumber("General.NumThreads", 1)        # воспроизводимая сетка

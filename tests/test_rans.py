@@ -59,3 +59,21 @@ def test_run_rans_pipeline_and_stop():
     assert p.method == "rans" and len(p.alpha) == 2
     assert np.isfinite(p.cl[0]) and abs(p.cl[0]) < 0.05
     assert any("остановлен" in t for t in p.notes)
+
+
+@pytest.mark.skipif(gmsh_missing, reason="нет gmsh")
+def test_mesh_in_worker_thread():
+    # окно программы строит сетку в фоновом потоке — gmsh не должен ставить обработчик сигналов
+    import threading
+    from aero2d.rans_mesh import build_mesh
+    out = {}
+
+    def job():
+        try:
+            out["n"] = build_mesh([repanel(naca4("0012", 120), 60)], re=1e6, far_radius=20).n_cells
+        except Exception as e:                       # noqa: BLE001
+            out["err"] = repr(e)
+    t = threading.Thread(target=job)
+    t.start()
+    t.join()
+    assert "err" not in out and out["n"] > 1000
