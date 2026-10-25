@@ -62,7 +62,7 @@ def gaw(defl, iters, out):
     from aero2d.rans import mesh_for, rans_polar
     els = G.configuration(defl, n_main=180, n_flap=100)
     e = G.EXP_CL[defl]
-    alphas = [0.0, 5.0, 10.0, 12.0, 14.0]
+    alphas = [0.0, 5.0, 10.0, 12.0, 14.0] if defl < 40 else [0.0, 5.0, 10.0, 12.0]
     mesh = mesh_for(els, 7.5, G.RE)
     log(f"GA(W)-1 + Фаулер δf = {defl}°: сетка {mesh.n_cells} ячеек", out)
     t0 = time.time()
@@ -78,15 +78,62 @@ def gaw(defl, iters, out):
                verbose=VERB)
 
 
+def plot(txt):
+    """rans_check.png: Cl(α) механизации — опыт, RANS, вязко-невязкий метод."""
+    import re
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import gaw1_fowler as G
+    rans, d = {}, None
+    for line in open(txt, encoding="utf-8"):
+        m = re.search(r"δf = (\d+)°", line)
+        if m:
+            d = int(m.group(1))
+        m = re.match(r"\s+α\s+([-\d.]+)\s+Cl ([-\d.]+).*(НЕ сошлось|сошлось)", line)
+        if m and d is not None:
+            rans.setdefault(d, []).append((float(m.group(1)), float(m.group(2)), m.group(3) == "сошлось"))
+    vi = {}
+    f = os.path.join(HERE, "vs_gaw1_fowler.txt")
+    if os.path.exists(f):
+        for line in open(f, encoding="utf-8"):
+            p = line.split()
+            if len(p) >= 8 and p[0].isdigit() and p[-1] == "да":
+                vi.setdefault(int(p[0]), []).append((float(p[1]), float(p[3])))
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for k, dd in enumerate(sorted(rans)):
+        c = f"C{k}"
+        e = G.EXP_CL[dd]
+        ax.plot(e[:, 0], e[:, 1], "o", color=c, mfc="none", ms=7, label=f"опыт CR-2443, δf = {dd}°")
+        r = np.array(sorted(rans[dd]), float)
+        ax.plot(r[:, 0], r[:, 1], "-s", color=c, ms=5, label=f"RANS-SA, δf = {dd}°")
+        bad = r[:, 2] == 0
+        if bad.any():
+            ax.plot(r[bad, 0], r[bad, 1], "x", color="k", ms=9, label="не установилось" if k == 0 else None)
+        if dd in vi:
+            v = np.array(vi[dd])
+            ax.plot(v[:, 0], v[:, 1], ":", color=c, lw=1.2, label=f"вязко-невязкий, δf = {dd}°")
+    ax.set_xlabel("α, °")
+    ax.set_ylabel("Cl")
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+    ax.set_title("GA(W)-1 + закрылок Фаулера 29 %, Re 2,2·10⁶, M 0,21")
+    fig.tight_layout()
+    fig.savefig(os.path.join(HERE, "rans_check.png"), dpi=120)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("case", nargs="?", default="all", choices=["naca", "gaw30", "gaw40", "all"])
+    ap.add_argument("case", nargs="?", default="all", choices=["naca", "gaw30", "gaw40", "all", "plot"])
     ap.add_argument("--iters", type=int, default=400)
     ap.add_argument("-v", "--verbose", action="store_true", help="печатать ход итераций")
     a = ap.parse_args()
     global VERB
     VERB = a.verbose
     out = os.path.join(HERE, "rans_check.txt")
+    if a.case == "plot":
+        plot(out)
+        return
     log(f"--- {time.strftime('%Y-%m-%d %H:%M')}, {os.cpu_count()} логических ядер", out)
     if a.case in ("naca", "all"):
         naca(a.iters, out)

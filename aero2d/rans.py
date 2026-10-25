@@ -75,6 +75,8 @@ class RansSolver:
         self.cfl_mode = "grow"
         self.cfl_growth = 1.25
         self.force_tol = 2e-4          # сходимость по силам (None — только по невязке)
+        self.sa_raw_grad = False       # True: источник SA по неограниченным градиентам (на механизации хуже сходится)
+        self.visc_raw_grad = False     # True: вязкие потоки по неограниченным градиентам
         self.freeze_limiter = True     # заморозка ограничителя при застое невязки
         self.right_prec = False        # True: правое предобусловливание GMRES (точнее линейные решения, но на практике медленнее)
         self.fd_matvec = False         # True: матрица-вектор разностью (в ~3 раза быстрее JVP, но неточно на изломах ограничителя)
@@ -338,17 +340,18 @@ class RansSolver:
         # вязкие: градиент на грани
         wf = 0.5 * (w[iL] + w[iR])
         T = GAM * w[:, 3] / w[:, 0]
-        gT = self._grad_T(w, gr)
+        gvv = gr if self.visc_raw_grad else g
+        gT = self._grad_T(w, gvv)
         e = J["d_i"] / J["dist_i"][:, None]
 
         def fgrad(phiL, phiR, gl, gr):
             ga = 0.5 * (gl + gr)
             corr = (phiR - phiL) / J["dist_i"] - jnp.sum(ga * e, 1)
             return ga + corr[:, None] * e
-        gu = fgrad(w[iL, 1], w[iR, 1], gr[iL, 1], gr[iR, 1])
-        gv = fgrad(w[iL, 2], w[iR, 2], gr[iL, 2], gr[iR, 2])
+        gu = fgrad(w[iL, 1], w[iR, 1], gvv[iL, 1], gvv[iR, 1])
+        gv = fgrad(w[iL, 2], w[iR, 2], gvv[iL, 2], gvv[iR, 2])
         gTf = fgrad(T[iL], T[iR], gT[iL], gT[iR])
-        gc = fgrad(w[iL, 4], w[iR, 4], gr[iL, 4], gr[iR, 4])
+        gc = fgrad(w[iL, 4], w[iR, 4], gvv[iL, 4], gvv[iR, 4])
         Fv = self.visc_flux(wf, gu, gv, gTf, gc, J["n_i"])
         F = (Fc - Fv) * J["A_i"][:, None]
         Rs = jnp.zeros((self.nc, 5)).at[iL].add(F).at[iR].add(-F)
@@ -365,9 +368,9 @@ class RansSolver:
             corr = (phiw - phii) / dn - jnp.sum(gi * n, 1)
             return gi + corr[:, None] * n
         z = jnp.zeros_like(pw)
-        gu_w = wgrad(z, ww[:, 1], gr[cw, 1])
-        gv_w = wgrad(z, ww[:, 2], gr[cw, 2])
-        gc_w = wgrad(z, ww[:, 4], gr[cw, 4])
+        gu_w = wgrad(z, ww[:, 1], gvv[cw, 1])
+        gv_w = wgrad(z, ww[:, 2], gvv[cw, 2])
+        gc_w = wgrad(z, ww[:, 4], gvv[cw, 4])
         wfw = jnp.stack([ww[:, 0], z, z, ww[:, 3], z], 1)
         gT_w = gT[cw] - jnp.sum(gT[cw] * n, 1)[:, None] * n      # теплоизолированная
         Fvw = self.visc_flux(wfw, gu_w, gv_w, gT_w, gc_w, n)
@@ -383,7 +386,7 @@ class RansSolver:
         # источник SA
         if not self.turbulent:                 # ламинарный расчёт: ρχ ≡ 0
             return Rs.at[:, 4].set(Q[:, 4] * J["vol"])
-        S = self.sa_source(w, gr, J["wd"])
+        S = self.sa_source(w, gr if self.sa_raw_grad else g, J["wd"])
         Rs = Rs.at[:, 4].add(-S * J["vol"])
         return Rs
 
@@ -619,30 +622,36 @@ class RansSolver:
             if order == 2 and rn < tol * r0:
                 conv = True
                 break
-            # инженерная сходимость: невязка упала на 4 порядка от максимума,
-            # а Cl и Cd не меняются последние 10 итераций
+            # инженерная сходимость по силам. Опорная невязка — наибольшая за все
+            # расчёты на этом решателе (у тёплого старта своя невязка мала).
             if order == 2 and self.force_tol:
                 fr_ = self.forces(Q, alpha)
                 fh.append((fr_["cl"], fr_["cd"]))
-                rmax = max(h[0] for h in hist if h[1] == 2)
-                # (или упала на 2 порядка, а силы стоят 30 итераций — невязка
-                # «застряла» в нескольких ячейках, на силы это не влияет)
-                for drop, win in ((1e-4, 10), (1e-2, 30)):
-                    if len(fh) > win and rn < drop * rmax:
-                        cls = [f[0] for f in fh[-win - 1:]]
-                        cds = [f[1] for f in fh[-win - 1:]]
-                        if (max(cls) - min(cls) < self.force_tol * max(1.0, abs(fh[-1][0]))
-                                and max(cds) - min(cds) < 0.1 * self.force_tol):
-                            conv = True
-                if conv:
+                o2 = [h[0] for h in hist if h[1] == 2]
+                self._rref = max(getattr(self, "_rref", 0.0), max(o2))
+                stalled = len(o2) > 60 and min(o2[-30:]) > 0.5 * min(o2[:-30])
+
+                def steady(win, tol_cl, tol_cd):
+                    if len(fh) <= win:
+                        return False
+                    cls = [f[0] for f in fh[-win - 1:]]
+                    cds = [f[1] for f in fh[-win - 1:]]
+                    return (max(cls) - min(cls) < tol_cl * max(0.2, abs(fh[-1][0]))
+                            and max(cds) - min(cds) < tol_cd)
+                ft = self.force_tol
+                # (а) невязка упала на 4 порядка, силы стоят 10 итераций;
+                # (б) невязка упала на 2 порядка или «застряла», силы стоят 30 итераций
+                if ((rn < 1e-4 * self._rref and steady(10, ft, 0.1 * ft))
+                        or (len(o2) > 40 and (rn < 1e-2 * self._rref or stalled) and steady(30, ft, 0.1 * ft))):
+                    conv = True
                     break
-            # застой невязки (ограничитель «дребезжит»): заморозить ограничитель
-            o2 = [h[0] for h in hist if h[1] == 2]
-            if (self.freeze_limiter and phi is None and order == 2 and self.limiter_k > 0 and len(o2) > 60
-                    and rn < 0.05 * max(o2) and min(o2[-30:]) > 0.5 * min(o2[:-30])):
-                phi = phi_fn(Qj)
-                if verbose:
-                    print(f"  it {it:4d}: невязка застряла на {rn:.2e} — ограничитель заморожен", flush=True)
+                # застой невязки при почти установившихся силах — заморозить ограничитель
+                # («дребезг» ограничителя в нескольких ячейках не даёт невязке падать)
+                if (self.freeze_limiter and phi is None and self.limiter_k > 0 and stalled
+                        and steady(30, 0.005, 1e-3)):
+                    phi = phi_fn(Qj)
+                    if verbose:
+                        print(f"  it {it:4d}: невязка застряла на {rn:.2e} — ограничитель заморожен", flush=True)
             # CFL: рост по уменьшению невязки (SER)
             if len(hist) >= 2 and hist[-2][1] == order:
                 if self.cfl_mode == "ser":
