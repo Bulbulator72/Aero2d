@@ -1149,11 +1149,75 @@ class ViscousSolver:
                             g, side, self._to_state(X))
         return res
 
+    # шаг «канонического» пути продолжения по α (см. solve_path)
+    canon_step = 2.0
+
+    def _advance(self, a_t, r0, verbose=False, max_iter=50, depth=0):
+        """Переход от сошедшегося решения r0 к углу a_t; при неудаче — через
+        промежуточные углы (деление шага пополам, до 3 уровней)."""
+        r = self.solve(a_t, init=r0.state, verbose=verbose, max_iter=max_iter, homotopy=False)
+        if r.converged or depth >= 3:
+            return r
+        rm = self._advance(0.5 * (a_t + r0.alpha), r0, verbose, max_iter, depth + 1)
+        if not rm.converged:
+            return r
+        r2 = self._advance(a_t, rm, verbose, max_iter, depth + 1)
+        return r2 if r2.converged else r
+
+    def solve_path(self, alpha, verbose=False, max_iter=50):
+        """Решение при угле α по одному и тому же («каноническому») пути, как бы ни
+        был задан расчёт — одной точкой или полярой с любым шагом: холодный старт при
+        α₀ = 0° (если не сходится — ±2°, ±4°, …), затем продолжение по узлам сетки
+        α₀ + k·canon_step к α и последний шаг — к самому α. Решения в узлах сетки
+        запоминаются (поляра считает их один раз).
+
+        Зачем: у вязко-невязкой задачи бывает несколько решений (например, когда
+        точка перехода подходит к задней кромке), и решение зависело от того, с
+        какого соседнего угла пришёл расчёт, — поляра и отдельная точка расходились
+        (у NACA 4415 при Re = 10⁶, α = 4° — на 17 % по Cl). Холодный старт сразу при
+        большом угле чаще попадает на нефизичную ветвь; путь от α = 0 даёт ту же
+        ветвь, что и XFOIL."""
+        cache = self.__dict__.setdefault("_canon", {})
+        h = float(self.canon_step)
+        if "anchor" not in cache:
+            cache["anchor"] = None
+            for k in (0, 1, -1, 2, -2, 3, -3):
+                a0 = k * h
+                r = self.solve(a0, verbose=verbose, max_iter=max_iter)
+                if r.converged:
+                    cache["anchor"] = a0
+                    cache[a0] = r
+                    break
+        a0 = cache["anchor"]
+        alpha = float(alpha)
+        if a0 is None:                                   # опорная точка не нашлась
+            return self.solve(alpha, verbose=verbose, max_iter=max_iter)
+        d = 1.0 if alpha >= a0 else -1.0
+        n_grid = int(np.floor(abs(alpha - a0) / h + 1e-9))
+        prev = cache[a0]
+        broken = False
+        for k in range(1, n_grid + 1):
+            g = round(a0 + d * k * h, 9)
+            r = cache.get(g)
+            if r is None:
+                r = cache[g] = self._advance(g, prev, verbose, max_iter)
+            if not r.converged:
+                broken = True                            # цепочка оборвалась — от последней сошедшейся
+                break
+            prev = r
+        if abs(prev.alpha - alpha) < 1e-9:
+            return prev
+        r = self._advance(alpha, prev, verbose, max_iter)
+        if not r.converged and not broken:              # за оборвавшейся цепочкой (срыв) — не тратить время
+            rc = self.solve(alpha, verbose=verbose, max_iter=max_iter)
+            if rc.converged:
+                return rc
+        return r
+
     def polar(self, alphas, verbose=False, callback=None, max_iter=50):
-        """Поляра с продолжением по углу атаки. Опорная точка — первая сошедшаяся
-        в порядке |α| (обычно α ≈ 0); от неё — вверх и вниз, каждая точка
-        стартует с решения соседней. Несошедшаяся точка повторяется через
-        промежуточный угол и с маршевого приближения."""
+        """Поляра: каждая точка — по каноническому пути solve_path (результат не
+        зависит от набора углов и совпадает с расчётом этой точки отдельно).
+        Несошедшиеся точки повторяются от сошедшихся соседей и с холодного старта."""
         alphas = np.asarray(alphas, float)
         n = len(alphas)
         out = [None] * n
@@ -1165,43 +1229,12 @@ class ViscousSolver:
             if callback:
                 callback(done[0], n, r)
 
-        anchor = None
-        for i in np.argsort(np.abs(alphas)):
-            r = self.solve(alphas[i], verbose=verbose, max_iter=max_iter)
-            report(i, r)
-            if r.converged:
-                anchor = i
-                break
-        if anchor is None:
-            for i in range(n):
-                if out[i] is None:
-                    report(i, self.solve(alphas[i], verbose=verbose, max_iter=max_iter))
-            return out
-        def advance(a_t, r0, depth=0):
-            """Переход от сошедшегося решения r0 к углу a_t; при неудаче — через
-            промежуточные углы (деление шага пополам, до 3 уровней)."""
-            r = self.solve(a_t, init=r0.state, verbose=verbose, max_iter=max_iter, homotopy=False)
-            if r.converged or depth >= 3:
-                return r
-            rm = advance(0.5 * (a_t + r0.alpha), r0, depth + 1)
-            if not rm.converged:
-                return r
-            r2 = advance(a_t, rm, depth + 1)
-            return r2 if r2.converged else r
+        for i in np.argsort(np.abs(alphas), kind="stable"):
+            report(i, self.solve_path(alphas[i], verbose=verbose, max_iter=max_iter))
 
-        for direction in (1, -1):
-            last_ok = out[anchor]
-            idx = [i for i in np.argsort(alphas * direction)
-                   if direction * (alphas[i] - alphas[anchor]) > 0]
-            for i in idx:
-                prev = out[i]
-                r = advance(alphas[i], last_ok)
-                if prev is not None:
-                    out[i] = r
-                else:
-                    report(i, r)
-                if r.converged:
-                    last_ok = r
+        def advance(a_t, r0, depth=0):
+            return self._advance(a_t, r0, verbose, max_iter, depth)
+
         # повторная попытка для несошедшихся точек — от соседей с другой стороны
         order = np.argsort(alphas)
         for pos, i in enumerate(order):

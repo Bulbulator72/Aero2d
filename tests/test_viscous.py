@@ -77,3 +77,13 @@ def test_continuation_polar():
     assert all(p.converged for p in pol)
     cl = [p.cl for p in pol]
     assert cl[0] < cl[1] < cl[2]
+
+
+def test_polar_point_equals_single_point():
+    """Канонический путь продолжения: точка поляры совпадает с той же точкой,
+    посчитанной отдельно (раньше у 4415 при α = 4° расхождение было 17 %)."""
+    af = naca4("2412", 200)
+    pol = ViscousSolver(af, 1e6).polar([-1.0, 1.0, 3.0])
+    one = ViscousSolver(af, 1e6).polar([3.0])[0]
+    assert pol[2].converged and one.converged
+    assert abs(pol[2].cl - one.cl) < 1e-9 and abs(pol[2].cd - one.cd) < 1e-12
