@@ -1412,7 +1412,23 @@ def wake_lines(elements, alpha, re, chord=1.0, length=0.6):
         ms._alpha = float(alpha)
         wk = ms._wakes(ms.mp.gamma(ms._alpha))
         xe = max(float(e.x.max()) for e in elements) + length * chord
-        return [(wx[wx < xe], wy[wx < xe]) for wx, wy in wk]
+        a = np.radians(float(alpha))
+        out = []
+        for wx, wy in wk:
+            wx, wy = np.asarray(wx, float), np.asarray(wy, float)
+            # линия тока, прошедшая слишком близко к другому телу или к особенности
+            # панельного решения, может «улететь» в сторону — такой хвост отбрасывается:
+            # излом больше 30° между соседними отрезками, отклонение от набегающего
+            # потока больше 50° или уход по высоте больше длины сгущения
+            d = np.arctan2(np.diff(wy), np.diff(wx))
+            kink = np.abs(np.angle(np.exp(1j * np.diff(d)))) > np.radians(30.0)
+            dev = np.abs(np.angle(np.exp(1j * (d - a)))) > np.radians(50.0)
+            far = np.abs(wy[1:] - wy[0]) > length * chord
+            bad = np.where(np.r_[False, kink] | dev | far | (wx[1:] >= xe))[0]
+            n = int(bad[0]) + 1 if len(bad) else len(wx)
+            if n >= 2:
+                out.append((wx[:n], wy[:n]))
+        return out or None
     except Exception:                                  # noqa: BLE001
         return None
 
