@@ -838,11 +838,16 @@ def _seq_order(alphas):
     return list(order[i0:]) + list(order[:i0][::-1])
 
 
-def _solve_sequence(solver, alphas, idx, states, out, max_iter, verbose, conv, control, on_iter, on_done):
-    """Углы idx по порядку, каждый — от ближайшего посчитанного (states)."""
+def _solve_sequence(solver, alphas, idx, states, out, max_iter, verbose, conv, control, on_iter, on_done,
+                    init=None):
+    """Углы idx по порядку, каждый — от ближайшего посчитанного (states) или
+    от своего прежнего решения (init: номер угла → состояние, «досчитать»)."""
+    init = init or {}
     for i in idx:
         Q = None
-        if states:
+        if i in init:
+            Q = init[i]
+        elif states:
             j = min(states, key=lambda jj: abs(alphas[jj] - alphas[i]))
             Q = states[j]
         r = solver.solve(float(alphas[i]), Q0=Q, max_iter=max_iter, verbose=verbose,
@@ -889,7 +894,7 @@ def _rans_chunk(args):
     """Исполнитель: часть поляры в отдельном процессе."""
     import warnings
     warnings.filterwarnings("ignore")
-    (mesh, mach, re, chord, xref, alphas, idx, Q0, rref, max_iter, conv, queue, skip_gen, stop_ev) = args
+    (mesh, mach, re, chord, xref, alphas, idx, Q0, rref, max_iter, conv, queue, skip_gen, stop_ev, init) = args
     solver = RansSolver(mesh, mach, re, chord=chord, xref=xref)
     solver._rref = rref
     ctl = _ProcControl(queue, skip_gen, stop_ev)
@@ -897,7 +902,10 @@ def _rans_chunk(args):
     st = {}
     for i in idx:
         # каждый следующий угол — от ближайшего посчитанного в этом куске, первый — от Q0
-        Q = st[min(st, key=lambda jj: abs(alphas[jj] - alphas[i]))] if st else Q0
+        if i in init:
+            Q = init[i]
+        else:
+            Q = st[min(st, key=lambda jj: abs(alphas[jj] - alphas[i]))] if st else Q0
         r = solver.solve(float(alphas[i]), Q0=Q, max_iter=max_iter, conv=conv, control=ctl)
         out[i] = r
         if r.converged or r.status == "принято вручную":
@@ -909,7 +917,7 @@ def _rans_chunk(args):
 
 
 def rans_polar(elements, alphas, re, mach=0.15, chord=1.0, xref=None, mesh=None, callback=None,
-               max_iter=250, verbose=False, conv=None, control=None, workers=1):
+               max_iter=250, verbose=False, conv=None, control=None, workers=1, init=None, rref=None):
     """Поляра RANS для одно- или многоэлементного профиля: сетка строится один
     раз (сгущение по линиям следа невязкого решения при среднем угле), углы
     атаки считаются от ближайшего к нулю в обе стороны, каждый — от решения
@@ -919,13 +927,18 @@ def rans_polar(elements, alphas, re, mach=0.15, chord=1.0, xref=None, mesh=None,
     от решения первого угла).
     callback(k, n, it, res, result_or_None) -> True для остановки.
     conv — критерий сходимости (Convergence), control — RansControl (монитор
-    итераций, «следующий угол», остановка)."""
+    итераций, «следующий угол», остановка).
+    init — {номер угла: прежнее состояние}: эти углы продолжаются со своего решения
+    («досчитать»); rref — опорная невязка прежнего расчёта (для критерия сходимости)."""
     alphas = np.asarray(alphas, float)
+    init = dict(init or {})
     if mesh is None:
         mesh = mesh_for(elements, float(np.median(alphas)), re, chord)
     xs = np.concatenate([e.x for e in elements])
     xr = xref if xref is not None else (float(xs.min()) + 0.25 * chord, 0.0)
     solver = RansSolver(mesh, mach, re, chord=chord, xref=xr)
+    if rref:
+        solver._rref = float(rref)
     seq = _seq_order(alphas)
     n = len(alphas)
     out = [None] * n
@@ -940,10 +953,11 @@ def rans_polar(elements, alphas, re, mach=0.15, chord=1.0, xref=None, mesh=None,
         return bool(callback and callback(count[0], n, 0, 0.0, r))
     workers = int(max(1, min(workers, n - 1)))
     if workers <= 1:
-        _solve_sequence(solver, alphas, seq, states, out, max_iter, verbose, conv, control, on_iter, on_done)
+        _solve_sequence(solver, alphas, seq, states, out, max_iter, verbose, conv, control, on_iter, on_done, init)
         return out, mesh
     # --- первый угол здесь, остальные — параллельно
-    stop = _solve_sequence(solver, alphas, seq[:1], states, out, max_iter, verbose, conv, control, on_iter, on_done)
+    stop = _solve_sequence(solver, alphas, seq[:1], states, out, max_iter, verbose, conv, control, on_iter, on_done,
+                           init)
     if stop:
         return out, mesh
     i0 = seq[0]
@@ -972,7 +986,8 @@ def rans_polar(elements, alphas, re, mach=0.15, chord=1.0, xref=None, mesh=None,
     try:
         with ProcessPoolExecutor(len(chunks), mp_context=ctx) as ex:
             futs = [ex.submit(_rans_chunk, (mesh, mach, re, chord, xr, alphas, c, Q0, rref, max_iter, conv,
-                                            queue, skip_gen, stop_ev)) for c in chunks]
+                                            queue, skip_gen, stop_ev, {i: init[i] for i in c if i in init}))
+                    for c in chunks]
             pending = set(futs)
             last_skip = False
             while pending:

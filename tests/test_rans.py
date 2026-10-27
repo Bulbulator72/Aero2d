@@ -96,3 +96,15 @@ def test_mesh_options():
     m1 = mesh_for([af], 0.0, 1e6, opts=MeshOptions(far_radius=20))
     m2 = mesh_for([af], 0.0, 1e6, opts=MeshOptions(far_radius=20, n_surface=60, near_size=0.008))
     assert m2.n_cells < m1.n_cells and (m2.face_tag == 1).sum() < (m1.face_tag == 1).sum()
+
+
+@pytest.mark.skipif(gmsh_missing, reason="нет gmsh")
+def test_continue_rans_appends_history():
+    from aero2d import core
+    from aero2d.rans_mesh import MeshOptions
+    af = repanel(naca4("0012", 120), 60)
+    p = core.run_rans(af, [0.0], 0.15, 1e6, None, max_iter=8, mesh_opts=MeshOptions(far_radius=20))
+    q = core.continue_rans(p, None, 6)
+    H = q.field_ctx["history"][0]
+    assert len(H["it"]) == 14 and H["it"][-1] == 14 and q.label.endswith("(досчитано)")
+    assert len(p.field_ctx["history"][0]["it"]) == 8          # прежняя поляра не изменилась

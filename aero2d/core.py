@@ -402,7 +402,7 @@ def run_multi_viscous_batch(elements, alphas, mach: float, re_list, ncrit: float
 
 def run_rans(af, alphas, mach: float, re: float, callback=None, max_iter: int = 250,
              name: str | None = None, chord=None, mesh=None, mesh_opts=None, conv=None,
-             control=None, workers: int = 1) -> Polar:
+             control=None, workers: int = 1, init=None, rref=None) -> Polar:
     """RANS (Навье–Стокс + Спаларт–Аллмарас, полностью турбулентный) для профиля
     или механизации (список элементов). Медленно, но описывает отрыв и слияние
     следов в щелях — для Cl_max механизации. callback(text, fraction) -> True для остановки.
@@ -443,7 +443,7 @@ def run_rans(af, alphas, mach: float, re: float, callback=None, max_iter: int = 
                    f"(первая итерация каждого процесса включает компиляцию)")
         return callback(txt, min(1.0, (k + (it / max_iter if r is None else 0)) / n))
     res, mesh = rans_polar(elements, alphas, re, mach=mach, chord=chord, callback=cb, max_iter=max_iter,
-                           mesh=mesh, conv=conv, control=control, workers=workers)
+                           mesh=mesh, conv=conv, control=control, workers=workers, init=init, rref=rref)
     done = np.array([r is not None for r in res])
     nan = float("nan")
     cl = np.array([r.cl if r else nan for r in res])
@@ -489,6 +489,56 @@ def run_rans(af, alphas, mach: float, re: float, callback=None, max_iter: int = 
                  field_ctx=dict(method="rans", mesh=mesh, elements=elements, mach=mach, re=re, chord=chord,
                                 alpha=alphas, states=[r.state if r else None for r in res],
                                 history=[r.history if r else None for r in res]))
+
+
+def continue_rans(p: Polar, callback=None, max_iter: int = 300, conv=None, control=None, workers: int = 1,
+                  only_bad: bool = True) -> Polar:
+    """Досчитать поляру RANS: несошедшиеся (или все при only_bad=False) углы
+    продолжаются каждый со своего решения на той же сетке; не посчитанные —
+    от ближайшего посчитанного. Возвращает новую поляру (прежняя не меняется)."""
+    import copy
+    ctx = p.field_ctx
+    if not ctx or ctx.get("method") != "rans":
+        raise ValueError("Досчитать можно только поляру RANS этого сеанса")
+    alphas = np.asarray(p.alpha, float)
+    idx = [k for k in range(len(alphas)) if not (only_bad and p.ok[k])]
+    if not idx:
+        raise ValueError("Все углы этой поляры уже сошлись")
+    have = [k for k in range(len(alphas)) if ctx["states"][k] is not None]
+    if not have:
+        raise ValueError("В поляре нет ни одного посчитанного угла")
+    init = {}
+    for j, k in enumerate(idx):
+        src = k if ctx["states"][k] is not None else min(have, key=lambda h: abs(alphas[h] - alphas[k]))
+        init[j] = ctx["states"][src]
+    rref = max([H.get("rref", 0.0) for H in ctx["history"] if H] or [0.0]) or None
+    q = run_rans(ctx["elements"], alphas[idx], p.mach, p.re, callback, max_iter, chord=ctx["chord"],
+                 mesh=ctx["mesh"], conv=conv, control=control, workers=workers, init=init, rref=rref)
+    out = copy.copy(p)
+    out.label = p.label if p.label.endswith("(досчитано)") else p.label + " (досчитано)"
+    for name in ("cl", "cd", "cm", "cdf", "ok"):
+        arr = np.array(getattr(p, name), copy=True)
+        arr[idx] = getattr(q, name)
+        setattr(out, name, arr)
+    out.cp_x, out.cp = list(p.cp_x), list(p.cp)
+    states, hist = list(ctx["states"]), list(ctx["history"])
+    for j, k in enumerate(idx):
+        out.cp_x[k], out.cp[k] = q.cp_x[j], q.cp[j]
+        if q.field_ctx["states"][j] is not None:
+            states[k] = q.field_ctx["states"][j]
+        Hn, Ho = q.field_ctx["history"][j], hist[k]
+        if Hn is not None and Ho is not None and len(Ho["it"]):
+            H = {key: (np.concatenate([Ho[key], Hn[key] + (Ho["it"][-1] if key == "it" else 0)])
+                       if key != "rref" else max(Ho["rref"], Hn["rref"])) for key in Hn}
+            hist[k] = H
+        elif Hn is not None:
+            hist[k] = Hn
+    out.field_ctx = dict(ctx, states=states, history=hist)
+    out.field_ctx.pop("_tri", None)
+    out.notes = list(p.notes) + [f"Досчитано: α = {', '.join(f'{a:g}' for a in alphas[idx])}° — каждый угол "
+                                 "продолжен со своего решения на той же сетке."] + \
+        [n for n in q.notes if n.startswith("Итог") or n.startswith("Не сошлись")]
+    return out
 
 
 class _Stop(Exception):

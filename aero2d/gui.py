@@ -190,6 +190,7 @@ class App(tk.Tk):
         fm = tk.Menu(mb, tearoff=0)
         fm.add_command(label="Сохранить таблицу (CSV)…", command=self.save_csv)
         fm.add_command(label="Сохранить графики (PNG)…", command=self.save_png)
+        fm.add_command(label="Сохранить ход невязок RANS (CSV)…", command=self.save_res_csv)
         fm.add_separator()
         fm.add_command(label="Очистить графики и таблицу", command=self.clear)
         fm.add_separator()
@@ -1112,7 +1113,7 @@ class App(tk.Tk):
         ttk.Label(bar3, text="Показать: ").pack(side="left")
         self.res_src = tk.StringVar(value="текущий расчёт")
         self.cb_res_src = ttk.Combobox(bar3, textvariable=self.res_src, values=["текущий расчёт"],
-                                       state="readonly", width=60)
+                                       state="readonly", width=42)
         self.cb_res_src.pack(side="left")
         self.cb_res_src.bind("<<ComboboxSelected>>", lambda _: (self.res_angle.set("все углы"), self.plot_res()))
         ttk.Label(bar3, text="   угол: ").pack(side="left")
@@ -1121,6 +1122,7 @@ class App(tk.Tk):
                                          state="readonly", width=10)
         self.cb_res_angle.pack(side="left")
         self.cb_res_angle.bind("<<ComboboxSelected>>", lambda _: self.plot_res())
+        ttk.Button(bar3, text="Досчитать несошедшиеся углы", command=self.continue_rans).pack(side="right")
         self.res_fig = Figure(figsize=(7, 5), dpi=100, layout="constrained")
         self.res_canvas = FigureCanvasTkAgg(self.res_fig, master=fr)
         NavigationToolbar2Tk(self.res_canvas, fr).update()
@@ -1255,6 +1257,79 @@ class App(tk.Tk):
             a, it, cl, cd = D["last"]
             ax1.set_title(f"последнее: α = {a:g}°, итерация {it}: Cl = {cl:.4f}, Cd = {cd:.5f}", fontsize=9)
         self.res_canvas.draw_idle()
+
+    def _rans_polar_for_continue(self):
+        src = self.res_src.get()
+        cand = [p for p in self.polars if p.method == "rans" and p.field_ctx]
+        sel = [p for p in cand if p.label == src]
+        return sel[-1] if sel else (cand[-1] if cand else None)
+
+    def continue_rans(self):
+        """Досчитать несошедшиеся углы выбранной (или последней) поляры RANS."""
+        if self.worker and self.worker.is_alive():
+            return
+        p = self._rans_polar_for_continue()
+        if p is None:
+            messagebox.showinfo("Досчитать", "Нет поляры RANS этого сеанса.")
+            return
+        bad = [f"{a:g}" for a, ok in zip(p.alpha, p.ok) if not ok]
+        if not bad:
+            messagebox.showinfo("Досчитать", f"В поляре «{p.label}» все углы уже сошлись.")
+            return
+        try:
+            rit = int(self.rans_iter.get())
+            conv = self.conv_settings()
+            from .parallel import resolve_workers
+            nw = resolve_workers(self.cores.get())
+        except ValueError as e:
+            messagebox.showerror("Ошибка", str(e))
+            return
+        if not messagebox.askyesno("Досчитать", f"Поляра «{p.label}»: продолжить α = {', '.join(bad)}° "
+                                   f"(до {rit} итераций на угол, каждый — со своего решения)?"):
+            return
+        from .rans import RansControl
+        self._live = self._new_res()
+        self.res_src.set("текущий расчёт")
+        self._rans_ctl = RansControl(monitor=lambda d: self.q.put(("iter", d)))
+        self.stop_flag.clear()
+        self.btn_run.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
+        self.btn_skip.configure(state="normal")
+        self.progress["value"] = 0
+        self.status.set("Досчитываю несошедшиеся углы…")
+
+        def job():
+            try:
+                def cb(text, frac):
+                    self.q.put(("progress", text, frac))
+                    return self.stop_flag.is_set()
+                q = core.continue_rans(p, cb, rit, conv=conv, control=self._rans_ctl, workers=nw)
+                self.q.put(("done", q))
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("error", f"{e}\n\n{traceback.format_exc(limit=3)}"))
+        self.worker = threading.Thread(target=job, daemon=True)
+        self.worker.start()
+
+    def save_res_csv(self):
+        D = self._res_data()
+        if not D or not D["angles"]:
+            messagebox.showinfo("Нет данных", "Нет хода невязок: выберите расчёт RANS на вкладке «Невязки».")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV (Excel)", "*.csv")],
+                                            initialfile="residuals.csv")
+        if not path:
+            return
+        import csv
+        with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+            w = csv.writer(fh, delimiter=";")
+            w.writerow(["alpha", "итерация", "невязка: неразрывность", "импульс x", "импульс y", "энергия",
+                        "турбулентность", "сумма", "Cl", "Cd"])
+            for a in sorted(D["angles"]):
+                A = D["angles"][a]
+                for j in range(len(A["it"])):
+                    w.writerow([f"{a:g}", A["it"][j]] + [f"{v:.6e}" for v in A["res"][j]] +
+                               [f"{A['rn'][j]:.6e}", f"{A['cl'][j]:.6f}", f"{A['cd'][j]:.6f}"])
+        self.status.set(f"Ход невязок сохранён: {path}")
 
     def clear(self):
         self.polars.clear()
