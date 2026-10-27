@@ -460,7 +460,8 @@ class App(tk.Tk):
             from .multi import load_multi
             from .geometry import repanel
             els = load_multi(self.mfile.get())
-            return [repanel(e, 80, keep_frame=True) for e in els]
+            # не меньше точек, чем в файле (мелкие детали — ниша, кромки — не теряются)
+            return [repanel(e, max(80, len(e.x) // 2 + 1), keep_frame=True) for e in els]
         af = self.get_airfoil()
         self._control = None
         fl = self.hl_cfg["flap"]

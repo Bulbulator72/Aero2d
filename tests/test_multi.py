@@ -110,3 +110,20 @@ def test_merge_residual_reduces_to_interval():
     assert np.allclose(r0, r1)
     r2 = ms._merge_res(V, *ex, np.array([0.5]))
     assert not np.allclose(r0, r2)
+
+
+
+def test_repanel_keeps_corners():
+    """Изломы контура (углы ниши закрылка) сохраняются при перераспределении точек:
+    раньше один сплайн через угол давал выбросы и петлю у задней кромки."""
+    import numpy as np
+    from aero2d.geometry import Airfoil, repanel
+    t = np.linspace(0, 1, 31)
+    x = np.r_[1 - t, 0.5 * t[1:], np.full(10, 0.5), 0.5 + 0.5 * t[1:]]
+    y = np.r_[0.06 * np.sin(np.pi * (1 - t)), -0.04 * np.sin(0.5 * np.pi * t[1:]),
+              np.linspace(-0.04, -0.01, 11)[1:], -0.01 * (1 - t[1:])]
+    r = repanel(Airfoil(x, y, "c"), 60, keep_frame=True)
+    for cx, cy in ((0.5, -0.04), (0.5, -0.01)):
+        assert np.min(np.hypot(r.x - cx, r.y - cy)) < 1e-12           # узел точно в изломе
+    nich = (r.x > 0.5 + 1e-6)
+    assert r.y[nich & (r.y < 0)].min() >= -0.01 - 1e-9                 # без выбросов у ниши

@@ -263,21 +263,62 @@ def _rescale(x, y):
     return xs * ca - ys * sa, xs * sa + ys * ca
 
 
-def repanel(af: Airfoil, n_side: int = 100, spacing: str = "cosine", keep_frame: bool = False) -> Airfoil:
+def _corners(x, y, angle=30.0):
+    """Номера внутренних точек контура, где направление обхода поворачивает больше
+    чем на angle градусов (углы ниши закрылка, излом носка дефлектора и т. п.)."""
+    d = np.column_stack([np.diff(x), np.diff(y)])
+    d /= np.maximum(np.linalg.norm(d, axis=1), 1e-300)[:, None]
+    c = np.clip(np.sum(d[:-1] * d[1:], 1), -1.0, 1.0)
+    return np.where(np.degrees(np.arccos(c)) > angle)[0] + 1
+
+
+class _PiecewiseSpline:
+    """Сплайн контура по длине дуги, разрезанный в изломах: на каждом гладком
+    участке — свой кубический сплайн. Один сплайн через острый угол даёт выбросы
+    и петли (у задней кромки основного элемента, в углах ниши закрылка)."""
+
+    def __init__(self, s, x, y, cuts):
+        from scipy.interpolate import CubicSpline, make_interp_spline
+        self.bounds = np.concatenate([[0], np.asarray(cuts, int), [len(s) - 1]])
+        self.sb = s[self.bounds]
+        self.parts = []
+        for a, b in zip(self.bounds[:-1], self.bounds[1:]):
+            ss, xx, yy = s[a:b + 1], x[a:b + 1], y[a:b + 1]
+            if len(ss) >= 4:
+                self.parts.append((CubicSpline(ss, xx), CubicSpline(ss, yy)))
+            else:
+                k = len(ss) - 1
+                self.parts.append((make_interp_spline(ss, xx, k=k), make_interp_spline(ss, yy, k=k)))
+
+    def __call__(self, st):
+        st = np.asarray(st, float)
+        j = np.clip(np.searchsorted(self.sb, st, side="right") - 1, 0, len(self.parts) - 1)
+        x, y = np.empty_like(st), np.empty_like(st)
+        for k, (fx, fy) in enumerate(self.parts):
+            m = j == k
+            if m.any():
+                x[m], y[m] = fx(st[m]), fy(st[m])
+        return x, y
+
+
+def repanel(af: Airfoil, n_side: int = 100, spacing: str = "cosine", keep_frame: bool = False,
+            corner_angle: float = 30.0) -> Airfoil:
     """Перераспределяет точки контура: сплайн по длине дуги, n_side точек на
     сторону. spacing="cosine" — сгущение к обеим кромкам; "viscous" — сильное
     сгущение к передней кромке и умеренное к задней (панели у задней кромки
     около 1 % хорды, как в XFOIL): для вязкого расчёта слишком мелкие панели
-    у задней кромки делают задачу жёсткой."""
-    from scipy.interpolate import CubicSpline
+    у задней кромки делают задачу жёсткой.
+    Изломы контура (поворот больше corner_angle градусов: углы ниши, острый
+    носок) сохраняются: сплайн разрезается в них, точка излома остаётся узлом."""
     x, y = np.asarray(af.x, float), np.asarray(af.y, float)
     keep = np.concatenate([[True], np.hypot(np.diff(x), np.diff(y)) > 1e-10])
     x, y = x[keep], y[keep]
     s = np.concatenate([[0.0], np.cumsum(np.hypot(np.diff(x), np.diff(y)))])
-    sx, sy = CubicSpline(s, x), CubicSpline(s, y)
+    cuts = _corners(x, y, corner_angle) if corner_angle else np.array([], int)
+    sp = _PiecewiseSpline(s, x, y, cuts)
     # передняя кромка — минимум x на сплайне
     sf = np.linspace(0, s[-1], 20001)
-    sle = sf[np.argmin(sx(sf))]
+    sle = sf[np.argmin(sp(sf)[0])]
     if spacing == "viscous":
         u = np.linspace(0, 1, n_side)               # 0 — передняя, 1 — задняя кромка
         w = 0.55
@@ -289,15 +330,28 @@ def repanel(af: Airfoil, n_side: int = 100, spacing: str = "cosine", keep_frame:
         s1 = sle * 0.5 * (1 - np.cos(b))
         s2 = sle + (s[-1] - sle) * 0.5 * (1 - np.cos(b))
     st = np.concatenate([s1, s2[1:]])
-    out = Airfoil(sx(st), sy(st), af.name)
+    # изломы — точно в узлах (ближайший узел переносится в излом)
+    for sc in s[cuts]:
+        k = int(np.argmin(np.abs(st[1:-1] - sc))) + 1
+        st[k] = sc
+    st = np.sort(st)
+    xo, yo = sp(st)
+    out = Airfoil(xo, yo, af.name)
     if keep_frame:            # элементы механизации: без нормировки и поворота
         area = 0.5 * np.sum(out.x[:-1] * out.y[1:] - out.x[1:] * out.y[:-1])
         if area < 0:
             out = Airfoil(out.x[::-1].copy(), out.y[::-1].copy(), af.name)
     else:
         out = normalize(out)
-    out.x[0] = out.x[-1] = 0.5 * (out.x[0] + out.x[-1])
-    out.y[0] = out.y[-1] = 0.5 * (out.y[0] + out.y[-1])
+    gap = np.hypot(out.x[0] - out.x[-1], out.y[0] - out.y[-1])
+    if gap <= 2e-3 * max(float(np.ptp(out.x)), 1e-12):
+        # почти замкнутый контур — концы сводятся в одну точку
+        out.x[0] = out.x[-1] = 0.5 * (out.x[0] + out.x[-1])
+        out.y[0] = out.y[-1] = 0.5 * (out.y[0] + out.y[-1])
+    else:
+        # заметный зазор (тупая кромка, конец ниши) — концы не сдвигаются, контур
+        # замыкается отрезком: раньше они сводились в середину, и форма у кромки менялась
+        out = Airfoil(np.r_[out.x, out.x[0]], np.r_[out.y, out.y[0]], out.name)
     return out
 
 
