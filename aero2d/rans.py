@@ -162,6 +162,9 @@ class RansSolver:
         # «дребезжит» и не даёт невязке падать), "all" — везде, "off" — нигде
         self.limiter_zone = "te"
         self.limiter_te_radius = 0.05          # радиус зоны у задней кромки, доли хорды
+        # шаг по псевдовремени: "grow" — рост в cfl_growth раз, пока шаги удаются (линейная
+        # задача решена и невязка не растёт; как адаптивный CFL в SU2); "fixed" — до
+        # cfl_limit и дальше постоянный (как число Куранта во Fluent); "ser" — по отношению невязок
         self.cfl_mode = "grow"
         self.cfl_growth = 1.25
         self.conv = Convergence()      # критерий перехода к следующему углу
@@ -1053,7 +1056,7 @@ class RansSolver:
                 self._rref = max(getattr(self, "_rref", 0.0), rn)
             if control is not None and control.monitor is not None:
                 control.monitor(dict(alpha=alpha, it=it, res=req, rn=rn, cl=fr_["cl"], cd=fr_["cd"], cfl=cfl,
-                                     rref=getattr(self, "_rref", rn), order=order))
+                                     rref=getattr(self, "_rref", rn), order=order, r_fs=r_fs, lin=self._last_lin))
             if order == 2 and rn < tol * r0:
                 conv = True
                 break
@@ -1101,7 +1104,13 @@ class RansSolver:
                         print(f"  it {it:4d}: невязка застряла на {rn:.2e} — ограничитель заморожен", flush=True)
             # CFL: рост по уменьшению невязки (SER)
             if len(hist) >= 2 and hist[-2][1] == order:
-                if self.cfl_mode == "ser":
+                if self.cfl_mode == "fixed":
+                    # как постоянное число Куранта во Fluent (coupled, 50–200): рост до
+                    # cfl_limit, дальше без изменений; уменьшение — только при неудаче шага
+                    ok_ = getattr(self, "_last_ok", True)
+                    cfl = min(cfl_max, cfl * self.cfl_growth) if ok_ and rn < 3.0 * hist[-2][0] \
+                        else max(cfl0, 0.5 * cfl)
+                elif self.cfl_mode == "ser":
                     cfl = min(cfl_max, max(cfl0, cfl * min(2.0, (hist[-2][0] / rn) ** 1.0)))
                 else:                                   # рост, пока шаги удаются
                     ok_ = getattr(self, "_last_ok", True)

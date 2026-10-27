@@ -1326,8 +1326,9 @@ class App(tk.Tk):
         bar4.pack(side="top", fill="x")
         ttk.Label(bar4, text="Шаг: режим").pack(side="left")
         self.cfl_preset = tk.StringVar(value="обычный")
-        cp_ = ttk.Combobox(bar4, textvariable=self.cfl_preset, values=["обычный", "осторожный", "свой"],
-                           state="readonly", width=10)
+        self.cfl_mode_v = "grow"
+        cp_ = ttk.Combobox(bar4, textvariable=self.cfl_preset, values=list(self.CFL_PRESETS) + ["свой"],
+                           state="readonly", width=22)
         cp_.pack(side="left")
         cp_.bind("<<ComboboxSelected>>", lambda _: self._apply_cfl_preset())
         self.cfl_vars = {}
@@ -1375,16 +1376,24 @@ class App(tk.Tk):
                    "SA-RC (поправка на кривизну)": "sa-rc",
                    "SA-AFT (переход, Ñкрит из окна)": "sa-aft"}
 
+    # режимы шага: "обычный" — CFL растёт, пока шаги Ньютона удаются (адаптивный, как в SU2);
+    # «как Fluent» — CFL растёт до 200 и дальше постоянный (число Куранта coupled-решателя
+    # Fluent: по умолчанию 200, при плохой сходимости советуют 50–100); «осторожный» — медленно
     CFL_PRESETS = {"обычный": dict(cfl_start="5", cfl_limit="1e6", cfl_growth="1.25", first_order="30",
-                                   rollback_factor="100"),
+                                   rollback_factor="100", mode="grow"),
+                   "как Fluent (Courant 200)": dict(cfl_start="5", cfl_limit="200", cfl_growth="1.25",
+                                                    first_order="30", rollback_factor="100", mode="fixed"),
                    "осторожный": dict(cfl_start="2", cfl_limit="1e4", cfl_growth="1.1", first_order="60",
-                                      rollback_factor="20")}
+                                      rollback_factor="20", mode="grow")}
 
     def _apply_cfl_preset(self):
         p = self.CFL_PRESETS.get(self.cfl_preset.get())
         if p:
             for k, v in p.items():
-                self.cfl_vars[k].set(v)
+                if k == "mode":
+                    self.cfl_mode_v = v
+                else:
+                    self.cfl_vars[k].set(v)
 
     # зона ограничителя Венкатакришнана (RansSolver.limiter_zone)
     LIMITER_ZONES = {"у задних кромок": "te", "везде (как раньше)": "all", "нет": "off"}
@@ -1399,6 +1408,7 @@ class App(tk.Tk):
         if not (0 < o["cfl_start"] <= o["cfl_limit"]) or o["cfl_growth"] < 1.0 or o["rollback_factor"] <= 1.0:
             raise ValueError("Невязки: CFL нач. > 0 и ≤ наибольшего, рост ≥ 1, откат при росте > 1")
         o["first_order"] = int(o["first_order"])
+        o["cfl_mode"] = getattr(self, "cfl_mode_v", "grow")
         o["prec_fill"] = int(self.prec_fill.get())
         o["limiter_zone"] = self.LIMITER_ZONES.get(self.lim_zone.get(), "te")
         o["turb_model"] = self.TURB_MODELS[self.turb_model.get()]
@@ -1464,6 +1474,8 @@ class App(tk.Tk):
             return
         self._res_add(L, d["alpha"], d["it"], d["res"], d["rn"], d["cl"], d["cd"])
         L["rref"] = max(L["rref"], d["rref"])
+        if d.get("r_fs"):
+            L.setdefault("r_fs", {})[float(d["alpha"])] = float(d["r_fs"])
         import time as _t
         if self.res_src.get() == "текущий расчёт" and _t.time() - self._res_drawn > 1.5:
             self.plot_res()
@@ -1482,6 +1494,8 @@ class App(tk.Tk):
                     for j in range(len(H["it"])):
                         self._res_add(D, a, int(H["it"][j]), H["res"][j], H["rn"][j], H["cl"][j], H["cd"][j])
                     D["rref"] = max(D["rref"], H.get("rref", 1.0))
+                    if H.get("r_fs"):
+                        D.setdefault("r_fs", {})[float(a)] = float(H["r_fs"])
                     D["events"] += [(float(a), int(e[0]), e[1]) for e in H.get("events", [])]
                 return D
         return None
@@ -1504,62 +1518,72 @@ class App(tk.Tk):
         self.cb_res_angle["values"] = vals
         if self.res_angle.get() not in vals:
             self.res_angle.set("все углы")
-        ax1, ax2 = fig.subplots(2, 1, sharex=True, height_ratios=[3, 2])
-        try:
-            c = self.conv_settings()
-            lvl, lbl = 10.0 ** (-c.orders) * D["rref"], f"порог: 10^−{c.orders:g} от наибольшей"
-        except ValueError:
-            lvl = None
         sel = self.res_angle.get()
-        if sel == "все углы":
-            import matplotlib as mpl
-            cmap = mpl.colormaps["turbo"]
-            for k, a in enumerate(angs):
-                A = D["angles"][a]
-                col = cmap(0.1 + 0.8 * k / max(1, len(angs) - 1))
-                ax1.semilogy(A["it"], A["rn"], "-", color=col, lw=1.2, label=f"α = {a:g}°")
-                ax2.plot(A["it"], A["cl"], "-", color=col, lw=1.2)
-            ax2.set_ylabel("Cl")
-            cls = [A["cl"][len(A["cl"]) // 3:] for A in D["angles"].values() if A["cl"]]
-            allc = np.concatenate([np.asarray(c_, float) for c_ in cls if len(c_)]) if cls else np.array([])
-            if allc.size:
-                lo, hi = np.nanmin(allc), np.nanmax(allc)
-                ax2.set_ylim(lo - 0.1 * (hi - lo) - 0.01, hi + 0.1 * (hi - lo) + 0.01)
-            ax1.set_ylabel("невязка, сумма по уравнениям")
-        else:
-            A = D["angles"][float(sel)]
+        try:
+            orders = self.conv_settings().orders
+        except ValueError:
+            orders = None
+        rfs = D.get("r_fs", {})
+        names = ["неразрывность", "импульс x", "импульс y", "энергия", "турбулентность ν̃", "переход ñ", "перемежаемость γ"]
+        import matplotlib as mpl
+        cmap = mpl.colormaps["turbo"]
+        show = angs if sel == "все углы" else [float(sel)]
+        neq = max(np.array(D["angles"][a]["res"]).shape[1] for a in show)
+        # невязки по уравнениям — каждая на своём графике (у каждого уравнения свой масштаб)
+        nc_ = 3 if neq <= 5 else 4
+        gs = fig.add_gridspec(3, nc_, height_ratios=[1, 1, 0.9], hspace=0.45, wspace=0.3)
+        axs = [fig.add_subplot(gs[r_, c_]) for r_ in range(2) for c_ in range(nc_)]
+        ax2 = fig.add_subplot(gs[2, :])
+        for k, a in enumerate(show):
+            A = D["angles"][a]
             R = np.array(A["res"])
-            names = ["неразрывность", "импульс x", "импульс y", "энергия", "турбулентность (SA)"]
-            for j in range(5):
-                ax1.semilogy(A["it"], R[:, j], lw=1.0, label=names[j])
-            ax1.semilogy(A["it"], A["rn"], "k-", lw=1.6, label="сумма")
-            ax2.plot(A["it"], A["cl"], "-", color="#1f77b4", lw=1.2)
-            ax2.set_ylabel("Cl", color="#1f77b4")
-            ax3 = ax2.twinx()
-            ax3.plot(A["it"], A["cd"], "-", color="#d62728", lw=1.0)
-            ax3.set_ylabel("Cd", color="#d62728")
-            m0 = len(A["cl"]) // 3
-            for ax_, v_ in ((ax2, A["cl"][m0:]), (ax3, A["cd"][m0:])):
-                if len(v_):
-                    lo, hi = float(np.nanmin(v_)), float(np.nanmax(v_))
-                    pad = 0.1 * (hi - lo) + 1e-4
-                    ax_.set_ylim(lo - pad, hi + pad)
-            ax1.set_ylabel("невязка (ср. кв. по ячейкам)")
-        if lvl:
-            ax1.axhline(lvl, color="#d62728", ls="--", lw=1.0, label=lbl)
+            col = cmap(0.1 + 0.8 * k / max(1, len(show) - 1)) if len(show) > 1 else "#1f77b4"
+            for j in range(R.shape[1]):
+                axs[j].semilogy(A["it"], R[:, j], "-", color=col, lw=1.0, label=f"α = {a:g}°" if j == 0 else None)
+            axs[neq].semilogy(A["it"], A["rn"], "-", color=col, lw=1.0)
+            ax2.plot(A["it"], A["cl"], "-", color=col, lw=1.2)
+            if orders is not None and a in rfs:
+                axs[neq].axhline(10.0 ** (-orders) * rfs[a], color=col, ls="--", lw=0.9)
+        for j in range(neq):
+            axs[j].set_title(names[j], fontsize=8)
+        axs[neq].set_title("сумма" + (f"; пунктир — порог 10^−{orders:g}" if orders is not None else ""), fontsize=8)
+        for ax_ in axs[neq + 1:]:
+            ax_.set_axis_off()
+        for ax_ in axs[:neq + 1]:
+            ax_.grid(alpha=0.3, which="both")
+            ax_.tick_params(labelsize=7)
+        if len(show) > 1:
+            axs[0].legend(fontsize=6, ncol=2, loc="upper right")
+        cls = [A["cl"][len(A["cl"]) // 3:] for a, A in D["angles"].items() if a in show and A["cl"]]
+        allc = np.concatenate([np.asarray(c_, float) for c_ in cls if len(c_)]) if cls else np.array([])
+        if allc.size:
+            lo, hi = np.nanmin(allc), np.nanmax(allc)
+            ax2.set_ylim(lo - 0.1 * (hi - lo) - 0.01, hi + 0.1 * (hi - lo) + 0.01)
+        ax2.set_ylabel("Cl")
+        ax1 = axs[neq]
         evs = [e for e in D.get("events", []) if sel == "все углы" or abs(e[0] - float(sel)) < 1e-9]
         for k_, (a_, it_, txt) in enumerate(evs):
             ax1.axvline(it_, color="#ff7f0e", lw=0.9, ls="-.", label="откат / ручное действие" if k_ == 0 else None)
         if evs:
             ax1.text(0.01, 0.02, f"последнее: α = {evs[-1][0]:g}°, итер. {evs[-1][1]}: {evs[-1][2]}",
                      transform=ax1.transAxes, fontsize=7, color="#b35900")
-        ax1.grid(alpha=0.3, which="both")
-        ax1.legend(fontsize=7, ncol=3, loc="upper right")
+        if evs:
+            ax1.legend(fontsize=6, loc="upper right")
+        if sel != "все углы":                      # один угол — ещё Cd на второй оси
+            A = D["angles"][float(sel)]
+            ax3 = ax2.twinx()
+            ax3.plot(A["it"], A["cd"], "-", color="#d62728", lw=1.0)
+            ax3.set_ylabel("Cd", color="#d62728")
+            v_ = A["cd"][len(A["cd"]) // 3:]
+            if len(v_):
+                lo, hi = float(np.nanmin(v_)), float(np.nanmax(v_))
+                ax3.set_ylim(lo - 0.1 * (hi - lo) - 1e-4, hi + 0.1 * (hi - lo) + 1e-4)
         ax2.grid(alpha=0.3)
         ax2.set_xlabel("итерация Ньютона на угле")
         if D["last"]:
             a, it, cl, cd = D["last"]
-            ax1.set_title(f"последнее: α = {a:g}°, итерация {it}: Cl = {cl:.4f}, Cd = {cd:.5f}", fontsize=9)
+            fig.suptitle(f"Невязки по уравнениям (ср. кв. по ячейкам). Последнее: α = {a:g}°, итерация {it}: "
+                         f"Cl = {cl:.4f}, Cd = {cd:.5f}", fontsize=9)
         self.res_canvas.draw_idle()
 
     def _rans_polar_for_continue(self):
