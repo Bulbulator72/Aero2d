@@ -85,7 +85,7 @@ def test_polar_order_and_convergence_defaults():
     seq = _seq_order(a)
     assert a[seq[0]] == 0.0 and list(a[seq]) == [0, 2, 4, 8, -2, -4]
     c = Convergence()
-    assert c.orders == 3 and c.hold == 20 and c.stall_ok
+    assert c.orders == 4.5 and c.hold == 20 and c.stall_ok
 
 
 @pytest.mark.skipif(gmsh_missing, reason="нет gmsh")
@@ -178,3 +178,60 @@ def test_rans_xtr_from_indicator():
     ind = np.r_[(x > 0.42).astype(float), np.zeros(11)]   # верх: турбулентный с 0,5; низ ламинарный
     u, l_ = _rans_xtr(xc, jn, xs, ind)
     assert abs(u - 0.5) < 1e-12 and l_ == 1.0
+
+
+def test_nested_dissection_lu_exact():
+    import scipy.sparse as sp
+    from aero2d.bilu import NestedLU
+    rng = np.random.default_rng(1)
+    n, k = 60, 3
+    rows = list(range(n)) + list(range(n - 1)) + list(range(1, n)) + [0, n - 1]
+    cols = list(range(n)) + list(range(1, n)) + list(range(n - 1)) + [n - 1, 0]
+    blocks = [rng.normal(size=(k, k)) * 0.3 + (4 * np.eye(k) if r == c else 0) for r, c in zip(rows, cols)]
+    A = sp.lil_matrix((n * k, n * k))
+    for r, c, b in zip(rows, cols, blocks):
+        A[r * k:(r + 1) * k, c * k:(c + 1) * k] = b
+    A = A.tocsr()
+    lu = NestedLU(n, np.array(rows), np.array(cols), k=k).factor(A)
+    x = rng.normal(size=n * k)
+    assert np.allclose(lu.solve(A @ x), x, atol=1e-10)
+
+
+def test_gmres_left_right():
+    from aero2d.krylov import gmres
+    rng = np.random.default_rng(2)
+    A = np.eye(40) * 3 + rng.normal(size=(40, 40)) * 0.2
+    b = rng.normal(size=40)
+    D = np.diag(1 / np.diag(A))
+    for right in (False, True):
+        x, info = gmres(lambda v: A @ v, b, prec=lambda v: D @ v, rtol=1e-10, maxiter=40, right=right)
+        assert info == 0 and np.linalg.norm(A @ x - b) < 1e-8 * np.linalg.norm(b)
+
+
+@pytest.mark.skipif(gmsh_missing, reason="нет gmsh")
+def test_unsteady_and_gif(tmp_path):
+    """Нестационарный RANS (BDF2) на грубой сетке: несколько шагов разгона из покоя
+    и сборка GIF."""
+    from aero2d.rans import RansSolver
+    from aero2d.rans_mesh import build_mesh
+    from aero2d.animate import make_gif
+    af = repanel(naca4("0012", 120), 40)
+    m = build_mesh([af], re=1e6, far_radius=15, far_size=5.0, ratio=1.4, slot_size=0.02, growth=0.4)
+    s = RansSolver(m, 0.2, 1e6)
+    run = s.solve_unsteady(5.0, None, t_end=0.1, steps_per_chord=20, sub_iter=3, frame_every=1)
+    assert len(run["t"]) == 2 and np.all(np.isfinite(run["cl"])) and len(run["frames"]) == 3
+    path = tmp_path / "a.gif"
+    assert make_gif(m, [af], run, str(path), n=80, dpi=40) == 3
+    assert path.stat().st_size > 1000
+
+
+@pytest.mark.skipif(gmsh_missing, reason="нет gmsh")
+def test_mesh_does_not_depend_on_alpha():
+    """Сетка механизации не зависит от угла расчёта: поляра и отдельная точка
+    считаются на одной сетке (раньше сгущение следа строилось при среднем угле поляры)."""
+    from aero2d.multi import highlift
+    from aero2d.rans import mesh_for
+    from aero2d.rans_mesh import MeshOptions
+    els = highlift(naca4("2412", 120), flap=dict(type="slotted", chord=0.3, deflection=20.0), n_side=50)
+    o = MeshOptions(far_radius=15, n_surface=50, near_size=0.01, wake_size=0.02)
+    assert mesh_for(els, 0.0, 1e6, opts=o).n_cells == mesh_for(els, 12.0, 1e6, opts=o).n_cells

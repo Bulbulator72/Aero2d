@@ -61,13 +61,14 @@ class Convergence:
     """Критерий перехода к следующему углу атаки.
 
     Угол считается сошедшимся, когда последние `hold` итераций подряд
-    невязка не выше 10^(−orders) от опорной (наибольшей за расчёт на этой
-    сетке) и за эти итерации Cl меняется меньше чем на cl_tol (доля от |Cl|),
-    а Cd — меньше чем на cd_tol (абсолютно).
-    stall_ok: если невязка упала хотя бы на 2 порядка и перестала падать
+    невязка не выше 10^(−orders) от опорной — невязки однородного набегающего
+    потока при этом угле (одна и та же для поляры и отдельной точки) — и за
+    эти итерации Cl меняется меньше чем на cl_tol (доля от |Cl|), а Cd — меньше
+    чем на cd_tol (абсолютно); или невязка ещё в 30 раз ниже и силы стоят 3 итерации.
+    stall_ok: если невязка упала до 10^(1−orders) и перестала падать
     («застряла» в нескольких ячейках), а силы стоят max(hold, 30) итераций, —
     тоже считать сошедшимся."""
-    orders: float = 3.0
+    orders: float = 4.5
     hold: int = 20
     cl_tol: float = 2e-4
     cd_tol: float = 2e-5
@@ -95,8 +96,50 @@ def _jnp():
     os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
     import jax
     jax.config.update("jax_enable_x64", True)
+    _persistent_cache(jax)
     import jax.numpy as jnp
     return jax, jnp
+
+
+def _prune_cache(path, limit=2e9, keep=1.5e9):
+    """Кэш больше limit байт — удалить самые старые файлы до keep (записи для
+    каждой новой сетки — десятки мегабайт)."""
+    try:
+        files = [os.path.join(path, f) for f in os.listdir(path)]
+        files = [(os.path.getmtime(f), os.path.getsize(f), f) for f in files if os.path.isfile(f)]
+        total = sum(sz for _, sz, _ in files)
+        for _, sz, f in sorted(files):
+            if total <= (keep if total > limit else limit):
+                break
+            os.remove(f)
+            total -= sz
+    except OSError:
+        pass
+
+
+def _persistent_cache(jax):
+    """Постоянный кэш скомпилированных функций XLA на диске: компиляция решателя
+    (десятки секунд) — один раз на ПК, а не в каждом расчёте и каждом процессе.
+    Папка — AERO2D_JAX_CACHE или ~/.cache/aero2d/jax; пустая строка — выключить."""
+    if getattr(jax, "_aero2d_cache", False):
+        return
+    jax._aero2d_cache = True
+    path = os.environ.get("AERO2D_JAX_CACHE", os.path.join(os.path.expanduser("~"), ".cache", "aero2d", "jax"))
+    if not path:
+        return
+    try:
+        os.makedirs(path, exist_ok=True)
+        _prune_cache(path)
+        jax.config.update("jax_compilation_cache_dir", path)
+        jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.5)
+        jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
+    except Exception:                                   # noqa: BLE001 — кэш не обязателен
+        return
+    try:                                                # не больше 2 ГБ (старые записи удаляются);
+        import filelock  # noqa: F401                    # без пакета filelock JAX не читает такой кэш
+        jax.config.update("jax_compilation_cache_max_size", int(2e9))
+    except Exception:                                   # noqa: BLE001 — нет filelock / старая версия JAX
+        pass
 
 
 class RansSolver:
@@ -114,6 +157,11 @@ class RansSolver:
         self.vortex_bc = vortex_bc
         self.turbulent = turbulent
         self.limiter_k = 5.0
+        # где действует ограничитель: "te" — только у задних кромок (веер вырожденных
+        # ячеек, ради которого он нужен; в гладком дозвуковом течении ограничитель
+        # «дребезжит» и не даёт невязке падать), "all" — везде, "off" — нигде
+        self.limiter_zone = "te"
+        self.limiter_te_radius = 0.05          # радиус зоны у задней кромки, доли хорды
         self.cfl_mode = "grow"
         self.cfl_growth = 1.25
         self.conv = Convergence()      # критерий перехода к следующему углу
@@ -213,6 +261,16 @@ class RansSolver:
         # отрезках стенки. Нормальная скорость в слое ~U/√Re_x — направление нужно точно.
         dex, gd = wall_direction(self.m)
         self.J["gd"] = jnp.asarray(gd)
+        # зона ограничителя у задних кромок: ячейки ближе limiter_te_radius·хорды к
+        # самой задней (по x) точке стенки каждого тела
+        fw_c = m.face_center[fw]
+        near = np.zeros(nc, bool)
+        for b in np.unique(self.body_w):
+            pts = fw_c[self.body_w == b]
+            te = pts[np.argmax(pts[:, 0])]
+            near |= np.hypot(xc[:, 0] - te[0], xc[:, 1] - te[1]) < self.limiter_te_radius * self.chord
+        self.lim_te = near
+        self.J["lim_te"] = jnp.asarray(near)
         self.J["wd_ex"] = jnp.asarray(dex)
 
     # ------------------------------------------------------------------
@@ -478,15 +536,18 @@ class RansSolver:
         y = J["fc_f"][:, 1] - self.xref[1]
         M = self.mach
         b = np.sqrt(1 - M**2)
-        a = self.alpha_rad
-        xr = x * np.cos(a) + y * np.sin(a)
-        yr = -x * np.sin(a) + y * np.cos(a)
+        # угол атаки — из скорости набегающего потока (аргумент, а не константа:
+        # скомпилированные функции годятся для всех углов)
+        vm = jnp.sqrt(winf[1] ** 2 + winf[2] ** 2) + 1e-30      # при разгоне |V| < V∞
+        ca, sa = winf[1] / vm, winf[2] / vm
+        xr = x * ca + y * sa
+        yr = -x * sa + y * ca
         th = jnp.arctan2(yr, xr)
         r = jnp.sqrt(xr**2 + yr**2)
         fac = gam * b / (2 * np.pi * r * (1 - M**2 * jnp.sin(th) ** 2))
         du_r, dv_r = fac * jnp.sin(th), -fac * jnp.cos(th)        # в повёрнутых осях
-        du = du_r * np.cos(a) - dv_r * np.sin(a)
-        dv = du_r * np.sin(a) + dv_r * np.cos(a)
+        du = du_r * ca - dv_r * sa
+        dv = du_r * sa + dv_r * ca
         U = winf[1] + du
         V = winf[2] + dv
         # изоэнтропически: p, ρ по скорости
@@ -506,8 +567,10 @@ class RansSolver:
         g = self.gradients(w, wv)
         gr = g                                   # неограниченные — для вязких членов и источника SA
         iL, iR = J["iL"], J["iR"]
-        if order >= 2 and self.limiter_k > 0:
+        if order >= 2 and self.limiter_k > 0 and self.limiter_zone != "off":
             phi = self.venkat(w, g, wv) if phi_frozen is None else phi_frozen
+            if self.limiter_zone == "te":
+                phi = jnp.where(J["lim_te"][:, None], phi, 1.0)
             g = g * phi[:, :, None]
         if order >= 2:
             g = g.at[J["cf"]].set(0.0)            # у внешней границы — первый порядок
@@ -689,42 +752,95 @@ class RansSolver:
             js = jax.vmap(jax.jacfwd(src))(Q, g, J["wd"], f1, HL)             # (nc,3,7)
         return jl, jr, jw, jf, js
 
+    def _jac1_blocks(self, Q, winf, gam):
+        """Блоки якобиана первого порядка без V/Δt (в JAX, сборка — тоже):
+        диагональные (nc,nv,nv) и внедиагональные — для пар (iL,iR) и (iR,iL)."""
+        jnp = self.jnp
+        J = self.J
+        jl, jr, jw, jf, js = self._jac1_parts(Q, winf, gam)
+        A_i, A_w, A_f = J["A_i"][:, None, None], J["A_w"][:, None, None], J["A_f"][:, None, None]
+        jl, jr, jw, jf = jl * A_i, jr * A_i, jw * A_w, jf * A_f
+        nv = jl.shape[1]
+        D = (jnp.zeros((self.nc, nv, nv)).at[J["iL"]].add(jl).at[J["iR"]].add(-jr)
+             .at[J["cw"]].add(jw).at[J["cf"]].add(jf))
+        for k in range(js.shape[1]):              # только убывающая часть источников — на диагональ
+            D = D.at[:, 4 + k, 4 + k].add(J["vol"] * jnp.maximum(-js[:, k, 4 + k], 0.0))
+        if not self.turbulent:
+            D = D.at[:, 4:, :].set(0.0)
+            for k in range(4, nv):
+                D = D.at[:, k, k].set(J["vol"])
+            jl = jl.at[:, 4:, :].set(0.0)
+            jr = jr.at[:, 4:, :].set(0.0)
+        return D, jnp.concatenate([jr, -jl], 0)
+
     def jac1(self, Q, winf, gam, dt):
         """Разреженная матрица V/Δt + J₁ (блоки nv×nv), scipy CSR."""
         import scipy.sparse as sp
-        if not hasattr(self, "_jac1_fn"):
-            self._jac1_fn = self.jax.jit(self._jac1_parts)
-        jl, jr, jw, jf, js = (np.asarray(a) for a in self._jac1_fn(Q, winf, gam))
+        D, off = self._fns()["jac1b"](Q, winf, gam)
+        D = np.array(D)
         nc = self.nc
-        A_i, A_w, A_f = self.A_i[:, None, None], self.A_w[:, None, None], self.A_f[:, None, None]
-        jl, jr, jw, jf = jl * A_i, jr * A_i, jw * A_w, jf * A_f
-        rows, cols, blocks = [], [], []
-        # диагональ
-        nv = jl.shape[1]
-        D = np.zeros((nc, nv, nv))
-        np.add.at(D, self.iL, jl)
-        np.add.at(D, self.iR, -jr)
-        np.add.at(D, self.cw, jw)
-        np.add.at(D, self.cf, jf)
-        for k in range(js.shape[1]):              # только убывающая часть источников — на диагональ
-            D[:, 4 + k, 4 + k] += self.vol * np.maximum(-js[:, k, 4 + k], 0.0)
-        if not self.turbulent:
-            D[:, 4:, :] = 0.0
-            for k in range(4, nv):
-                D[:, k, k] = self.vol
-            jl[:, 4:, :] = 0; jr[:, 4:, :] = 0
-        D += (self.vol / dt)[:, None, None] * np.eye(nv)[None]
-        rows.append(np.arange(nc)); cols.append(np.arange(nc)); blocks.append(D)
-        rows.append(self.iL); cols.append(self.iR); blocks.append(jr)
-        rows.append(self.iR); cols.append(self.iL); blocks.append(-jl)
-        r = np.concatenate(rows); c = np.concatenate(cols); b = np.concatenate(blocks)
+        nv = D.shape[1]
+        D[:, np.arange(nv), np.arange(nv)] += (self.vol / dt)[:, None]
+        r = np.concatenate([np.arange(nc), self.iL, self.iR])
+        c = np.concatenate([np.arange(nc), self.iR, self.iL])
+        b = np.concatenate([D, np.asarray(off)])
         if getattr(self, "_want_blocks", False):
             return r, c, b
         ii = (r[:, None, None] * nv + np.arange(nv)[None, :, None]) + 0 * np.arange(nv)[None, None, :]
         jj = (c[:, None, None] * nv + np.arange(nv)[None, None, :]) + 0 * np.arange(nv)[None, :, None]
         return sp.csr_matrix((b.ravel(), (ii.ravel(), jj.ravel())), shape=(nv * nc, nv * nc))
 
+    def _rotate_state(self, Q, dalpha, inner=0.05, outer=0.5):
+        """Поворот скорости на dalpha градусов: полностью дальше outer хорды от
+        стенок, плавно до нуля на расстоянии inner; плотность, энергия и
+        переменные модели турбулентности не меняются."""
+        f = np.clip((self.wall_d / self.chord - inner) / max(outer - inner, 1e-9), 0.0, 1.0)
+        th = np.radians(dalpha) * f
+        c, s_ = np.cos(th), np.sin(th)
+        Q = Q.copy()
+        mu, mv = Q[:, 1].copy(), Q[:, 2].copy()
+        Q[:, 1] = c * mu - s_ * mv
+        Q[:, 2] = s_ * mu + c * mv
+        return Q
+
     # ------------------------------------------------------------------
+    def _fn_key(self):
+        """Параметры, которые входят в скомпилированные функции как константы."""
+        return (self.nv, self.turb_model, self.aft_version, float(self.ncrit), float(self.limiter_k),
+                self.limiter_zone,
+                float(self.zmin), bool(self.sa_raw_grad), bool(self.visc_raw_grad), int(self.rc_smooth),
+                bool(self.turbulent), float(self.chi_inf), float(self.chi_inf_tr), self.xref)
+
+    def _fns(self):
+        """Скомпилированные (jax.jit) невязки, произведения якобиана на вектор и
+        ограничитель — одни на все углы атаки (компиляция — один раз на решатель;
+        с постоянным кэшем JAX — один раз на ПК)."""
+        key = self._fn_key()
+        if getattr(self, "_fn_cache_key", None) == key:
+            return self._fn_cache
+        jax = self.jax
+        prim, wallv = self.prim, self._wall_values
+
+        def phi_(q):
+            w = prim(q)
+            return self.venkat(w, self.gradients(w, wallv(w)), wallv(w))
+        f = dict(
+            res1=jax.jit(lambda q, wi, gm: self.residual(q, wi, gm, order=1)),
+            res2=jax.jit(lambda q, wi, gm, ph: self.residual(q, wi, gm, order=2, phi_frozen=ph)),
+            res2f=jax.jit(lambda q, wi, gm: self.residual(q, wi, gm, order=2)),
+            jvp1=jax.jit(lambda q, v, wi, gm: jax.jvp(lambda qq: self.residual(qq, wi, gm, order=1), (q,), (v,))[1]),
+            jvp2=jax.jit(lambda q, v, wi, gm, ph: jax.jvp(
+                lambda qq: self.residual(qq, wi, gm, order=2, phi_frozen=ph), (q,), (v,))[1]),
+            jvp2f=jax.jit(lambda q, v, wi, gm: jax.jvp(
+                lambda qq: self.residual(qq, wi, gm, order=2), (q,), (v,))[1]),
+            phi=jax.jit(phi_),
+            grad=jax.jit(lambda w: self.gradients(w, wallv(w))),
+            jac1=jax.jit(self._jac1_parts),
+            jac1b=jax.jit(self._jac1_blocks),
+        )
+        self._fn_cache, self._fn_cache_key = f, key
+        return f
+
     def local_dt(self, Q, cfl):
         w = np.asarray(self.prim(self.jnp.asarray(Q)))
         a = np.sqrt(GAM * w[:, 3] / w[:, 0])
@@ -751,7 +867,7 @@ class RansSolver:
     def forces(self, Q, alpha):
         jnp = self.jnp
         w = np.asarray(self.prim(jnp.asarray(Q)))
-        g = np.asarray(self.gradients(self.jnp.asarray(w), self._wall_values(self.jnp.asarray(w))))
+        g = np.asarray(self._fns()["grad"](self.jnp.asarray(w)))
         cw, n, A, dn = self.cw, self.n_w, self.A_w, self.dn_w
         ww = w[cw]
         pw = ww[:, 3] + np.sum(g[cw, 3] * self.r_w, 1)
@@ -796,9 +912,12 @@ class RansSolver:
 
     # ------------------------------------------------------------------
     def solve(self, alpha, Q0=None, max_iter=300, tol=1e-7, cfl0=None, cfl_max=None, first_order_iters=None,
-              verbose=False, callback=None, gmres_tol=0.01, gmres_iter=60, conv=None, control=None):
+              verbose=False, callback=None, gmres_tol=0.01, gmres_iter=60, conv=None, control=None, alpha0=None):
         """Установление до выполнения критерия conv (Convergence; по умолчанию —
-        self.conv) или до max_iter итераций Ньютона. control — RansControl."""
+        self.conv) или до max_iter итераций Ньютона. control — RansControl.
+        alpha0 — угол, при котором получено начальное поле Q0: скорость вдали от
+        тел поворачивается на α − α0 (у стенок — меньше), иначе внешнее поле
+        «узнаёт» о новом угле только через десятки итераций."""
         crit = conv or self.conv
         cfl0 = self.cfl_start if cfl0 is None else cfl0
         cfl_max = self.cfl_limit if cfl_max is None else cfl_max
@@ -821,14 +940,11 @@ class RansSolver:
                 Q = Q[:, :self.nv].copy()
             elif Q.shape[1] < self.nv:                   # тёплый старт SA → с переходом: ñ = 0, γ̃ = 0
                 Q = np.concatenate([Q, np.zeros((len(Q), self.nv - Q.shape[1]))], 1)
+            if alpha0 is not None and abs(float(alpha) - float(alpha0)) > 1e-12:
+                Q = self._rotate_state(Q, float(alpha) - float(alpha0))
         nv = self.nv
-        res1 = jax.jit(lambda q, wi, gm: self.residual(q, wi, gm, order=1))
-        res2 = jax.jit(lambda q, wi, gm, ph: self.residual(q, wi, gm, order=2, phi_frozen=ph))
-        jvp1 = jax.jit(lambda q, v, wi, gm: jax.jvp(lambda qq: self.residual(qq, wi, gm, order=1), (q,), (v,))[1])
-        jvp2 = jax.jit(lambda q, v, wi, gm, ph: jax.jvp(
-            lambda qq: self.residual(qq, wi, gm, order=2, phi_frozen=ph), (q,), (v,))[1])
-        phi_fn = jax.jit(lambda q: self.venkat(self.prim(q), self.gradients(self.prim(q), self._wall_values(self.prim(q))),
-                                               self._wall_values(self.prim(q))))
+        F_ = self._fns()
+        res1, jvp1, phi_fn = F_["res1"], F_["jvp1"], F_["phi"]
         phi = None                                    # «замороженный» ограничитель (при застое невязки)
         from .bilu import BlockILU0
         if not hasattr(self, "_bilu") or self._bilu.fill != int(self.prec_fill) or self._bilu.k != nv:
@@ -837,11 +953,14 @@ class RansSolver:
                                   jnp.asarray(winf), jnp.asarray(0.0), np.ones(self.nc))
             self._want_blocks = False
             self._bilu = BlockILU0(self.nc, r_, c_, k=nv, fill=int(self.prec_fill))
-        if (not hasattr(self, "_jac1_fn") or getattr(self, "_jac_alpha", None) != alpha
-                or getattr(self, "_jac_nv", None) != nv):
-            self._jac_nv = nv
-            self._jac1_fn = jax.jit(self._jac1_parts)
-            self._jac_alpha = alpha
+        # опорная невязка критерия сходимости — невязка однородного набегающего потока
+        # при этом угле (не зависит от того, откуда начат расчёт: поляра и отдельная
+        # точка сходятся до одного и того же уровня)
+        w_fs = np.tile(winf, (self.nc, 1))
+        w_fs[:, 1:3] *= np.clip(self.wall_d / 0.02, 0, 1)[:, None]
+        R_fs = np.asarray(F_["res2f"](self.cons(jnp.asarray(w_fs)), jnp.asarray(winf), jnp.asarray(0.0)))
+        r_fs = float(np.sqrt(np.mean((R_fs / self.vol[:, None]) ** 2, 0)).sum())
+        warm = Q0 is not None
         hist = []
         r0 = None
         cfl = cfl0
@@ -877,9 +996,11 @@ class RansSolver:
             order = 1 if (it <= first_order_iters and Q0 is None) or it <= first_until else self.order
             if order == 1:
                 resf, jvpf = res1, jvp1
+            elif phi is None:
+                resf, jvpf = F_["res2f"], F_["jvp2f"]
             else:
-                resf = lambda q, wi, gm_: res2(q, wi, gm_, phi)                     # noqa: E731
-                jvpf = lambda q, v, wi, gm_: jvp2(q, v, wi, gm_, phi)              # noqa: E731
+                resf = lambda q, wi, gm_: F_["res2"](q, wi, gm_, phi)              # noqa: E731
+                jvpf = lambda q, v, wi, gm_: F_["jvp2"](q, v, wi, gm_, phi)       # noqa: E731
             Qj = jnp.asarray(Q)
             winf_j = jnp.asarray(winf)
             gm = jnp.asarray(self.gamma_vortex if self.vortex_bc else 0.0)
@@ -891,7 +1012,10 @@ class RansSolver:
                 control.rollback = False
             if best["order"] != order:                    # смена порядка — своя шкала невязки
                 best.update(rn=np.inf, order=order)
-            blowup = (not np.isfinite(rn)) or (rn > self.rollback_factor * best["rn"] and it - best["it"] >= 3)
+            # у тёплого старта невязка сначала мала и растёт, пока поле подстраивается
+            # под новый угол, — это не развал (первые 8 итераций не проверяются)
+            blowup = (not np.isfinite(rn)) or (rn > self.rollback_factor * best["rn"] and it - best["it"] >= 3
+                                               and not (warm and it <= 8))
             if (blowup or manual) and best["Q"] is not None:
                 n_back += int(not manual)
                 why = "вручную" if manual else ("NaN" if not np.isfinite(rn) else
@@ -938,7 +1062,7 @@ class RansSolver:
             if order == 2:
                 fh.append((fr_["cl"], fr_["cd"]))
                 o2 = [h[0] for h in hist if h[1] == 2]
-                rref = self._rref
+                rref = r_fs
                 stalled = len(o2) > 60 and min(o2[-30:]) > 0.5 * min(o2[:-30])
 
                 def steady(win, tol_cl, tol_cd):
@@ -950,16 +1074,27 @@ class RansSolver:
                             and max(cds) - min(cds) < tol_cd)
                 hold = max(1, int(crit.hold))
                 lvl = 10.0 ** (-crit.orders) * rref
-                if len(o2) >= hold and max(o2[-hold:]) <= lvl and steady(hold, crit.cl_tol, crit.cd_tol):
+                # у тёплого старта (от соседнего угла) невязка с самого начала мала —
+                # возмущение только во внешнем поле, а масштаб r_fs задают пристеночные
+                # ячейки; поэтому ещё нужно падение от наибольшей невязки этого расчёта
+                own = max(o2)
+                dropped = (not warm) or rn <= 1e-2 * own
+                if (len(o2) >= hold and max(o2[-hold:]) <= lvl and dropped
+                        and steady(hold, crit.cl_tol, crit.cd_tol)):
                     conv, status = True, "сошлось"
                     break
-                if (crit.stall_ok and len(o2) > 40 and stalled and rn < 1e-2 * rref
+                # глубокое падение невязки (Ньютон сошёлся) — ждать hold итераций незачем
+                if (len(o2) >= 8 and max(o2[-3:]) <= 10.0 ** (-1.5) * lvl and rn <= 1e-3 * own
+                        and steady(3, crit.cl_tol, crit.cd_tol)):
+                    conv, status = True, "сошлось"
+                    break
+                if (crit.stall_ok and len(o2) > 40 and stalled and rn < 10.0 ** (1.0 - crit.orders) * rref
                         and steady(max(hold, 30), crit.cl_tol, crit.cd_tol)):
                     conv, status = True, "сошлось (невязка застряла, силы установились)"
                     break
                 # застой невязки при почти установившихся силах — заморозить ограничитель
                 # («дребезг» ограничителя в нескольких ячейках не даёт невязке падать)
-                if (self.freeze_limiter and phi is None and self.limiter_k > 0 and stalled
+                if (self.freeze_limiter and phi is None and self.limiter_k > 0 and self.limiter_zone != "off" and stalled
                         and steady(30, 0.005, 1e-3)):
                     phi = phi_fn(Qj)
                     if verbose:
@@ -980,7 +1115,13 @@ class RansSolver:
                 if lu is None or it - lu_it >= max(1, self.prec_reuse):
                     try:
                         A1 = self.jac1(Qj, winf_j, gm, dt)
-                        lu = spla.splu(A1.tocsc(), permc_spec="COLAMD")
+                        if getattr(self, "_ndlu", None) is None or self._ndlu.bperm.size != A1.shape[0]:
+                            from .bilu import NestedLU
+                            nb = self.nc
+                            rr = np.concatenate([np.arange(nb), self.iL, self.iR])
+                            cc = np.concatenate([np.arange(nb), self.iR, self.iL])
+                            self._ndlu = NestedLU(nb, rr, cc, k=nv)
+                        lu = self._ndlu.factor(A1)
                         lu_it = it
                     except RuntimeError:                # вырожденная матрица — уменьшить шаг
                         lu = None
@@ -1022,9 +1163,9 @@ class RansSolver:
                                      callback=lambda rr: gh.append(rr), callback_type="pr_norm")
                 dq = ilu.solve(y)
             else:
-                Aop = spla.LinearOperator((N5, N5), mv)
-                dq, info = spla.gmres(Aop, -R.ravel(), M=M, rtol=gmres_tol, maxiter=1, restart=gmres_iter,
-                                      callback=lambda rr: gh.append(rr), callback_type="pr_norm")
+                from .krylov import gmres as _gmres
+                dq, info = _gmres(mv, -R.ravel(), prec=ilu.solve, rtol=gmres_tol, maxiter=gmres_iter,
+                                  callback=gh.append)
             lin = float(np.linalg.norm(mv(dq) + R.ravel()) / max(np.linalg.norm(R), 1e-300))
             gh.append(lin)
             self._last_ok = bool(np.isfinite(lin) and lin < 0.5)
@@ -1089,6 +1230,7 @@ class RansSolver:
                     status = (f"не установилось: Cl колеблется {cl_h.mean():.3f} ± {amp:.3f} "
                               "(вероятно, нестационарное течение)")
         H["rref"] = float(getattr(self, "_rref", 0.0) or (max(H["rn"]) if len(H["rn"]) else 1.0))
+        H["r_fs"] = r_fs                                # опорная невязка критерия (однородный поток)
         H["events"] = events
         if n_back:
             status += f"; откатов: {n_back}"
@@ -1098,6 +1240,135 @@ class RansSolver:
             H["worst"] = worst_cells(R)
         return RansResult(alpha, fr["cl"], fr["cd"], fr["cdp"], fr["cdf"], fr["cm"], conv, it,
                           [h[0] for h in hist], fr["elements"], Q, status, H)
+
+
+    # ------------------------------------------------------------------
+    # нестационарный расчёт (двойной шаг по времени)
+    # ------------------------------------------------------------------
+    def solve_unsteady(self, alpha, Q0, t_end, dt=None, steps_per_chord=None, sub_iter=12, sub_tol=1e-2,
+                       cfl=None, frame_every=1, callback=None, control=None, verbose=False, ramp=0.0):
+        """Расчёт по физическому времени — неявная схема BDF2 второго порядка с
+        внутренними итерациями Ньютона по псевдовремени («двойной шаг»):
+            V (3Qⁿ⁺¹ − 4Qⁿ + Qⁿ⁻¹)/(2Δt) + R(Qⁿ⁺¹) = 0.
+        Время — в единицах хорды, делённой на скорость набегающего потока
+        (t* = t·V∞/c); dt — шаг в тех же единицах (по умолчанию 1/steps_per_chord,
+        steps_per_chord = 40). Q0 — начальное поле (установившееся решение при этом
+        или другом угле; None — покой: скорость 0). ramp > 0 — скорость набегающего
+        потока нарастает от 0 до V∞ за время ramp (плавный «старт»: резкий старт
+        сжимаемого газа даёт сильные акустические волны). На каждом шаге — до
+        sub_iter итераций, пока невязка не упадёт в 1/sub_tol раз. Каждые
+        frame_every шагов сохраняется кадр (float32).
+        callback(k, n, t, cl, cd) → True — остановить. Возвращает словарь:
+        t, cl, cd, cm (по шагам), frames (список (t, Q)), status."""
+        jax, jnp = self.jax, self.jnp
+        from .bilu import BlockILU0
+        from .krylov import gmres as _gmres
+        U = self.mach                                  # V∞ в единицах a∞
+        t_unit = self.chord / U                        # c/V∞ в единицах решателя
+        if dt is None:
+            dt = 1.0 / float(steps_per_chord or 40)
+        dtp = float(dt) * t_unit
+        n_steps = int(np.ceil(float(t_end) / float(dt) - 1e-9))
+        winf = self.freestream(alpha)
+        self.alpha_rad = np.radians(alpha)
+        nv = self.nv
+        if Q0 is None:                                  # покой: скорость 0
+            w0 = np.tile(winf, (self.nc, 1))
+            w0[:, 1:3] = 0.0
+            Q0 = np.asarray(self.cons(jnp.asarray(w0)))
+            ramp = ramp or 0.5
+        Q = np.array(Q0, float)[:, :nv]
+        if Q.shape[1] < nv:
+            Q = np.concatenate([Q, np.zeros((len(Q), nv - Q.shape[1]))], 1)
+        F_ = self._fns()
+        resf, jvpf = F_["res2f"], F_["jvp2f"]
+        if not hasattr(self, "_bilu") or self._bilu.fill != int(self.prec_fill) or self._bilu.k != nv:
+            self._want_blocks = True
+            r_, c_, _ = self.jac1(jnp.asarray(Q), jnp.asarray(winf), jnp.asarray(0.0), np.ones(self.nc))
+            self._want_blocks = False
+            self._bilu = BlockILU0(self.nc, r_, c_, k=nv, fill=int(self.prec_fill))
+        cfl = float(cfl or 300.0)
+        vol = self.vol[:, None]
+        Qn, Qnm1 = Q.copy(), None
+        winf_j = jnp.asarray(winf)
+        gam_full = self.gamma_vortex
+        out = dict(t=[], cl=[], cd=[], cm=[], frames=[], sub=[], status="", dt=float(dt), alpha=float(alpha),
+                   mach=self.mach, re=self.re)
+        fr = self.forces(Q, alpha)
+        out["frames"].append((0.0, Q.astype(np.float32)))
+        for k in range(1, n_steps + 1):
+            if control is not None and (control.stop or control.skip):
+                out["status"] = "остановлено"
+                control.skip = False
+                break
+            bdf2 = Qnm1 is not None
+            c0, c1, c2 = (1.5, -2.0, 0.5) if bdf2 else (1.0, -1.0, 0.0)   # первый шаг — неявный Эйлер
+            if ramp and ramp > 0:                         # разгон: скорость набегающего потока растёт
+                fr_ = min(1.0, k * float(dt) / float(ramp))
+                fr_ = 0.5 - 0.5 * np.cos(np.pi * fr_)
+                w_ = winf.copy()
+                w_[1:3] *= fr_
+                winf_j = jnp.asarray(w_)
+            Q = 2 * Qn - Qnm1 if bdf2 else Qn.copy()                      # экстраполяция — начальное приближение
+            if not np.all(Q[:, 0] > 0):
+                Q = Qn.copy()
+            r_first, nsub = None, 0
+            for sub in range(sub_iter):
+                gm = jnp.asarray(self.gamma_vortex if self.vortex_bc else 0.0)
+                Qj = jnp.asarray(Q)
+                Rs = np.asarray(resf(Qj, winf_j, gm))
+                Rt = Rs + vol * (c0 * Q + c1 * Qn + (c2 * Qnm1 if bdf2 else 0.0)) / dtp
+                rn = float(np.sqrt(np.mean((Rt / vol) ** 2, 0)).sum())
+                if not np.isfinite(rn):
+                    break
+                if verbose and verbose > 1:
+                    print(f"     подытерация {sub}: невязка {rn:.3e}", flush=True)
+                if r_first is None:
+                    r_first = rn
+                elif rn < sub_tol * r_first:
+                    break
+                dtau = self.local_dt(Q, cfl)
+                inv_eff = 1.0 / dtau + c0 / dtp                  # V/Δτ + c0·V/Δt на диагонали
+                self._want_blocks = True
+                _, _, blocks = self.jac1(Qj, winf_j, gm, 1.0 / inv_eff)
+                self._want_blocks = False
+                ilu = self._bilu.factor(blocks)
+                Vd = np.repeat(self.vol * inv_eff, nv)
+
+                def mv(x):
+                    return np.asarray(jvpf(Qj, jnp.asarray(x.reshape(-1, nv)), winf_j, gm)).ravel() + Vd * x
+                dq, _ = _gmres(mv, -Rt.ravel(), prec=ilu.solve, rtol=0.05, maxiter=40)
+                dq = dq.reshape(-1, nv)
+                w = np.asarray(self.prim(Qj))
+                wn = np.asarray(self.prim(jnp.asarray(Q + dq)))
+                rel = np.maximum(np.max(-(wn[:, 0] - w[:, 0]) / w[:, 0]), np.max(-(wn[:, 3] - w[:, 3]) / w[:, 3]))
+                Q = Q + (1.0 if rel < 0.2 else 0.2 / rel) * dq
+                nsub = sub + 1
+            Qnm1, Qn = Qn, Q.copy()
+            fr = self.forces(Q, alpha)
+            if self.vortex_bc:
+                self.gamma_vortex = 0.5 * fr["cl"] * self.mach * self.chord
+            gam_full = self.gamma_vortex
+            t = k * float(dt)
+            for key in ("cl", "cd", "cm"):
+                out[key].append(fr[key])
+            out["t"].append(t)
+            out["sub"].append(nsub)
+            if k % max(1, int(frame_every)) == 0 or k == n_steps:
+                out["frames"].append((t, Q.astype(np.float32)))
+            if verbose:
+                print(f"  шаг {k}/{n_steps} t={t:.3f}: Cl {fr['cl']:.4f} Cd {fr['cd']:.5f}, итераций {nsub}", flush=True)
+            if callback and callback(k, n_steps, t, fr["cl"], fr["cd"]):
+                out["status"] = "остановлено"
+                break
+            if not np.all(np.isfinite(Q)):
+                out["status"] = "расходится"
+                break
+        if not out["status"]:
+            out["status"] = "готово"
+        for key in ("t", "cl", "cd", "cm", "sub"):
+            out[key] = np.asarray(out[key])
+        return out
 
 
 def wall_direction(mesh, k=6):
@@ -1139,7 +1410,9 @@ def wake_lines(elements, alpha, re, chord=1.0, length=0.6):
 
 def mesh_for(elements, alpha, re, chord=1.0, fine=False, opts=None):
     """Сетка RANS по параметрам opts (MeshOptions; по умолчанию — автоматические).
-    Для механизации — сгущение в щелях и по линиям следа невязкого решения при угле alpha."""
+    Для механизации — сгущение в щелях и по линиям следа невязкого решения при углах
+    opts.wake_alphas (alpha не используется: сетка не зависит от угла расчёта, поэтому
+    поляра и отдельные точки считаются на одной сетке)."""
     from .rans_mesh import MeshOptions, build_mesh
     from .geometry import repanel
     o = opts or MeshOptions()
@@ -1153,8 +1426,10 @@ def mesh_for(elements, alpha, re, chord=1.0, fine=False, opts=None):
     kw = dict(yplus=o.yplus, ratio=o.ratio, bl_thickness=(o.bl_thickness or None), far_radius=o.far_radius,
               far_size=o.far_size, slot_size=near * chord, growth=o.growth)
     if multi and o.wake_refine:
-        kw.update(wakes=wake_lines(els, alpha, re, chord, length=o.wake_length),
-                  wake_size=(0.006 if fine else o.wake_size))
+        wk = []
+        for a_ in (o.wake_alphas or (0.0,)):
+            wk += wake_lines(els, float(a_), re, chord, length=o.wake_length) or []
+        kw.update(wakes=wk or None, wake_size=(0.006 if fine else o.wake_size))
     return build_mesh(els, chord=chord, re=re, **kw)
 
 
@@ -1168,7 +1443,8 @@ def _seq_order(alphas):
 def _solve_angle(solver, a, Q, a_src, max_iter, verbose, cb, conv, control, depth=0):
     """Один угол; если он развалился при старте от соседнего угла a_src, —
     промежуточный угол (a + a_src)/2 и затем снова a (до двух делений)."""
-    r = solver.solve(float(a), Q0=Q, max_iter=max_iter, verbose=verbose, callback=cb, conv=conv, control=control)
+    r = solver.solve(float(a), Q0=Q, max_iter=max_iter, verbose=verbose, callback=cb, conv=conv, control=control,
+                     alpha0=a_src)
     bad = r.status.startswith(("расходится", "неустойчиво"))
     if (bad and Q is not None and a_src is not None and abs(a - a_src) > 1.0 and depth < 2
             and not (control is not None and control.stop)):
@@ -1390,7 +1666,7 @@ def rans_polar(elements, alphas, re, mach=0.15, chord=1.0, xref=None, mesh=None,
         cs = RansSolver(cm, mach, re, chord=chord, xref=xr)
         for k_, v_ in (solver_opts or {}).items():
             setattr(cs, k_, v_)
-        rc = cs.solve(float(alphas[i0]), max_iter=max_iter, verbose=verbose, conv=Convergence(2.0, 10, 2e-3, 2e-4),
+        rc = cs.solve(float(alphas[i0]), max_iter=max_iter, verbose=verbose, conv=Convergence(3.5, 10, 2e-3, 2e-4),
                       callback=lambda it, rn: on_iter(i0, it, rn), control=control)
         if verbose:
             print(f"  грубая сетка ({cm.n_cells} ячеек): α {alphas[i0]:g}°, Cl {rc.cl:.4f}, {rc.status}", flush=True)

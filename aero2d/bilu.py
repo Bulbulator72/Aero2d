@@ -107,18 +107,26 @@ class BlockILU0:
                 a2, b2 = np.searchsorted(gp_s, g), np.searchsorted(gp_s, g, side="right")
                 steps.append((low_s[a:b], pe[a2:b2], pij[a2:b2], pkj[a2:b2]))
             self.fact.append((steps, rows_by_lev[lev_bounds[l_]:lev_bounds[l_ + 1]]))
-        # расписание решения
-        self.fwd = []
-        for l in range(L):
-            rws = np.where(lev == l)[0]
-            E = low[lev_e[low] == l]
-            self.fwd.append((rws, E))
-        self.bwd = []
-        levu_e = levu[r]
-        for l in range(levu.max() + 1):
-            rws = np.where(levu == l)[0]
-            E = up[levu_e[up] == l]
-            self.bwd.append((rws, E))
+        # расписание решения: внутри уровня элементы отсортированы по строке —
+        # суммы по строкам через np.add.reduceat (быстрее np.subtract.at)
+        def sched(levels, cand, n_lev):
+            out = []
+            le = levels[r[cand]]
+            o = np.lexsort((r[cand], le))
+            cs, ls = cand[o], le[o]
+            bnd = np.searchsorted(ls, np.arange(n_lev + 1))
+            for l in range(n_lev):
+                rws = np.where(levels == l)[0]
+                E = cs[bnd[l]:bnd[l + 1]]
+                if len(E):
+                    rr = r[E]
+                    st = np.r_[0, np.where(np.diff(rr) != 0)[0] + 1]
+                    out.append((rws, E, st, rr[st]))
+                else:
+                    out.append((rws, E, None, None))
+            return out
+        self.fwd = sched(lev, low, L)
+        self.bwd = sched(levu, up, levu.max() + 1)
         self.B = None
 
     def factor(self, blocks):
@@ -128,10 +136,11 @@ class BlockILU0:
         invU = np.zeros((self.n, self.k, self.k))
         for steps, rws in self.fact:
             for E, pe, pij, pkj in steps:
-                B[E] = np.einsum("eab,ebc->eac", B[E], invU[self.c[E]])
+                B[E] = np.matmul(B[E], invU[self.c[E]])
                 if len(pe):
-                    upd = np.einsum("eab,ebc->eac", B[pe], B[pkj])
-                    np.subtract.at(B, pij, upd)
+                    # внутри шага у каждой строки один исключаемый элемент — позиции
+                    # (i, j) не повторяются, можно вычитать без np.subtract.at
+                    B[pij] -= np.matmul(B[pe], B[pkj])
             invU[rws] = np.linalg.inv(B[self.diag[rws]])
         self.B, self.invU = B, invU
         return self
@@ -141,16 +150,80 @@ class BlockILU0:
         k = self.k
         y = np.asarray(b, float).reshape(-1, k)[self.perm].copy()
         B, r, c = self.B, self.r, self.c
-        for rws, E in self.fwd:
+        for rws, E, st, ru in self.fwd:
             if len(E):
-                acc = np.einsum("eab,eb->ea", B[E], y[c[E]])
-                np.subtract.at(y, r[E], acc)
+                acc = np.matmul(B[E], y[c[E]][:, :, None])[:, :, 0]
+                y[ru] -= np.add.reduceat(acc, st, axis=0)
         x = y
-        for rws, E in self.bwd:
+        for rws, E, st, ru in self.bwd:
             if len(E):
-                acc = np.einsum("eab,eb->ea", B[E], x[c[E]])
-                np.subtract.at(x, r[E], acc)
-            x[rws] = np.einsum("eab,eb->ea", self.invU[rws], x[rws])
+                acc = np.matmul(B[E], x[c[E]][:, :, None])[:, :, 0]
+                x[ru] -= np.add.reduceat(acc, st, axis=0)
+            x[rws] = np.matmul(self.invU[rws], x[rws][:, :, None])[:, :, 0]
         out = np.empty_like(x)
         out[self.perm] = x
         return out.ravel()
+
+
+
+def nested_dissection(n, rows, cols, leaf=200):
+    """Упорядочение вложенными сечениями графа (rows, cols) с n вершинами:
+    рекурсивное деление уровнями обхода в ширину от псевдопериферийной вершины,
+    разделитель — средний уровень, нумеруется после обеих частей. Для точного LU
+    двумерных сеток заполнение в разы меньше, чем у COLAMD/MMD (NACA 0012, 14 тыс.
+    ячеек, блоки 5×5: разложение SuperLU за 2 с вместо десятков минут)."""
+    import scipy.sparse as sp
+    from scipy.sparse.csgraph import breadth_first_order, connected_components, shortest_path
+    G = sp.csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(n, n))
+    G = ((G + G.T) > 0).astype(float).tocsr()
+    G.setdiag(0)
+    G.eliminate_zeros()
+
+    def rec(idx, out):
+        if len(idx) <= leaf:
+            out.append(idx)
+            return
+        sub = G[idx][:, idx]
+        ncomp, lab = connected_components(sub, directed=False)
+        if ncomp > 1:
+            for k in range(ncomp):
+                rec(idx[lab == k], out)
+            return
+        start = 0
+        for _ in range(2):
+            order = breadth_first_order(sub, start, directed=False, return_predecessors=False)
+            start = order[-1]
+        d = shortest_path(sub, method="D", unweighted=True, indices=start)
+        m = np.floor(np.median(d))
+        a_, b_ = idx[d < m], idx[d > m]
+        if len(a_) == 0 or len(b_) == 0:
+            out.append(idx)
+            return
+        rec(a_, out)
+        rec(b_, out)
+        out.append(idx[d == m])
+    out = []
+    rec(np.arange(n), out)
+    return np.concatenate(out)
+
+
+class NestedLU:
+    """Точное разреженное LU (SuperLU) блочной матрицы n×n блоков k×k в порядке
+    вложенных сечений (nested_dissection) — предобусловливатель «lu»."""
+
+    def __init__(self, n, rows, cols, k=5):
+        perm = nested_dissection(n, rows, cols)
+        self.bperm = (perm[:, None] * k + np.arange(k)[None]).ravel()
+        self.inv = np.empty_like(self.bperm)
+        self.inv[self.bperm] = np.arange(len(self.bperm))
+        self.lu = None
+
+    def factor(self, A):
+        """A — scipy.sparse (n·k × n·k) в исходной нумерации."""
+        import scipy.sparse.linalg as spla
+        Ap = A.tocsr()[self.bperm][:, self.bperm].tocsc()
+        self.lu = spla.splu(Ap, permc_spec="NATURAL", diag_pivot_thresh=0.0, options=dict(SymmetricMode=True))
+        return self
+
+    def solve(self, b):
+        return self.lu.solve(np.asarray(b, float)[self.bperm])[self.inv]
