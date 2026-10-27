@@ -85,6 +85,9 @@ class RansControl:
 
 
 def _jnp():
+    # без служебных сообщений XLA («Constant folding … is taking > 1s» — это компиляция,
+    # на результат не влияет)
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
     import jax
     jax.config.update("jax_enable_x64", True)
     import jax.numpy as jnp
