@@ -600,6 +600,63 @@ def continue_rans(p: Polar, callback=None, max_iter: int = 300, conv=None, contr
     return out
 
 
+def run_rans_unsteady(ctx: dict, k: int, t_end: float = 4.0, steps_per_chord: int = 40, sub_iter: int = 12,
+                      start: str = "steady", frame_every: int = 2, callback=None, control=None,
+                      solver_opts=None, k_from=None, ramp: float = 0.5) -> dict:
+    """Нестационарный RANS (двойной шаг по времени, BDF2) для угла номер k поляры
+    RANS (ctx = Polar.field_ctx): та же сетка, Re и M. start:
+      "steady" — с установившегося решения этого угла (проверка: устойчиво ли
+                 течение; за Cl_max — срыв вихрей, если он есть у модели);
+      "pitch"  — резкий поворот потока: начальное поле — решение угла номер k_from
+                 той же поляры, течение подстраивается к углу k (развитие отрыва,
+                 динамические нагрузки);
+      "start"  — разгон из покоя за время ramp (разгонный вихрь у задней кромки).
+    t_end — время в хордах (t·V∞/c). callback(text, fraction) → True — остановить.
+    Возвращает результат RansSolver.solve_unsteady (+ mesh, elements)."""
+    from .rans import RansSolver
+    if not ctx or ctx.get("method") != "rans":
+        raise ValueError("Анимация по времени — для расчёта RANS (выберите поляру RANS)")
+    alpha = float(ctx["alpha"][k])
+    if start == "steady":
+        Q0 = ctx["states"][k]
+    elif start == "pitch":
+        if k_from is None:
+            raise ValueError("Не задан начальный угол")
+        Q0 = ctx["states"][k_from]
+    else:
+        Q0 = None
+    if start in ("steady", "pitch") and Q0 is None:
+        raise ValueError("Для начального угла нет решения RANS")
+    elements = ctx["elements"]
+    xs = np.concatenate([e.x for e in elements])
+    xr = (float(xs.min()) + 0.25 * ctx["chord"], 0.0)
+    s = RansSolver(ctx["mesh"], ctx["mach"], ctx["re"], chord=ctx["chord"], xref=xr)
+    for k_, v_ in (solver_opts or {}).items():
+        setattr(s, k_, v_)
+    if Q0 is not None and Q0.shape[1] != s.nv:
+        Q0 = np.asarray(Q0)[:, :s.nv] if Q0.shape[1] > s.nv else \
+            np.concatenate([Q0, np.zeros((len(Q0), s.nv - Q0.shape[1]))], 1)
+    if Q0 is not None:
+        a0 = alpha if start == "steady" else float(ctx["alpha"][k_from])
+        s.gamma_vortex = 0.5 * s.forces(np.asarray(Q0), a0)["cl"] * s.mach * s.chord
+        if start == "pitch":
+            # резкая смена угла: скорость поворачивается во всей области (у стенки, в
+            # пределах 0,02 хорды, — плавно до нуля), а не только на внешней границе —
+            # иначе новый угол «доходит» до профиля лишь со звуковой волной
+            Q0 = s._rotate_state(np.asarray(Q0, float), alpha - a0, inner=0.0, outer=0.02)
+
+    def cb(i, n, t, cl, cd):
+        if callback is None:
+            return False
+        return callback(f"Нестационарный RANS: шаг {i}/{n}, t·V∞/c = {t:.2f}, Cl = {cl:.4f}, Cd = {cd:.5f}", i / n)
+    run = s.solve_unsteady(alpha, Q0, t_end, steps_per_chord=steps_per_chord, sub_iter=sub_iter,
+                           frame_every=frame_every, callback=cb, control=control,
+                           ramp=(ramp if start == "start" else 0.0))
+    run.update(mesh=ctx["mesh"], elements=elements, start=start,
+               alpha_from=(float(ctx["alpha"][k_from]) if start == "pitch" else None))
+    return run
+
+
 class _Stop(Exception):
     pass
 

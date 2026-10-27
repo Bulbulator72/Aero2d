@@ -270,6 +270,7 @@ class App(tk.Tk):
         ttk.Checkbutton(bar, text="линии тока", variable=self.fl_lines,
                         command=self._redraw_field).pack(side="left", padx=6)
         ttk.Button(bar, text="Построить", command=self.plot_field).pack(side="left", padx=6)
+        ttk.Button(bar, text="Анимация по времени (GIF)…", command=self.animate_dialog).pack(side="left", padx=6)
         self._field_cache = {}
         self._build_res_tab(nb)
         # таблица
@@ -668,6 +669,15 @@ class App(tk.Tk):
                     self._draw_field(*msg[1:])
                 elif msg[0] == "field_error":
                     self.status.set("Поле течения: " + msg[1])
+                elif msg[0] == "anim_done":
+                    self._anim_running = False
+                    self.progress["value"] = 1.0
+                    self.status.set(msg[2])
+                    self._show_gif(msg[1])
+                elif msg[0] == "anim_error":
+                    self._anim_running = False
+                    self.status.set("Анимация: ошибка")
+                    messagebox.showerror("Анимация", msg[1])
                 elif msg[0] == "iter":
                     self._on_iter(msg[1])
                 elif msg[0] == "mesh":
@@ -876,6 +886,172 @@ class App(tk.Tk):
                 self.q.put(("field_error", str(e)))
         threading.Thread(target=job, daemon=True).start()
 
+    # ------------------------------------------------------------ анимация (GIF)
+    def animate_dialog(self):
+        """Нестационарный RANS для выбранного угла поляры RANS и GIF поля течения."""
+        if getattr(self, "_anim_running", False) or (self.worker and self.worker.is_alive()):
+            messagebox.showinfo("Анимация", "Дождитесь окончания текущего расчёта.")
+            return
+        try:
+            a = float(self.cp_alpha.get())
+        except ValueError:
+            a = None
+        cand = [p for p in self.polars if p.method == "rans" and p.field_ctx]
+        sel = [p for p in cand if p.label == self.fl_polar.get()] or cand[-1:]
+        if not sel:
+            messagebox.showinfo("Анимация", "Анимация по времени строится нестационарным RANS: сначала "
+                                "посчитайте поляру (или одну точку) методом RANS, затем выберите α.")
+            return
+        p = sel[-1]
+        if a is None or not np.isclose(p.alpha, a).any():
+            a = float(p.alpha[0])
+        k = int(np.where(np.isclose(p.alpha, a))[0][0])
+        from .animate import QUANTITIES
+        w = tk.Toplevel(self)
+        w.title("Анимация поля течения по времени")
+        w.transient(self)
+        fr = ttk.Frame(w, padding=10)
+        fr.pack(fill="both", expand=True)
+        ttk.Label(fr, text=f"{p.label}, α = {a:g}°", font=("", 10, "bold")).grid(row=0, column=0, columnspan=3,
+                                                                                sticky="w", pady=(0, 6))
+        v_t = tk.StringVar(value="4")
+        v_n = tk.StringVar(value="40")
+        v_sub = tk.StringVar(value="12")
+        v_fe = tk.StringVar(value="2")
+        v_start = tk.StringVar(value="steady")
+        v_q = tk.StringVar(value=list(QUANTITIES)[0])
+        v_reg = tk.StringVar(value="Весь профиль и след")
+        v_sl = tk.BooleanVar(value=False)
+        regs = {"Весь профиль и след": (-0.5, 2.5, -0.9, 0.9), "Профиль крупно": (-0.3, 1.5, -0.55, 0.55),
+                "Задняя кромка и след": (0.6, 2.0, -0.45, 0.45)}
+        rows = [("Время расчёта t·V∞/c (хорд пройдено потоком)", v_t,
+                 "срыв вихрей за Cl_max — несколько периодов (~2–6); разгонный вихрь — 1–3"),
+                ("Шагов по времени на одну хорду", v_n, "40 — обычно; 80–100 — мелкие вихри точнее"),
+                ("Внутренних итераций Ньютона на шаг (не больше)", v_sub, "останавливаются раньше при падении невязки в 100 раз"),
+                ("Кадр каждые N шагов", v_fe, "меньше — плавнее и тяжелее GIF")]
+        for i, (t_, v_, h_) in enumerate(rows, start=1):
+            ttk.Label(fr, text=t_).grid(row=i, column=0, sticky="w")
+            ttk.Entry(fr, textvariable=v_, width=8).grid(row=i, column=1, sticky="w", padx=4)
+            ttk.Label(fr, text=h_, foreground="#666").grid(row=i, column=2, sticky="w")
+        i = len(rows) + 1
+        others = [f"{float(x_):g}" for j_, x_ in enumerate(p.alpha)
+                  if j_ != k and p.field_ctx["states"][j_] is not None]
+        v_from = tk.StringVar(value=(min(others, key=lambda t_: abs(float(t_) - a)) if others else ""))
+        ttk.Label(fr, text="Начало").grid(row=i, column=0, sticky="w")
+        ttk.Radiobutton(fr, text="с установившегося решения этого угла (устойчиво ли течение)",
+                        variable=v_start, value="steady").grid(row=i, column=1, columnspan=2, sticky="w")
+        rf = ttk.Frame(fr)
+        rf.grid(row=i + 1, column=1, columnspan=2, sticky="w")
+        ttk.Radiobutton(rf, text="резкий поворот потока: начальное поле — решение при α =", variable=v_start,
+                        value="pitch", state=("normal" if others else "disabled")).pack(side="left")
+        ttk.Combobox(rf, textvariable=v_from, values=others, width=6, state="readonly").pack(side="left")
+        ttk.Label(rf, text="°").pack(side="left")
+        ttk.Radiobutton(fr, text="разгон из покоя (поток набирает скорость за 0,5 хорды пути — разгонный вихрь)",
+                        variable=v_start, value="start").grid(row=i + 2, column=1, columnspan=2, sticky="w")
+        i += 1
+        ttk.Label(fr, text="Величина").grid(row=i + 2, column=0, sticky="w")
+        ttk.Combobox(fr, textvariable=v_q, values=list(QUANTITIES), state="readonly",
+                     width=28).grid(row=i + 2, column=1, columnspan=2, sticky="w")
+        ttk.Label(fr, text="Область").grid(row=i + 3, column=0, sticky="w")
+        ttk.Combobox(fr, textvariable=v_reg, values=list(regs), state="readonly",
+                     width=28).grid(row=i + 3, column=1, columnspan=2, sticky="w")
+        ttk.Checkbutton(fr, text="линии тока на кадрах (медленнее)", variable=v_sl).grid(
+            row=i + 4, column=1, columnspan=2, sticky="w")
+        ttk.Label(fr, text="Расчёт по времени — та же сетка и модель, что в поляре; на ЦП это минуты–десятки "
+                  "минут (шагов = время × шагов на хорду).", foreground="#666", wraplength=560).grid(
+            row=i + 5, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        def go():
+            try:
+                t_end = float(v_t.get().replace(",", "."))
+                nsc = int(float(v_n.get()))
+                nsub = int(float(v_sub.get()))
+                fe = int(float(v_fe.get()))
+                if t_end <= 0 or nsc < 2 or nsub < 1 or fe < 1:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Анимация", "Проверьте числа: время > 0, шагов на хорду ≥ 2, итераций ≥ 1.",
+                                     parent=w)
+                return
+            path = filedialog.asksaveasfilename(parent=w, title="Сохранить анимацию", defaultextension=".gif",
+                                                initialfile=f"aero2d_a{a:g}.gif", filetypes=[("GIF", "*.gif")])
+            if not path:
+                return
+            k_from = None
+            if v_start.get() == "pitch":
+                k_from = int(np.where(np.isclose(p.alpha, float(v_from.get())))[0][0])
+            w.destroy()
+            self._run_animation(p, k, t_end, nsc, nsub, fe, v_start.get(), QUANTITIES[v_q.get()],
+                                regs[v_reg.get()], v_sl.get(), path, k_from)
+        b = ttk.Frame(fr)
+        b.grid(row=i + 6, column=0, columnspan=3, sticky="e", pady=(10, 0))
+        ttk.Button(b, text="Рассчитать и сохранить GIF", command=go).pack(side="right")
+        ttk.Button(b, text="Отмена", command=w.destroy).pack(side="right", padx=6)
+
+    def _run_animation(self, p, k, t_end, nsc, nsub, fe, start, qty, box, streamlines, path, k_from=None):
+        from .rans import RansControl
+        self._anim_running = True
+        self.stop_flag.clear()
+        self.btn_stop.configure(state="normal")
+        self._rans_ctl = RansControl()
+        sopts = {}
+        try:
+            sopts = self.solver_settings()
+        except Exception:                                   # noqa: BLE001
+            pass
+
+        def job():
+            try:
+                def cb(text, frac):
+                    self.q.put(("progress", text, 0.9 * frac))
+                    return self.stop_flag.is_set()
+                run = core.run_rans_unsteady(p.field_ctx, k, t_end, nsc, nsub, start, fe, cb,
+                                             control=self._rans_ctl, solver_opts=sopts, k_from=k_from)
+                from .animate import make_gif
+                self.q.put(("progress", "Сборка GIF…", 0.9))
+                nm = p.label.split(",")[0]
+                ttl = f"{nm}, α = {run['alpha']:g}°"
+                if run.get("alpha_from") is not None:
+                    ttl = f"{nm}, α {run['alpha_from']:g}° → {run['alpha']:g}°"
+                n = make_gif(run["mesh"], run["elements"], run, path, quantity=qty, box=box,
+                             streamlines=streamlines, title=ttl,
+                             progress=lambda i, n_: self.q.put(("progress", f"Сборка GIF: кадр {i}/{n_}",
+                                                                0.9 + 0.1 * i / max(n_, 1))) and False)
+                self._anim_last = run
+                self.q.put(("anim_done", path, f"Анимация сохранена: {path} ({n} кадров, "
+                                               f"{len(run['t'])} шагов, {run['status']})"))
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("anim_error", f"{e}\n\n{traceback.format_exc(limit=3)}"))
+        threading.Thread(target=job, daemon=True).start()
+
+    def _show_gif(self, path):
+        """Просмотр GIF в окне программы (Tk показывает кадры GIF сам)."""
+        try:
+            frames = []
+            i = 0
+            while True:
+                try:
+                    frames.append(tk.PhotoImage(file=path, format=f"gif -index {i}"))
+                except tk.TclError:
+                    break
+                i += 1
+        except Exception:                                   # noqa: BLE001
+            return
+        if not frames:
+            return
+        w = tk.Toplevel(self)
+        w.title(os.path.basename(path))
+        lab = ttk.Label(w, image=frames[0])
+        lab.pack()
+        w._frames = frames
+
+        def step(j=0):
+            if not w.winfo_exists():
+                return
+            lab.configure(image=frames[j % len(frames)])
+            w.after(90, step, j + 1)
+        step()
+
     def _redraw_field(self):
         """Перерисовать уже рассчитанное поле (смена величины, линий тока)."""
         last = getattr(self, "_field_last", None)
@@ -1037,8 +1213,8 @@ class App(tk.Tk):
     def _mesh_signature(af, re, alpha, opts):
         els = af if isinstance(af, list) else [af]
         xy = np.concatenate([np.r_[e.x, e.y] for e in els])
-        return (len(xy), round(float(xy.sum()), 9), round(float((xy ** 2).sum()), 9), float(re),
-                round(float(alpha), 3), repr(opts))
+        # угол атаки в подпись не входит: сетка от него не зависит (MeshOptions.wake_alphas)
+        return (len(xy), round(float(xy.sum()), 9), round(float((xy ** 2).sum()), 9), float(re), repr(opts))
 
     def _mesh_inputs(self):
         af = self.get_config()
@@ -1124,9 +1300,9 @@ class App(tk.Tk):
         bar = ttk.Frame(fr, padding=(4, 4))
         bar.pack(side="top", fill="x")
         ttk.Label(bar, text="Переход к следующему углу: невязка ниже 10^−").pack(side="left")
-        self.cv_orders = tk.StringVar(value="3")
+        self.cv_orders = tk.StringVar(value="4.5")
         ttk.Entry(bar, textvariable=self.cv_orders, width=4).pack(side="left")
-        ttk.Label(bar, text=" от наибольшей,").pack(side="left")
+        ttk.Label(bar, text=" от невязки однородного потока,").pack(side="left")
         self.cv_hold = tk.StringVar(value="20")
         ttk.Entry(bar, textvariable=self.cv_hold, width=4).pack(side="left", padx=(4, 0))
         ttk.Label(bar, text=" итераций подряд;").pack(side="left")
@@ -1141,7 +1317,7 @@ class App(tk.Tk):
         bar2 = ttk.Frame(fr, padding=(4, 0))
         bar2.pack(side="top", fill="x")
         self.cv_stall = tk.BooleanVar(value=True)
-        ttk.Checkbutton(bar2, text="принимать и при «застрявшей» невязке (упала на 2 порядка, Cl и Cd стоят "
+        ttk.Checkbutton(bar2, text="принимать и при «застрявшей» невязке (на порядок выше заданной, Cl и Cd стоят "
                         "≥ 30 итераций)", variable=self.cv_stall).pack(side="left")
         ttk.Button(bar2, text="⏭ Принять угол, следующий", command=self.skip_angle).pack(side="right")
         # шаг по псевдовремени и защита от развала
@@ -1166,7 +1342,10 @@ class App(tk.Tk):
             e_.pack(side="left")
             e_.bind("<KeyRelease>", lambda _: self.cfl_preset.set("свой"))
             self.cfl_vars[key] = v
-        ttk.Label(bar5, text=" раз").pack(side="left")
+        ttk.Label(bar5, text=" раз;  ограничитель:").pack(side="left")
+        self.lim_zone = tk.StringVar(value="у задних кромок")
+        ttk.Combobox(bar5, textvariable=self.lim_zone, values=list(self.LIMITER_ZONES), state="readonly",
+                     width=16).pack(side="left")
         ttk.Button(bar5, text="↶ Откат к лучшему", command=self.rollback_now).pack(side="right")
         ttk.Button(bar5, text="CFL ×0,5", command=self.halve_cfl).pack(side="right", padx=4)
         bar3 = ttk.Frame(fr, padding=(4, 2))
@@ -1206,6 +1385,9 @@ class App(tk.Tk):
             for k, v in p.items():
                 self.cfl_vars[k].set(v)
 
+    # зона ограничителя Венкатакришнана (RansSolver.limiter_zone)
+    LIMITER_ZONES = {"у задних кромок": "te", "везде (как раньше)": "all", "нет": "off"}
+
     def solver_settings(self):
         """Параметры решателя RANS из окна (для RansSolver через solver_opts)."""
         num = lambda v: float(v.get().replace(",", "."))
@@ -1217,6 +1399,7 @@ class App(tk.Tk):
             raise ValueError("Невязки: CFL нач. > 0 и ≤ наибольшего, рост ≥ 1, откат при росте > 1")
         o["first_order"] = int(o["first_order"])
         o["prec_fill"] = int(self.prec_fill.get())
+        o["limiter_zone"] = self.LIMITER_ZONES.get(self.lim_zone.get(), "te")
         o["turb_model"] = self.TURB_MODELS[self.turb_model.get()]
         if o["turb_model"].endswith("aft"):
             try:
