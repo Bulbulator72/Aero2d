@@ -6,6 +6,9 @@
   full  (около часа): то же + GA(W)-1 с закрылком Фаулера 30°, α = 0…12° через 2°
          (7 углов): старт на грубой сетке, затем все углы параллельно на ядрах —
          сравнение с продувкой NASA CR-2443 и время на этом ПК.
+  rc    (1–2 часа): модель SA-RC (поправка на кривизну) — NACA 0012 α = 0° и 10° против
+         эталона NASA для SA-RC и механизация GA(W)-1 с закрылком 40° (α = 0, 5, 10°),
+         где SA расходится с опытом.
 Отчёт: benchmarks/verify_report.txt — его и нужно прислать.
 """
 from __future__ import annotations
@@ -103,11 +106,55 @@ def gaw():
     log(f"  всего {time.time() - t0:.0f} с")
 
 
+def rc():
+    import numpy as np
+    import gaw1_fowler as G
+    from aero2d.geometry import naca4, repanel
+    from aero2d.parallel import auto_workers
+    from aero2d.rans import Convergence, RansSolver, mesh_for, rans_polar
+    from aero2d.rans_mesh import build_mesh
+    REF = {0.0: (0.0, 0.00793), 10.0: (1.0947, 0.01179)}
+    af = repanel(naca4("0012", 200), 130)
+    mesh = build_mesh([af], re=6e6, far_radius=50)
+    log(f"\n--- SA-RC, NACA 0012, M 0,15, Re 6e6: сетка {mesh.n_cells} ячеек")
+    log("эталон NASA TMR для SA-RC (CFL3D): α=0: Cd 0,00793; α=10: Cl 1,0947, Cd 0,01179 "
+        "(для SA: Cd 0,00819; Cl 1,0909, Cd 0,01231)")
+    s = RansSolver(mesh, 0.15, 6e6)
+    s.turb_model = "sa-rc"
+    Q = None
+    for a in (0.0, 10.0):
+        t = time.time()
+        r = s.solve(a, Q0=Q, max_iter=400)
+        log(f"SA-RC α {a:4.1f}: Cl {r.cl:.4f} (эталон {REF[a][0]:.4f})  Cd {r.cd:.5f} (эталон {REF[a][1]:.5f})  "
+            f"итераций {r.iterations}, {r.status}, {time.time() - t:.0f} с")
+        Q = r.state
+    els = G.configuration(40, n_main=180, n_flap=100)
+    m40 = mesh_for(els, 5.0, G.RE)
+    e = G.EXP_CL[40]
+    log(f"\n--- SA-RC, GA(W)-1 + закрылок Фаулера 40°: сетка {m40.n_cells} ячеек")
+    log("  SA (прежний расчёт): Cl 2,649 / 3,274 / 3,736 при α = 0 / 5 / 10°; опыт 2,917 / 3,383 / 3,502")
+    t0 = time.time()
+
+    def cb(k, n, it, rn, r):
+        if r is not None:
+            ce = np.interp(r.alpha, e[:, 0], e[:, 1], right=np.nan)
+            log(f"  α {r.alpha:5.1f}: Cl {r.cl:.3f} (опыт {ce:.3f}), {r.status}, {time.time() - t0:.0f} с от начала")
+        return False
+    res, _ = rans_polar(els, [0.0, 5.0, 10.0], G.RE, mach=G.MACH, mesh=m40, xref=(0.25, 0.0), callback=cb,
+                        max_iter=400, conv=Convergence(), workers=auto_workers(), coarse_start=True,
+                        solver_opts={"turb_model": "sa-rc"})
+    for r in res:
+        if r is not None and hasattr(r, "elements"):
+            log(f"  итог α {r.alpha:5.1f}: Cl {r.cl:.3f} Cd {r.cd:.4f} осн. {r.elements[0]['cl']:.3f} "
+                f"закр. {r.elements[1]['cl']:.3f}, итераций {r.iterations}, {r.status}")
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "quick"
     header()
     t = time.time()
-    for name, fn in (("naca", naca), ("gaw", gaw)):
+    jobs = (("rc", rc),) if mode == "rc" else (("naca", naca), ("gaw", gaw))
+    for name, fn in jobs:
         if name == "gaw" and mode != "full":
             continue
         try:

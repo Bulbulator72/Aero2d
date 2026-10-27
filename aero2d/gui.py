@@ -167,14 +167,20 @@ class App(tk.Tk):
         ttk.Combobox(rc, textvariable=self.cores, width=6,
                      values=["авто"] + [str(n) for n in (1, 2, 4, 8, 12, 16, 24, 32) if n <= cpu_count()]
                      ).pack(side="left")
-        ttk.Radiobutton(f, text="RANS (Спаларт–Аллмарас): отрыв, Cl_max\n   механизации (медленно: минуты на угол)",
+        ttk.Radiobutton(f, text="RANS (Навье–Стокс + модель турбулентности):\n   отрыв, Cl_max механизации (минуты на угол)",
                         variable=self.method, value="rans").grid(row=11, column=0, columnspan=2, sticky="w",
                                                                  pady=(6, 0))
         ttk.Label(f, text="   Итераций на угол, не более:").grid(row=12, column=0, sticky="w")
         self.rans_iter = tk.StringVar(value="400")
         ttk.Entry(f, textvariable=self.rans_iter, width=8).grid(row=12, column=1, sticky="w")
+        rm = ttk.Frame(f)
+        rm.grid(row=13, column=0, columnspan=2, sticky="w")
+        ttk.Label(rm, text="   модель турбулентности").pack(side="left")
+        self.turb_model = tk.StringVar(value=list(self.TURB_MODELS)[0])
+        ttk.Combobox(rm, textvariable=self.turb_model, values=list(self.TURB_MODELS), state="readonly",
+                     width=26).pack(side="left")
         rp = ttk.Frame(f)
-        rp.grid(row=13, column=0, columnspan=2, sticky="w")
+        rp.grid(row=14, column=0, columnspan=2, sticky="w")
         ttk.Label(rp, text="   предобусловл. ILU(k), k =").pack(side="left")
         self.prec_fill = tk.StringVar(value="3")
         ttk.Combobox(rp, textvariable=self.prec_fill, values=["0", "1", "2", "3", "4"], state="readonly",
@@ -182,9 +188,9 @@ class App(tk.Tk):
         ttk.Label(rp, text=" (больше — быстрее)", foreground="#555").pack(side="left")
         self.coarse_start = tk.BooleanVar(value=True)
         ttk.Checkbutton(f, text="старт на грубой сетке (если > 20 тыс. ячеек)",
-                        variable=self.coarse_start).grid(row=14, column=0, columnspan=2, sticky="w", padx=(14, 0))
+                        variable=self.coarse_start).grid(row=15, column=0, columnspan=2, sticky="w", padx=(14, 0))
         ttk.Label(f, text="   сетка — «Сетка»; сходимость и шаг — «Невязки»", foreground="#555").grid(
-            row=15, column=0, columnspan=2, sticky="w")
+            row=16, column=0, columnspan=2, sticky="w")
 
         # --- кнопки
         f = ttk.Frame(left, padding=(0, 6))
@@ -1185,6 +1191,9 @@ class App(tk.Tk):
         self._live = None
         self._res_drawn = 0.0
 
+    TURB_MODELS = {"SA (Спаларт–Аллмарас)": "sa",
+                   "SA-RC (поправка на кривизну)": "sa-rc"}
+
     CFL_PRESETS = {"обычный": dict(cfl_start="5", cfl_limit="1e6", cfl_growth="1.25", first_order="30",
                                    rollback_factor="100"),
                    "осторожный": dict(cfl_start="2", cfl_limit="1e4", cfl_growth="1.1", first_order="60",
@@ -1207,6 +1216,7 @@ class App(tk.Tk):
             raise ValueError("Невязки: CFL нач. > 0 и ≤ наибольшего, рост ≥ 1, откат при росте > 1")
         o["first_order"] = int(o["first_order"])
         o["prec_fill"] = int(self.prec_fill.get())
+        o["turb_model"] = self.TURB_MODELS[self.turb_model.get()]
         return o
 
     def halve_cfl(self):

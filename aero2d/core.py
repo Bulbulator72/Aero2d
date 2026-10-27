@@ -467,7 +467,9 @@ def run_rans(af, alphas, mach: float, re: float, callback=None, max_iter: int = 
             xx.append(np.append(el["x"][o], nan)); cc.append(np.append(el["cp"][o], nan))
         xs_all.append(np.concatenate(xx)); cps_all.append(np.concatenate(cc))
     notes = [f"RANS: уравнения Навье–Стокса, осреднённые по Рейнольдсу, модель турбулентности "
-             f"Спаларта–Аллмараса; пограничный слой турбулентный от носка (переход не моделируется). "
+             f"Спаларта–Аллмараса" + (" с поправкой Спаларта–Шура на вращение и кривизну линий тока (SA-RC)"
+                                      if (solver_opts or {}).get("turb_model") == "sa-rc" else "") +
+             f"; пограничный слой турбулентный от носка (переход не моделируется). "
              f"Сетка gmsh: {mesh.n_cells} ячеек. Re = {re:.3g}, M = {mach:g}.",
              "Проверка: NACA 0012 (NASA TMR) и GA(W)-1 + закрылок Фаулера (CR-2443) — в README."]
     if m_note:
@@ -490,7 +492,9 @@ def run_rans(af, alphas, mach: float, re: float, callback=None, max_iter: int = 
         notes.append("Cl по элементам: " + "; ".join(
             f"{r.alpha:g}°: " + ", ".join(f"{e['cl']:.3f}" for e in r.elements) for r in res if r))
     nm = name or (elements[0].name if len(elements) == 1 else "многоэлементный")
-    return Polar(f"{nm}, RANS-SA, Re={re:.3g}, M={mach:g}", "rans", mach, alphas, cl, cd, cm, ok,
+    tm = (solver_opts or {}).get("turb_model", "sa")
+    tname = {"sa": "SA", "sa-rc": "SA-RC"}.get(tm, tm.upper())
+    return Polar(f"{nm}, RANS-{tname}, Re={re:.3g}, M={mach:g}", "rans", mach, alphas, cl, cd, cm, ok,
                  xs_all, cps_all, notes, re=re, cdf=cdf,
                  field_ctx=dict(method="rans", mesh=mesh, elements=elements, mach=mach, re=re, chord=chord,
                                 alpha=alphas, states=[r.state if r else None for r in res],

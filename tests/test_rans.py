@@ -133,3 +133,17 @@ def test_transfer_state_between_meshes():
     Q = np.asarray(s.cons(s.jnp.asarray(np.tile(s.freestream(3.0), (coarse.n_cells, 1)))))
     Qf = transfer_state(coarse, Q, fine)
     assert Qf.shape == (fine.n_cells, 5) and np.all(np.isfinite(Qf)) and np.all(Qf[:, 0] > 0)
+
+
+@pytest.mark.skipif(gmsh_missing, reason="нет gmsh")
+def test_sa_rc_factor_near_one_in_boundary_layer():
+    from aero2d.rans import RansSolver
+    from aero2d.rans_mesh import build_mesh
+    m = build_mesh([repanel(naca4("0012", 120), 60)], re=1e6, far_radius=20)
+    s = RansSolver(m, 0.15, 1e6)
+    r = s.solve(2.0, max_iter=60)
+    s.turb_model = "sa-rc"
+    w = s.prim(s.jnp.asarray(r.state))
+    f = np.asarray(s.fr1(w, s.gradients(w, s._wall_values(w))))
+    k = (m.wall_dist < 1e-3) & (m.centroid[:, 0] > 0.05) & (m.centroid[:, 0] < 0.95)
+    assert 0.95 < np.median(f[k]) < 1.05 and f.min() >= 0 and f.max() <= 1.25

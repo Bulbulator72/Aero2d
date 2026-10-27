@@ -115,6 +115,8 @@ class RansSolver:
         self.cfl_mode = "grow"
         self.cfl_growth = 1.25
         self.conv = Convergence()      # критерий перехода к следующему углу
+        self.rc_smooth = 2             # SA-RC: проходов сглаживания r̃
+        self.turb_model = "sa"         # "sa" — SA-neg; "sa-rc" — с поправкой на кривизну линий тока
         # шаг по псевдовремени и защита от развала
         self.cfl_start = 5.0           # CFL первой итерации
         self.cfl_limit = 1e6           # наибольший CFL
@@ -300,7 +302,43 @@ class RansSolver:
         fs = (mu + rho * chi * self.nu_inf * fn) / SIG * (gc[:, 0] * nx + gc[:, 1] * ny)
         return jnp.stack([jnp.zeros_like(fx), fx, fy, fe, fs], 1)
 
-    def sa_source(self, w, g, wd):
+    def fr1(self, w, g):
+        """Поправка Спаларта–Шура на вращение и кривизну линий тока (SA-RC):
+        множитель f_r1 к порождению. r* = S/W, r̃ = 2 W_ik S_jk (DS_ij/Dt) / D⁴,
+        D² = (S² + W²)/2; c_r1 = 1, c_r2 = 12, c_r3 = 1 (NASA TMR)."""
+        jnp = self.jnp
+        u, v = w[:, 1], w[:, 2]
+        s11, s22 = g[:, 1, 0], g[:, 2, 1]
+        s12 = 0.5 * (g[:, 1, 1] + g[:, 2, 0])
+        w12 = 0.5 * (g[:, 1, 1] - g[:, 2, 0])
+        gs = self._lsq(jnp.stack([s11, s22, s12], 1))          # (nc,3,2)
+        d11 = u * gs[:, 0, 0] + v * gs[:, 0, 1]
+        d22 = u * gs[:, 1, 0] + v * gs[:, 1, 1]
+        d12 = u * gs[:, 2, 0] + v * gs[:, 2, 1]
+        S2 = 2 * (s11 ** 2 + s22 ** 2 + 2 * s12 ** 2)
+        W2 = 4 * w12 ** 2
+        D2 = 0.5 * (S2 + W2) + 1e-30
+        rs = jnp.sqrt(S2) / jnp.sqrt(W2 + 1e-30)
+        rt = 2 * w12 * (s12 * (d11 - d22) + d12 * (s22 - s11)) / D2 ** 2
+        # вторые производные МНК на неструктурированной сетке шумят — сгладить r̃
+        # усреднением по соседям через грани (rc_smooth проходов)
+        J = self.J
+        cnt = jnp.ones(self.nc).at[J["iL"]].add(1.0).at[J["iR"]].add(1.0)
+        for _ in range(int(self.rc_smooth)):
+            rt = (rt + jnp.zeros(self.nc).at[J["iL"]].add(rt[J["iR"]]).at[J["iR"]].add(rt[J["iL"]])) / cnt
+        f = 2.0 * 2 * rs / (1 + rs) * (1 - jnp.arctan(12.0 * rt)) - 1.0
+        return jnp.clip(f, 0.0, 1.25)
+
+    def _lsq(self, f):
+        """Градиенты МНК произвольных величин в ячейках (на стенке — значение ячейки)."""
+        jnp = self.jnp
+        J = self.J
+        d = f[J["iR"]] - f[J["iL"]]
+        contrib = J["w_i"][:, None, None] * d[:, :, None] * J["d_i"][:, None, :]
+        rhs = jnp.zeros((self.nc, f.shape[1], 2)).at[J["iL"]].add(contrib).at[J["iR"]].add(contrib)
+        return jnp.einsum("cij,ckj->cki", J["Minv"], rhs)
+
+    def sa_source(self, w, g, wd, fr1=None):
         """Источник SA на единицу объёма в переменных ρχ: ρ(P − D)/ν∞ + (cb2/σ)ρ ν∞|∇χ|²."""
         jnp = self.jnp
         rho, u, v, p, chi = (w[:, k] for k in range(5))
@@ -316,7 +354,7 @@ class RansSolver:
         r = jnp.minimum(nut / (St * KAP**2 * wd**2), 10.0)
         gg = r + CW2 * (r**6 - r)
         fw = gg * ((1 + CW3**6) / (gg**6 + CW3**6)) ** (1.0 / 6.0)
-        prod = jnp.where(chi >= 0, CB1 * St * chi, CB1 * Om * chi)
+        prod = jnp.where(chi >= 0, CB1 * St * chi * (1.0 if fr1 is None else fr1), CB1 * Om * chi)
         dest = jnp.where(chi >= 0, CW1 * fw * nut * chi / wd**2, -CW1 * nut * chi / wd**2)
         cross = CB2 / SIG * self.nu_inf * (g[:, 4, 0] ** 2 + g[:, 4, 1] ** 2)
         return rho * (prod - dest + cross)
@@ -440,7 +478,8 @@ class RansSolver:
         # источник SA
         if not self.turbulent:                 # ламинарный расчёт: ρχ ≡ 0
             return Rs.at[:, 4].set(Q[:, 4] * J["vol"])
-        S = self.sa_source(w, gr if self.sa_raw_grad else g, J["wd"])
+        gs_ = gr if self.sa_raw_grad else g
+        S = self.sa_source(w, gs_, J["wd"], self.fr1(w, gr) if self.turb_model == "sa-rc" else None)
         Rs = Rs.at[:, 4].add(-S * J["vol"])
         return Rs
 
@@ -514,9 +553,11 @@ class RansSolver:
         w = self.prim(Q)
         g = self.gradients(w, self._wall_values(w))
 
-        def src(q, gi, wd):
-            return self.sa_source(self.prim(q[None]), gi[None], wd[None])[0]
-        js = jax.vmap(jax.grad(src))(Q, g, J["wd"])            # (nc,5)
+        f1 = self.fr1(w, g) if self.turb_model == "sa-rc" else jnp.ones(self.nc)
+
+        def src(q, gi, wd, f):
+            return self.sa_source(self.prim(q[None]), gi[None], wd[None], f[None])[0]
+        js = jax.vmap(jax.grad(src))(Q, g, J["wd"], f1)            # (nc,5)
         return jl, jr, jw, jf, js
 
     def jac1(self, Q, winf, gam, dt):
