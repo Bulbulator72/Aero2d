@@ -24,6 +24,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import os
+
 import numpy as np
 
 GAM = 1.4
@@ -48,6 +50,38 @@ class RansResult:
     residual: list = field(default_factory=list)
     elements: list = field(default_factory=list)    # по элементам: x, cp, cf (по граням стенки)
     state: object = None
+    status: str = ""                                # «сошлось», «не сошлось», «принято вручную», …
+    history: dict = field(default_factory=dict)     # невязки по уравнениям, Cl, Cd по итерациям
+
+
+@dataclass
+class Convergence:
+    """Критерий перехода к следующему углу атаки.
+
+    Угол считается сошедшимся, когда последние `hold` итераций подряд
+    невязка не выше 10^(−orders) от опорной (наибольшей за расчёт на этой
+    сетке) и за эти итерации Cl меняется меньше чем на cl_tol (доля от |Cl|),
+    а Cd — меньше чем на cd_tol (абсолютно).
+    stall_ok: если невязка упала хотя бы на 2 порядка и перестала падать
+    («застряла» в нескольких ячейках), а силы стоят max(hold, 30) итераций, —
+    тоже считать сошедшимся."""
+    orders: float = 3.0
+    hold: int = 20
+    cl_tol: float = 2e-4
+    cd_tol: float = 2e-5
+    stall_ok: bool = True
+
+
+class RansControl:
+    """Связь с окном программы во время расчёта: monitor(info) вызывается
+    на каждой итерации (info — словарь: alpha, it, res — невязки 5 уравнений,
+    rn, cl, cd, cfl, rref); skip=True — принять текущий угол и перейти к
+    следующему; stop=True — прекратить расчёт поляры."""
+
+    def __init__(self, monitor=None):
+        self.monitor = monitor
+        self.skip = False
+        self.stop = False
 
 
 def _jnp():
@@ -74,7 +108,7 @@ class RansSolver:
         self.limiter_k = 5.0
         self.cfl_mode = "grow"
         self.cfl_growth = 1.25
-        self.force_tol = 2e-4          # сходимость по силам (None — только по невязке)
+        self.conv = Convergence()      # критерий перехода к следующему углу
         self.sa_raw_grad = False       # True: источник SA по неограниченным градиентам (на механизации хуже сходится)
         self.visc_raw_grad = False     # True: вязкие потоки по неограниченным градиентам
         self.freeze_limiter = True     # заморозка ограничителя при застое невязки
@@ -562,9 +596,10 @@ class RansSolver:
 
     # ------------------------------------------------------------------
     def solve(self, alpha, Q0=None, max_iter=300, tol=1e-7, cfl0=5.0, cfl_max=1e6, first_order_iters=30,
-              verbose=False, callback=None, gmres_tol=0.01, gmres_iter=60):
-        """Установление до падения невязки в tol·(начальная) или до max_iter
-        итераций Ньютона."""
+              verbose=False, callback=None, gmres_tol=0.01, gmres_iter=60, conv=None, control=None):
+        """Установление до выполнения критерия conv (Convergence; по умолчанию —
+        self.conv) или до max_iter итераций Ньютона. control — RansControl."""
+        crit = conv or self.conv
         import scipy.sparse.linalg as spla
         jax, jnp = self.jax, self.jnp
         winf = self.freestream(alpha)
@@ -600,9 +635,15 @@ class RansSolver:
         cfl = cfl0
         self._last_ok, self._last_lin = True, 0.0
         fh = []
+        H = dict(it=[], res=[], rn=[], cl=[], cd=[], cfl=[])
         conv = False
+        status = ""
         it = 0
         for it in range(1, max_iter + 1):
+            if control is not None and (control.skip or control.stop):
+                status = "принято вручную" if control.skip else "остановлено"
+                control.skip = False
+                break
             order = 1 if it <= first_order_iters and Q0 is None else self.order
             if order == 1:
                 resf, jvpf = res1, jvp1
@@ -615,20 +656,30 @@ class RansSolver:
             R = np.asarray(resf(Qj, winf_j, gm))
             rn = float(np.sqrt(np.mean((R / self.vol[:, None]) ** 2, 0)).sum())
             if not np.isfinite(rn):
+                status = "расходится"
                 break
             if r0 is None or (order == 2 and len(hist) and hist[-1][1] == 1):
                 r0 = rn
             hist.append((rn, order))
+            fr_ = self.forces(Q, alpha)
+            req = np.sqrt(np.mean((R / self.vol[:, None]) ** 2, 0))
+            for k_, v_ in (("it", it), ("res", req), ("rn", rn), ("cl", fr_["cl"]), ("cd", fr_["cd"]),
+                           ("cfl", cfl)):
+                H[k_].append(v_)
+            if order == 2:
+                self._rref = max(getattr(self, "_rref", 0.0), rn)
+            if control is not None and control.monitor is not None:
+                control.monitor(dict(alpha=alpha, it=it, res=req, rn=rn, cl=fr_["cl"], cd=fr_["cd"], cfl=cfl,
+                                     rref=getattr(self, "_rref", rn), order=order))
             if order == 2 and rn < tol * r0:
                 conv = True
                 break
-            # инженерная сходимость по силам. Опорная невязка — наибольшая за все
+            # критерий сходимости (Convergence). Опорная невязка — наибольшая за все
             # расчёты на этом решателе (у тёплого старта своя невязка мала).
-            if order == 2 and self.force_tol:
-                fr_ = self.forces(Q, alpha)
+            if order == 2:
                 fh.append((fr_["cl"], fr_["cd"]))
                 o2 = [h[0] for h in hist if h[1] == 2]
-                self._rref = max(getattr(self, "_rref", 0.0), max(o2))
+                rref = self._rref
                 stalled = len(o2) > 60 and min(o2[-30:]) > 0.5 * min(o2[:-30])
 
                 def steady(win, tol_cl, tol_cd):
@@ -638,12 +689,14 @@ class RansSolver:
                     cds = [f[1] for f in fh[-win - 1:]]
                     return (max(cls) - min(cls) < tol_cl * max(0.2, abs(fh[-1][0]))
                             and max(cds) - min(cds) < tol_cd)
-                ft = self.force_tol
-                # (а) невязка упала на 4 порядка, силы стоят 10 итераций;
-                # (б) невязка упала на 2 порядка или «застряла», силы стоят 30 итераций
-                if ((rn < 1e-4 * self._rref and steady(10, ft, 0.1 * ft))
-                        or (len(o2) > 40 and (rn < 1e-2 * self._rref or stalled) and steady(30, ft, 0.1 * ft))):
-                    conv = True
+                hold = max(1, int(crit.hold))
+                lvl = 10.0 ** (-crit.orders) * rref
+                if len(o2) >= hold and max(o2[-hold:]) <= lvl and steady(hold, crit.cl_tol, crit.cd_tol):
+                    conv, status = True, "сошлось"
+                    break
+                if (crit.stall_ok and len(o2) > 40 and stalled and rn < 1e-2 * rref
+                        and steady(max(hold, 30), crit.cl_tol, crit.cd_tol)):
+                    conv, status = True, "сошлось (невязка застряла, силы установились)"
                     break
                 # застой невязки при почти установившихся силах — заморозить ограничитель
                 # («дребезг» ограничителя в нескольких ячейках не даёт невязке падать)
@@ -732,8 +785,13 @@ class RansSolver:
             if callback and callback(it, rn):
                 break
         fr = self.forces(Q, alpha)
+        if not status:
+            status = "сошлось" if conv else ("расходится" if hist and not np.isfinite(hist[-1][0])
+                                             else "не сошлось за отведённые итерации")
+        H = {k_: np.array(v_) for k_, v_ in H.items()}
+        H["rref"] = float(getattr(self, "_rref", 0.0) or (max(H["rn"]) if len(H["rn"]) else 1.0))
         return RansResult(alpha, fr["cl"], fr["cd"], fr["cdp"], fr["cdf"], fr["cm"], conv, it,
-                          [h[0] for h in hist], fr["elements"], Q)
+                          [h[0] for h in hist], fr["elements"], Q, status, H)
 
 
 def wake_lines(elements, alpha, re, chord=1.0, length=0.6):
@@ -752,52 +810,207 @@ def wake_lines(elements, alpha, re, chord=1.0, length=0.6):
         return None
 
 
-def mesh_for(elements, alpha, re, chord=1.0, fine=False):
-    """Сетка RANS: для механизации — сгущение в щелях и по следам."""
-    from .rans_mesh import build_mesh
+def mesh_for(elements, alpha, re, chord=1.0, fine=False, opts=None):
+    """Сетка RANS по параметрам opts (MeshOptions; по умолчанию — автоматические).
+    Для механизации — сгущение в щелях и по линиям следа невязкого решения при угле alpha."""
+    from .rans_mesh import MeshOptions, build_mesh
+    from .geometry import repanel
+    o = opts or MeshOptions()
     multi = len(elements) > 1
-    opts = dict(wakes=wake_lines(elements, alpha, re, chord),
-                wake_size=(0.006 if fine else 0.008), slot_size=(0.002 if fine else 0.003)) if multi else {}
-    return build_mesh(elements, chord=chord, re=re, **opts)
+    els = elements
+    if o.n_surface and o.n_surface > 10:
+        cmax = max(float(np.ptp(e.x)) for e in elements)
+        els = [repanel(e, max(20, int(round(o.n_surface * float(np.ptp(e.x)) / cmax))), keep_frame=True)
+               for e in elements]
+    near = o.near_size or ((0.002 if fine else 0.003) if multi else 0.004)
+    kw = dict(yplus=o.yplus, ratio=o.ratio, bl_thickness=(o.bl_thickness or None), far_radius=o.far_radius,
+              far_size=o.far_size, slot_size=near * chord, growth=o.growth)
+    if multi and o.wake_refine:
+        kw.update(wakes=wake_lines(els, alpha, re, chord, length=o.wake_length),
+                  wake_size=(0.006 if fine else o.wake_size))
+    return build_mesh(els, chord=chord, re=re, **kw)
+
+
+def _seq_order(alphas):
+    """Порядок счёта: от угла, ближайшего к нулю, в обе стороны."""
+    order = np.argsort(alphas, kind="stable")
+    i0 = int(np.argmin(np.abs(alphas[order])))
+    return list(order[i0:]) + list(order[:i0][::-1])
+
+
+def _solve_sequence(solver, alphas, idx, states, out, max_iter, verbose, conv, control, on_iter, on_done):
+    """Углы idx по порядку, каждый — от ближайшего посчитанного (states)."""
+    for i in idx:
+        Q = None
+        if states:
+            j = min(states, key=lambda jj: abs(alphas[jj] - alphas[i]))
+            Q = states[j]
+        r = solver.solve(float(alphas[i]), Q0=Q, max_iter=max_iter, verbose=verbose,
+                         callback=(lambda it, rn: on_iter(i, it, rn)), conv=conv, control=control)
+        out[i] = r
+        if r.converged or r.status == "принято вручную" or (not states and Q is None):
+            states[i] = r.state
+        if on_done(i, r) or (control is not None and control.stop):
+            return True
+    return False
+
+
+class _ProcControl(RansControl):
+    """RansControl внутри процесса-исполнителя: монитор — в общую очередь,
+    «следующий угол» и «стоп» — через общие флаги."""
+
+    def __init__(self, queue, skip_gen, stop_ev):
+        super().__init__(monitor=lambda d: queue.put(("iter", d)))
+        self._q, self._gen, self._stop = queue, skip_gen, stop_ev
+        self._seen = skip_gen.value
+
+    @property
+    def skip(self):
+        g = self._gen.value
+        if g != self._seen:
+            self._seen = g
+            return True
+        return False
+
+    @skip.setter
+    def skip(self, v):
+        pass
+
+    @property
+    def stop(self):
+        return self._stop.is_set()
+
+    @stop.setter
+    def stop(self, v):
+        pass
+
+
+def _rans_chunk(args):
+    """Исполнитель: часть поляры в отдельном процессе."""
+    import warnings
+    warnings.filterwarnings("ignore")
+    (mesh, mach, re, chord, xref, alphas, idx, Q0, rref, max_iter, conv, queue, skip_gen, stop_ev) = args
+    solver = RansSolver(mesh, mach, re, chord=chord, xref=xref)
+    solver._rref = rref
+    ctl = _ProcControl(queue, skip_gen, stop_ev)
+    out = [None] * len(alphas)
+    st = {}
+    for i in idx:
+        # каждый следующий угол — от ближайшего посчитанного в этом куске, первый — от Q0
+        Q = st[min(st, key=lambda jj: abs(alphas[jj] - alphas[i]))] if st else Q0
+        r = solver.solve(float(alphas[i]), Q0=Q, max_iter=max_iter, conv=conv, control=ctl)
+        out[i] = r
+        if r.converged or r.status == "принято вручную":
+            st[i] = r.state
+        queue.put(("done", i, r.alpha, r.cl, r.status))
+        if ctl.stop:
+            break
+    return [(i, out[i]) for i in idx if out[i] is not None]
 
 
 def rans_polar(elements, alphas, re, mach=0.15, chord=1.0, xref=None, mesh=None, callback=None,
-               max_iter=250, verbose=False):
+               max_iter=250, verbose=False, conv=None, control=None, workers=1):
     """Поляра RANS для одно- или многоэлементного профиля: сетка строится один
     раз (сгущение по линиям следа невязкого решения при среднем угле), углы
-    атаки считаются по возрастанию, каждый — от решения предыдущего.
-    callback(k, n, it, res, result_or_None) -> True для остановки."""
+    атаки считаются от ближайшего к нулю в обе стороны, каждый — от решения
+    ближайшего посчитанного.
+    workers > 1: первый угол считается здесь, остальные делятся на непрерывные
+    куски и считаются одновременно в отдельных процессах (каждый кусок стартует
+    от решения первого угла).
+    callback(k, n, it, res, result_or_None) -> True для остановки.
+    conv — критерий сходимости (Convergence), control — RansControl (монитор
+    итераций, «следующий угол», остановка)."""
     alphas = np.asarray(alphas, float)
     if mesh is None:
         mesh = mesh_for(elements, float(np.median(alphas)), re, chord)
     xs = np.concatenate([e.x for e in elements])
     xr = xref if xref is not None else (float(xs.min()) + 0.25 * chord, 0.0)
     solver = RansSolver(mesh, mach, re, chord=chord, xref=xr)
-    order = np.argsort(alphas, kind="stable")
-    # начать с угла, ближайшего к нулю, дальше — в обе стороны
-    i0 = int(np.argmin(np.abs(alphas[order])))
-    seq = list(order[i0:]) + list(order[:i0][::-1])
-    out = [None] * len(alphas)
+    seq = _seq_order(alphas)
+    n = len(alphas)
+    out = [None] * n
     states = {}
-    stop = False
-    for k, i in enumerate(seq):
-        # тёплый старт — от ближайшего сошедшегося угла
-        Q = None
-        if states:
-            j = min(states, key=lambda jj: abs(alphas[jj] - alphas[i]))
-            Q = states[j]
+    count = [0]
 
-        def cb(it, rn, k=k):
-            nonlocal stop
-            if callback and callback(k, len(alphas), it, rn, None):
-                stop = True
-            return stop
-        r = solver.solve(float(alphas[i]), Q0=Q, max_iter=max_iter, verbose=verbose, callback=cb)
-        out[i] = r
-        if r.converged:
-            states[i] = r.state
-        elif not states and Q is None:
-            states[i] = r.state
-        if stop or (callback and callback(k + 1, len(alphas), 0, 0.0, r)):
-            break
+    def on_iter(i, it, rn):
+        return bool(callback and callback(count[0], n, it, rn, None))
+
+    def on_done(i, r):
+        count[0] += 1
+        return bool(callback and callback(count[0], n, 0, 0.0, r))
+    workers = int(max(1, min(workers, n - 1)))
+    if workers <= 1:
+        _solve_sequence(solver, alphas, seq, states, out, max_iter, verbose, conv, control, on_iter, on_done)
+        return out, mesh
+    # --- первый угол здесь, остальные — параллельно
+    stop = _solve_sequence(solver, alphas, seq[:1], states, out, max_iter, verbose, conv, control, on_iter, on_done)
+    if stop:
+        return out, mesh
+    i0 = seq[0]
+    Q0 = states.get(i0, out[i0].state)
+    rest = seq[1:]
+    up = [i for i in rest if alphas[i] >= alphas[i0]]
+    dn = [i for i in rest if alphas[i] < alphas[i0]]
+    # куски пропорционально числу углов в каждую сторону
+    w_up = int(round(workers * len(up) / len(rest))) if up else 0
+    w_up = min(max(w_up, 1 if up else 0), len(up))
+    w_dn = min(max(workers - w_up, 1 if dn else 0), len(dn))
+    chunks = [list(c) for c in np.array_split(up, w_up) if len(c)] if up else []
+    chunks += [list(c) for c in np.array_split(dn, w_dn) if len(c)] if dn else []
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor, FIRST_COMPLETED, wait
+    from .parallel import cpu_count
+    ctx = mp.get_context("spawn")
+    mgr = ctx.Manager()
+    queue, skip_gen, stop_ev = mgr.Queue(), mgr.Value("i", 0), mgr.Event()
+    rref = getattr(solver, "_rref", 0.0)
+    # потоки XLA: на каждый процесс — своя доля ядер
+    keep = os.environ.get("XLA_FLAGS")
+    per = max(1, cpu_count() // len(chunks))
+    if per <= 2:
+        os.environ["XLA_FLAGS"] = ((keep or "") + " --xla_cpu_multi_thread_eigen=false").strip()
+    try:
+        with ProcessPoolExecutor(len(chunks), mp_context=ctx) as ex:
+            futs = [ex.submit(_rans_chunk, (mesh, mach, re, chord, xr, alphas, c, Q0, rref, max_iter, conv,
+                                            queue, skip_gen, stop_ev)) for c in chunks]
+            pending = set(futs)
+            last_skip = False
+            while pending:
+                done, pending = wait(pending, timeout=0.3, return_when=FIRST_COMPLETED)
+                for f in done:
+                    for i, r in f.result():
+                        out[i] = r
+                while True:
+                    try:
+                        msg = queue.get_nowait()
+                    except Exception:                       # noqa: BLE001
+                        break
+                    if msg[0] == "iter":
+                        d = msg[1]
+                        if control is not None and control.monitor is not None:
+                            control.monitor(d)
+                        if callback and callback(count[0], n, d["it"], d["rn"], None):
+                            stop_ev.set()
+                    elif msg[0] == "done":
+                        count[0] += 1
+                        if callback:
+                            class _R:                       # лёгкая сводка для строки состояния
+                                pass
+                            rr = _R()
+                            rr.alpha, rr.cl, rr.status = msg[2], msg[3], msg[4]
+                            if callback(count[0], n, 0, 0.0, rr):
+                                stop_ev.set()
+                if control is not None:
+                    if control.stop:
+                        stop_ev.set()
+                    if control.skip and not last_skip:
+                        skip_gen.value += 1
+                        control.skip = False
+                    last_skip = False
+    finally:
+        if keep is None:
+            os.environ.pop("XLA_FLAGS", None)
+        else:
+            os.environ["XLA_FLAGS"] = keep
+        mgr.shutdown()
     return out, mesh

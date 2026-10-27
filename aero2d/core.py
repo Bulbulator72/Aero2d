@@ -401,17 +401,20 @@ def run_multi_viscous_batch(elements, alphas, mach: float, re_list, ncrit: float
 
 
 def run_rans(af, alphas, mach: float, re: float, callback=None, max_iter: int = 250,
-             name: str | None = None, chord=None) -> Polar:
+             name: str | None = None, chord=None, mesh=None, mesh_opts=None, conv=None,
+             control=None, workers: int = 1) -> Polar:
     """RANS (Навье–Стокс + Спаларт–Аллмарас, полностью турбулентный) для профиля
     или механизации (список элементов). Медленно, но описывает отрыв и слияние
-    следов в щелях — для Cl_max механизации. callback(text, fraction) -> True для остановки."""
+    следов в щелях — для Cl_max механизации. callback(text, fraction) -> True для остановки.
+    mesh — готовая сетка (иначе строится по mesh_opts: rans_mesh.MeshOptions);
+    conv — rans.Convergence; control — rans.RansControl (монитор итераций, «следующий угол»)."""
     try:
         import gmsh  # noqa: F401
     except (ImportError, OSError) as e:
         raise ValueError("Для RANS нужен генератор сеток gmsh: pip install gmsh (в офлайн-комплекте "
                          "ставится файлом 2_install_WINDOWS_cpu.bat; в Linux/WSL ещё нужны библиотеки "
                          f"libGLU, libXcursor, libXft, libXinerama). Ошибка: {e}") from None
-    from .rans import rans_polar
+    from .rans import mesh_for, rans_polar
     elements = af if isinstance(af, list) else [af]
     if not 1e5 <= re <= 1e9:
         raise ValueError("RANS — при Re от 1e5 до 1e9 (модель полностью турбулентная)")
@@ -424,27 +427,30 @@ def run_rans(af, alphas, mach: float, re: float, callback=None, max_iter: int = 
     alphas = np.asarray(alphas, float)
     if not chord:
         chord = float(max(np.max(e.x) for e in elements) - min(np.min(e.x) for e in elements))
-    if callback:
-        callback("Построение сетки (gmsh)…", 0.0)
+    if mesh is None:
+        if callback:
+            callback("Построение сетки (gmsh)…", 0.0)
+        mesh = mesh_for(elements, float(np.median(alphas)), re, chord, opts=mesh_opts)
     n = len(alphas)
 
     def cb(k, n_, it, rn, r):
         if callback is None:
             return False
         if r is not None:
-            txt = f"α = {r.alpha:g}°: Cl = {r.cl:.3f}, {'сошлось' if r.converged else 'НЕ сошлось'}"
+            txt = f"α = {r.alpha:g}°: Cl = {r.cl:.3f}, {r.status}"
         else:
-            txt = (f"Угол {k + 1} из {n}: итерация {it}/{max_iter}, невязка {rn:.2e} "
-                   f"(первая итерация включает компиляцию)")
+            txt = (f"Готово углов {k} из {n}; идёт итерация {it}/{max_iter}, невязка {rn:.2e} "
+                   f"(первая итерация каждого процесса включает компиляцию)")
         return callback(txt, min(1.0, (k + (it / max_iter if r is None else 0)) / n))
-    res, mesh = rans_polar(elements, alphas, re, mach=mach, chord=chord, callback=cb, max_iter=max_iter)
+    res, mesh = rans_polar(elements, alphas, re, mach=mach, chord=chord, callback=cb, max_iter=max_iter,
+                           mesh=mesh, conv=conv, control=control, workers=workers)
     done = np.array([r is not None for r in res])
     nan = float("nan")
     cl = np.array([r.cl if r else nan for r in res])
     cd = np.array([r.cd if r else nan for r in res])
     cdf = np.array([r.cdf if r else nan for r in res])
     cm = np.array([r.cm if r else nan for r in res])
-    ok = np.array([bool(r and r.converged) for r in res])
+    ok = np.array([bool(r and (r.converged or r.status == "принято вручную")) for r in res])
     # Cp вдоль контура каждого элемента (грани стенки — по порядку точек контура)
     from scipy.spatial import cKDTree
     xs_all, cps_all = [], []
@@ -460,22 +466,29 @@ def run_rans(af, alphas, mach: float, re: float, callback=None, max_iter: int = 
         xs_all.append(np.concatenate(xx)); cps_all.append(np.concatenate(cc))
     notes = [f"RANS: уравнения Навье–Стокса, осреднённые по Рейнольдсу, модель турбулентности "
              f"Спаларта–Аллмараса; пограничный слой турбулентный от носка (переход не моделируется). "
-             f"Сетка gmsh: {mesh.n_cells} ячеек, у стенки y⁺ ≈ 1. Re = {re:.3g}, M = {mach:g}.",
+             f"Сетка gmsh: {mesh.n_cells} ячеек. Re = {re:.3g}, M = {mach:g}.",
              "Проверка: NACA 0012 (NASA TMR) и GA(W)-1 + закрылок Фаулера (CR-2443) — в README."]
     if m_note:
         notes.append(m_note)
     if not done.all():
         notes.append("Расчёт остановлен: часть углов не посчитана.")
+    if workers > 1 and n > 1:
+        notes.append(f"Углы считались параллельно: до {min(workers, n - 1)} процессов (первый угол — отдельно, "
+                     "остальные куски стартуют от его решения).")
+    notes.append("Итог по углам: " + "; ".join(f"{r.alpha:g}° — {r.status}, {r.iterations} итер." for r in res if r))
     bad = done & ~ok
     if bad.any():
-        notes.append(f"Не сошлись за {max_iter} итераций: α = {', '.join(f'{a:g}' for a in alphas[bad])}° "
-                     "(за Cl_max течение может быть нестационарным).")
+        notes.append(f"Не сошлись: α = {', '.join(f'{a:g}' for a in alphas[bad])}° "
+                     "(за Cl_max течение может быть нестационарным; ход невязок — вкладка «Невязки»).")
     if len(elements) > 1:
         notes.append("Cl по элементам: " + "; ".join(
             f"{r.alpha:g}°: " + ", ".join(f"{e['cl']:.3f}" for e in r.elements) for r in res if r))
     nm = name or (elements[0].name if len(elements) == 1 else "многоэлементный")
     return Polar(f"{nm}, RANS-SA, Re={re:.3g}, M={mach:g}", "rans", mach, alphas, cl, cd, cm, ok,
-                 xs_all, cps_all, notes, re=re, cdf=cdf)
+                 xs_all, cps_all, notes, re=re, cdf=cdf,
+                 field_ctx=dict(method="rans", mesh=mesh, elements=elements, mach=mach, re=re, chord=chord,
+                                alpha=alphas, states=[r.state if r else None for r in res],
+                                history=[r.history if r else None for r in res]))
 
 
 class _Stop(Exception):

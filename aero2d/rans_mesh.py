@@ -35,9 +35,38 @@ class Mesh:
         return len(self.volume)
 
 
+@dataclass
+class MeshOptions:
+    """Параметры сетки RANS (значение 0 — подобрать автоматически).
+
+    yplus        — y⁺ первой ячейки у стенки (1 — для модели SA без пристеночных функций);
+    ratio        — рост высоты ячеек в слое четырёхугольников;
+    bl_thickness — толщина слоя четырёхугольников, доли хорды (авто: 0,02, но
+                   не больше 0,3 наименьшей щели между элементами);
+    n_surface    — точек на сторону основного элемента (у остальных — пропорционально
+                   хорде; 0 — как в исходном контуре);
+    near_size    — размер треугольников у стенок и в щелях, доли хорды
+                   (авто: 0,004 — один профиль, 0,003 — механизация);
+    growth       — рост размера треугольников с расстоянием от стенки (доля расстояния);
+    wake_refine  — сгущение по линиям следа (для механизации);
+    wake_size    — размер ячеек на линии следа; wake_length — длина сгущения за кромкой;
+    far_radius   — радиус внешней границы, хорд; far_size — размер ячеек на ней, хорд."""
+    yplus: float = 1.0
+    ratio: float = 1.2
+    bl_thickness: float = 0.0
+    n_surface: int = 0
+    near_size: float = 0.0
+    growth: float = 0.25
+    wake_refine: bool = True
+    wake_size: float = 0.008
+    wake_length: float = 0.6
+    far_radius: float = 50.0
+    far_size: float = 8.0
+
+
 def build_mesh(elements, chord=1.0, re=1e6, yplus=1.0, ratio=1.2, bl_thickness=None,
                far_radius=50.0, far_size=8.0, surf_ratio=1.0, wakes=None, wake_size=0.01,
-               slot_size=None, verbose=False):
+               slot_size=None, verbose=False, growth=0.25):
     """elements — список Airfoil (обход: ЗК → верх → носок → низ → ЗК), в общей
     системе координат; Re — по хорде chord. Первый шаг у стенки — по оценке
     y⁺ = yplus для турбулентной пластины (Cf ≈ 0,026 Re^(−1/7)).
@@ -112,7 +141,7 @@ def build_mesh(elements, chord=1.0, re=1e6, yplus=1.0, ratio=1.2, bl_thickness=N
         gmsh.model.mesh.field.setNumber(fd, "Sampling", 20)
         fm = gmsh.model.mesh.field.add("MathEval")
         smin = 0.004 * chord if slot_size is None else slot_size
-        gmsh.model.mesh.field.setString(fm, "F", f"{smin} + 0.25*F{fd}")
+        gmsh.model.mesh.field.setString(fm, "F", f"{smin} + {growth}*F{fd}")
         fields.append(fm)
         if wakes:
             wpts = []

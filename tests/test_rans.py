@@ -77,3 +77,22 @@ def test_mesh_in_worker_thread():
     t.start()
     t.join()
     assert "err" not in out and out["n"] > 1000
+
+
+def test_polar_order_and_convergence_defaults():
+    from aero2d.rans import Convergence, _seq_order
+    a = np.array([-4.0, -2.0, 0.0, 2.0, 4.0, 8.0])
+    seq = _seq_order(a)
+    assert a[seq[0]] == 0.0 and list(a[seq]) == [0, 2, 4, 8, -2, -4]
+    c = Convergence()
+    assert c.orders == 3 and c.hold == 20 and c.stall_ok
+
+
+@pytest.mark.skipif(gmsh_missing, reason="нет gmsh")
+def test_mesh_options():
+    from aero2d.rans import mesh_for
+    from aero2d.rans_mesh import MeshOptions
+    af = naca4("0012", 121)
+    m1 = mesh_for([af], 0.0, 1e6, opts=MeshOptions(far_radius=20))
+    m2 = mesh_for([af], 0.0, 1e6, opts=MeshOptions(far_radius=20, n_surface=60, near_size=0.008))
+    assert m2.n_cells < m1.n_cells and (m2.face_tag == 1).sum() < (m1.face_tag == 1).sum()

@@ -115,6 +115,33 @@ def compute_field(ctx: dict, k: int, box=None, n: int = 220) -> dict:
                 disp.append((x[nd] + ds * nx_[nd], y[nd] + ds * ny_[nd]))
         extra.update(bodies=bodies, disp=disp, wakes=wakes, converged=bool(r.converged))
         x, y = bodies[0]
+    elif ctx["method"] == "rans":
+        from scipy.interpolate import LinearNDInterpolator
+        mesh, Q = ctx["mesh"], ctx["states"][k]
+        if Q is None:
+            raise ValueError("для этого угла RANS не посчитан")
+        GAM = 1.4
+        Q = np.asarray(Q)
+        rho = Q[:, 0]
+        u, v = Q[:, 1] / rho, Q[:, 2] / rho
+        p = (GAM - 1) * (Q[:, 3] - 0.5 * rho * (u**2 + v**2))
+        M = ctx["mach"]
+        tri = ctx.get("_tri")
+        if tri is None:
+            from scipy.spatial import Delaunay
+            tri = ctx["_tri"] = Delaunay(mesh.centroid)
+        vals = np.column_stack([u / M, v / M, (p - 1 / GAM) / (0.5 * M**2),
+                                np.sqrt(u**2 + v**2) / np.sqrt(GAM * p / rho), Q[:, 4] / rho])
+        f = LinearNDInterpolator(tri, vals)(np.column_stack([xp, yp]))
+        U, V = f[:, 0], f[:, 1]
+        inside = np.zeros(xp.shape, bool)
+        bodies = []
+        for e in ctx["elements"]:
+            inside |= Path(np.column_stack([e.x, e.y])).contains_points(np.column_stack([xp, yp]))
+            bodies.append((np.asarray(e.x), np.asarray(e.y)))
+        extra.update(bodies=bodies, converged=True, mach_local=f[:, 3].reshape(X.shape),
+                     nut=f[:, 4].reshape(X.shape), cp_rans=f[:, 2])
+        x, y = bodies[0]
     elif ctx["method"] == "multi":
         from .multi import MultiPanelSolver
         ms = MultiPanelSolver(ctx["elements"], chord=ctx.get("chord"))
@@ -139,11 +166,13 @@ def compute_field(ctx: dict, k: int, box=None, n: int = 220) -> dict:
         U = np.cos(a) + Uv @ g
         V = np.sin(a) + Vv @ g
         extra["converged"] = True
-    if ctx["method"] not in ("multi", "multi_viscous"):
+    if ctx["method"] not in ("multi", "multi_viscous", "rans"):
         inside = Path(np.column_stack([x, y])).contains_points(np.column_stack([xp, yp]))
     q2 = U**2 + V**2
     cp0 = 1.0 - q2
     cp = karman_tsien(cp0, ctx.get("mach", 0.0)) if ctx.get("mach", 0.0) > 0 else cp0
+    if "cp_rans" in extra:                     # RANS: давление из решения (с потерями в следе)
+        cp = extra.pop("cp_rans")
     shape = X.shape
     speed = np.sqrt(U**2 + V**2)
     # для заливки: внутри тел — значения ближайшей точки снаружи, иначе по
