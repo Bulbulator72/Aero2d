@@ -141,6 +141,11 @@ def compute_field(ctx: dict, k: int, box=None, n: int = 220) -> dict:
             bodies.append((np.asarray(e.x), np.asarray(e.y)))
         extra.update(bodies=bodies, converged=True, mach_local=f[:, 3].reshape(X.shape),
                      nut=f[:, 4].reshape(X.shape), cp_rans=f[:, 2])
+        H = (ctx.get("history") or [None] * (k + 1))[k]
+        if H is not None and "res_cell" in H:
+            rc = LinearNDInterpolator(tri, np.asarray(H["res_cell"], float))(np.column_stack([xp, yp]))
+            extra["res_cell"] = rc.reshape(X.shape)
+            extra["worst_xy"] = mesh.centroid[np.asarray(H.get("worst", []), int)]
         x, y = bodies[0]
     elif ctx["method"] == "multi":
         from .multi import MultiPanelSolver

@@ -3,8 +3,9 @@
 Запуск: python benchmarks/verify_rans.py [quick | full]
   quick (по умолчанию, ~10–30 мин): NACA 0012, M 0,15, Re 6·10⁶, α = 0° и 10°,
          предобусловливатель ILU(0) и ILU(3) — сравнение времени и с эталоном NASA.
-  full  (часы): то же + GA(W)-1 с закрылком Фаулера 30° (α = 0, 5, 10, 12°)
-         параллельно на ядрах — сравнение с продувкой NASA CR-2443.
+  full  (около часа): то же + GA(W)-1 с закрылком Фаулера 30°, α = 0…12° через 2°
+         (7 углов): старт на грубой сетке, затем все углы параллельно на ядрах —
+         сравнение с продувкой NASA CR-2443 и время на этом ПК.
 Отчёт: benchmarks/verify_report.txt — его и нужно прислать.
 """
 from __future__ import annotations
@@ -90,9 +91,11 @@ def gaw():
             ce = np.interp(r.alpha, e[:, 0], e[:, 1], right=np.nan)
             log(f"  α {r.alpha:5.1f}: Cl {r.cl:.3f} (опыт {ce:.3f}), {r.status}, {time.time() - t0:.0f} с от начала")
         return False
-    res, _ = rans_polar(els, [0.0, 5.0, 10.0, 12.0], G.RE, mach=G.MACH, mesh=mesh, xref=(0.25, 0.0),
-                        callback=cb, max_iter=400, conv=Convergence(), workers=w)
-    log("  ранее на 2 ядрах (ILU(0), последовательно): Cl 2,397 / 3,021 / 3,413 / 3,395, ~50–60 мин на угол")
+    res, _ = rans_polar(els, [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0], G.RE, mach=G.MACH, mesh=mesh,
+                        xref=(0.25, 0.0), callback=cb, max_iter=400, conv=Convergence(), workers=w,
+                        coarse_start=True)
+    log("  прежние результаты: α 0 / 5 / 10 / 12° — Cl 2,397 / 3,021 / 3,414 / 3,395; "
+        "прошлый запуск этой проверки (4 угла, без грубого старта) — 57 мин")
     for r in res:
         if r is not None:
             log(f"  итог α {r.alpha:5.1f}: Cl {r.cl:.3f} Cd {r.cd:.4f} осн. {r.elements[0]['cl']:.3f} "

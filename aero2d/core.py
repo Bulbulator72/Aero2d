@@ -402,7 +402,8 @@ def run_multi_viscous_batch(elements, alphas, mach: float, re_list, ncrit: float
 
 def run_rans(af, alphas, mach: float, re: float, callback=None, max_iter: int = 250,
              name: str | None = None, chord=None, mesh=None, mesh_opts=None, conv=None,
-             control=None, workers: int = 1, init=None, rref=None, solver_opts=None) -> Polar:
+             control=None, workers: int = 1, init=None, rref=None, solver_opts=None,
+             coarse_start="auto") -> Polar:
     """RANS (Навье–Стокс + Спаларт–Аллмарас, полностью турбулентный) для профиля
     или механизации (список элементов). Медленно, но описывает отрыв и слияние
     следов в щелях — для Cl_max механизации. callback(text, fraction) -> True для остановки.
@@ -444,7 +445,7 @@ def run_rans(af, alphas, mach: float, re: float, callback=None, max_iter: int = 
         return callback(txt, min(1.0, (k + (it / max_iter if r is None else 0)) / n))
     res, mesh = rans_polar(elements, alphas, re, mach=mach, chord=chord, callback=cb, max_iter=max_iter,
                            mesh=mesh, conv=conv, control=control, workers=workers, init=init, rref=rref,
-                           solver_opts=solver_opts)
+                           solver_opts=solver_opts, mesh_opts=mesh_opts, coarse_start=coarse_start)
     done = np.array([r is not None for r in res])
     nan = float("nan")
     cl = np.array([r.cl if r else nan for r in res])
@@ -473,9 +474,13 @@ def run_rans(af, alphas, mach: float, re: float, callback=None, max_iter: int = 
         notes.append(m_note)
     if not done.all():
         notes.append("Расчёт остановлен: часть углов не посчитана.")
+    big = (coarse_start is True or (coarse_start == "auto" and mesh.n_cells > 20000)) and not init
+    if big:
+        notes.append("Быстрый старт: первый угол сначала посчитан на грубой сетке, решение перенесено на рабочую.")
     if workers > 1 and n > 1:
-        notes.append(f"Углы считались параллельно: до {min(workers, n - 1)} процессов (первый угол — отдельно, "
-                     "остальные куски стартуют от его решения).")
+        notes.append(f"Углы считались параллельно: до {min(workers, n)} процессов "
+                     + ("(все углы сразу, от решения грубой сетки)." if big or init else
+                        "(первый угол — отдельно, остальные куски стартуют от его решения)."))
     notes.append("Итог по углам: " + "; ".join(f"{r.alpha:g}° — {r.status}, {r.iterations} итер." for r in res if r))
     bad = done & ~ok
     if bad.any():
@@ -530,8 +535,13 @@ def continue_rans(p: Polar, callback=None, max_iter: int = 300, conv=None, contr
             states[k] = q.field_ctx["states"][j]
         Hn, Ho = q.field_ctx["history"][j], hist[k]
         if Hn is not None and Ho is not None and len(Ho["it"]):
-            H = {key: (np.concatenate([Ho[key], Hn[key] + (Ho["it"][-1] if key == "it" else 0)])
-                       if key != "rref" else max(Ho["rref"], Hn["rref"])) for key in Hn}
+            off = int(Ho["it"][-1])
+            H = dict(Hn)
+            for key in ("it", "res", "rn", "cl", "cd", "cfl"):
+                if key in Ho and key in Hn:
+                    H[key] = np.concatenate([Ho[key], Hn[key] + (off if key == "it" else 0)])
+            H["rref"] = max(Ho.get("rref", 0.0), Hn.get("rref", 0.0))
+            H["events"] = list(Ho.get("events", [])) + [(e[0] + off,) + tuple(e[1:]) for e in Hn.get("events", [])]
             hist[k] = H
         elif Hn is not None:
             hist[k] = Hn

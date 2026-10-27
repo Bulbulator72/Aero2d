@@ -108,3 +108,28 @@ def test_continue_rans_appends_history():
     H = q.field_ctx["history"][0]
     assert len(H["it"]) == 14 and H["it"][-1] == 14 and q.label.endswith("(досчитано)")
     assert len(p.field_ctx["history"][0]["it"]) == 8          # прежняя поляра не изменилась
+
+
+@pytest.mark.skipif(gmsh_missing, reason="нет gmsh")
+def test_rollback_keeps_best_state():
+    from aero2d.rans import RansSolver
+    from aero2d.rans_mesh import build_mesh
+    m = build_mesh([repanel(naca4("0012", 120), 60)], re=1e6, far_radius=20)
+    s = RansSolver(m, 0.15, 1e6)
+    s.rollback_factor, s.max_rollbacks = 1.05, 2          # искусственно частые откаты
+    r = s.solve(0.0, max_iter=40)
+    assert r.history["events"] and "откат" in r.history["events"][0][1]
+    assert np.all(np.isfinite(r.state)) and len(r.history["res_cell"]) == m.n_cells
+
+
+@pytest.mark.skipif(gmsh_missing, reason="нет gmsh")
+def test_transfer_state_between_meshes():
+    from aero2d.rans import RansSolver, coarse_options, mesh_for, transfer_state
+    af = naca4("0012", 121)
+    fine = mesh_for([af], 0.0, 1e6)
+    coarse = mesh_for([af], 0.0, 1e6, opts=coarse_options([af]))
+    assert coarse.n_cells < 0.8 * fine.n_cells
+    s = RansSolver(coarse, 0.15, 1e6)
+    Q = np.asarray(s.cons(s.jnp.asarray(np.tile(s.freestream(3.0), (coarse.n_cells, 1)))))
+    Qf = transfer_state(coarse, Q, fine)
+    assert Qf.shape == (fine.n_cells, 5) and np.all(np.isfinite(Qf)) and np.all(Qf[:, 0] > 0)

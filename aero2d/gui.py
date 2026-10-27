@@ -175,13 +175,16 @@ class App(tk.Tk):
         ttk.Entry(f, textvariable=self.rans_iter, width=8).grid(row=12, column=1, sticky="w")
         rp = ttk.Frame(f)
         rp.grid(row=13, column=0, columnspan=2, sticky="w")
-        ttk.Label(rp, text="   предобусловливатель ILU(k), k =").pack(side="left")
+        ttk.Label(rp, text="   предобусловл. ILU(k), k =").pack(side="left")
         self.prec_fill = tk.StringVar(value="3")
         ttk.Combobox(rp, textvariable=self.prec_fill, values=["0", "1", "2", "3", "4"], state="readonly",
                      width=3).pack(side="left")
-        ttk.Label(rp, text=" (больше — быстрее, больше памяти)", foreground="#555").pack(side="left")
-        ttk.Label(f, text="   сетка — вкладка «Сетка», сходимость — «Невязки»", foreground="#555").grid(
-            row=14, column=0, columnspan=2, sticky="w")
+        ttk.Label(rp, text=" (больше — быстрее)", foreground="#555").pack(side="left")
+        self.coarse_start = tk.BooleanVar(value=True)
+        ttk.Checkbutton(f, text="старт на грубой сетке (если > 20 тыс. ячеек)",
+                        variable=self.coarse_start).grid(row=14, column=0, columnspan=2, sticky="w", padx=(14, 0))
+        ttk.Label(f, text="   сетка — «Сетка»; сходимость и шаг — «Невязки»", foreground="#555").grid(
+            row=15, column=0, columnspan=2, sticky="w")
 
         # --- кнопки
         f = ttk.Frame(left, padding=(0, 6))
@@ -247,7 +250,8 @@ class App(tk.Tk):
         self.fl_qty = tk.StringVar(value="Давление Cp")
         cq = ttk.Combobox(bar, textvariable=self.fl_qty,
                           values=["Давление Cp", "Скорость |V|/V∞", "Число Маха (RANS)",
-                                  "Турбулентная вязкость ν̃/ν∞ (RANS)", "Нет (только линии тока)"],
+                                  "Турбулентная вязкость ν̃/ν∞ (RANS)", "Невязка по ячейкам (RANS)",
+                                  "Нет (только линии тока)"],
                           state="readonly", width=24)
         cq.pack(side="left")
         cq.bind("<<ComboboxSelected>>", lambda _: self._redraw_field())
@@ -561,6 +565,7 @@ class App(tk.Tk):
             try:
                 rit = int(self.rans_iter.get())
                 conv = self.conv_settings()
+                sopts = self.solver_settings()
                 els_, re0, a_mid, mopts, _, sig = self._mesh_inputs()
             except ValueError as e:
                 messagebox.showerror("Ошибка", str(e) if str(e) else "Итераций на угол — целое число")
@@ -611,8 +616,8 @@ class App(tk.Tk):
                         p_ = core.run_rans(af, alphas, mach, r_, cb, rit, nm,
                                            chord=(1.0 if isinstance(af, list) and self.src.get() != "mfile" else None),
                                            mesh=(mesh0 if r_ == re0 else None), mesh_opts=mopts, conv=conv,
-                                           control=ctl, workers=nw,
-                                           solver_opts={"prec_fill": int(self.prec_fill.get())})
+                                           control=ctl, workers=nw, solver_opts=sopts,
+                                           coarse_start=("auto" if self.coarse_start.get() else False))
                         ps.append(p_)
                         if p_.field_ctx and r_ == re0 and mesh0 is None:
                             self.q.put(("mesh", sig, p_.field_ctx["mesh"], r_, p_.field_ctx["chord"]))
@@ -886,6 +891,15 @@ class App(tk.Tk):
         elif qty.startswith("Скорость"):
             z, cmap, name = f["speed"], "viridis", "|V| / V∞"
             levels = np.linspace(np.nanpercentile(z, 0.5), min(np.nanpercentile(z, 99.5), 3.0), 41)
+        elif qty.startswith("Невязка"):
+            if "res_cell" not in f:
+                self.status.set("Невязка по ячейкам есть только в расчёте RANS.")
+                z, name = None, "линии тока"
+            else:
+                z = np.log10(np.maximum(f["res_cell"], 1e-30))
+                cmap, name = "inferno", "lg невязки в ячейке (последняя итерация)"
+                hi = np.nanmax(z)
+                levels = np.linspace(hi - 6, hi + 1e-9, 41)
         elif qty.startswith("Число Маха") or qty.startswith("Турбулентная"):
             key = "mach_local" if qty.startswith("Число") else "nut"
             if key not in f:
@@ -913,6 +927,11 @@ class App(tk.Tk):
                               arrowsize=0.5, broken_streamlines=False)
         for bx, by in f.get("bodies", [f["body"]]):
             ax.fill(bx, by, color="#444", zorder=3)
+        if "worst_xy" in f and len(f["worst_xy"]):
+            wx_, wy_ = f["worst_xy"][:, 0], f["worst_xy"][:, 1]
+            ax.plot(wx_, wy_, "o", mfc="none", mec="#00e5ff", ms=11, mew=1.6, zorder=5,
+                    label="ячейки с наибольшей невязкой")
+            ax.legend(loc="upper right", fontsize=7)
         if "disp" in f:
             for dx, dy in f["disp"]:
                 ax.plot(dx, dy, "-", color="#ffd400", lw=1.0, zorder=4)
@@ -1056,7 +1075,10 @@ class App(tk.Tk):
             .replace(",", " ") +
             f"Высота первой ячейки ≈ {h1:.2e} c, оценка y⁺ ≈ {yp:.2f} (по Cf пластины).\n"
             f"Наибольшее отношение объёмов соседних ячеек — {q['vol_ratio_max']:.0f}.\n"
-            "Эта сетка будет использована в расчёте RANS.")
+            "Эта сетка будет использована в расчёте RANS." +
+            ("\n⚠ y⁺ > 2: для модели SA без пристеночных функций слой у стенки грубоват." if yp > 2 else "") +
+            ("\n⚠ Резкий скачок размеров соседних ячеек (> 300): возможен развал счёта — уменьшите "
+             "«рост треугольников» или «ячейки у стенок и в щелях»." if q["vol_ratio_max"] > 300 else ""))
         self.draw_mesh()
 
     def draw_mesh(self):
@@ -1116,12 +1138,37 @@ class App(tk.Tk):
         ttk.Checkbutton(bar2, text="принимать и при «застрявшей» невязке (упала на 2 порядка, Cl и Cd стоят "
                         "≥ 30 итераций)", variable=self.cv_stall).pack(side="left")
         ttk.Button(bar2, text="⏭ Принять угол, следующий", command=self.skip_angle).pack(side="right")
+        # шаг по псевдовремени и защита от развала
+        bar4 = ttk.Frame(fr, padding=(4, 2))
+        bar4.pack(side="top", fill="x")
+        ttk.Label(bar4, text="Шаг: режим").pack(side="left")
+        self.cfl_preset = tk.StringVar(value="обычный")
+        cp_ = ttk.Combobox(bar4, textvariable=self.cfl_preset, values=["обычный", "осторожный", "свой"],
+                           state="readonly", width=10)
+        cp_.pack(side="left")
+        cp_.bind("<<ComboboxSelected>>", lambda _: self._apply_cfl_preset())
+        self.cfl_vars = {}
+        bar5 = ttk.Frame(fr, padding=(4, 0))
+        bar5.pack(side="top", fill="x")
+        for key, lbl, val, w in (("cfl_start", " CFL нач.", "5", 5), ("cfl_limit", " наиб.", "1e6", 6),
+                                 ("cfl_growth", " рост ×", "1.25", 5), ("first_order", " 1-й порядок, итер.", "30", 4),
+                                 ("rollback_factor", "Откат к лучшему состоянию, если невязка выросла в", "100", 5)):
+            bar_ = bar5 if key == "rollback_factor" else bar4
+            ttk.Label(bar_, text=lbl).pack(side="left")
+            v = tk.StringVar(value=val)
+            e_ = ttk.Entry(bar_, textvariable=v, width=w)
+            e_.pack(side="left")
+            e_.bind("<KeyRelease>", lambda _: self.cfl_preset.set("свой"))
+            self.cfl_vars[key] = v
+        ttk.Label(bar5, text=" раз").pack(side="left")
+        ttk.Button(bar5, text="↶ Откат к лучшему", command=self.rollback_now).pack(side="right")
+        ttk.Button(bar5, text="CFL ×0,5", command=self.halve_cfl).pack(side="right", padx=4)
         bar3 = ttk.Frame(fr, padding=(4, 2))
         bar3.pack(side="top", fill="x")
         ttk.Label(bar3, text="Показать: ").pack(side="left")
         self.res_src = tk.StringVar(value="текущий расчёт")
         self.cb_res_src = ttk.Combobox(bar3, textvariable=self.res_src, values=["текущий расчёт"],
-                                       state="readonly", width=42)
+                                       state="readonly", width=36)
         self.cb_res_src.pack(side="left")
         self.cb_res_src.bind("<<ComboboxSelected>>", lambda _: (self.res_angle.set("все углы"), self.plot_res()))
         ttk.Label(bar3, text="   угол: ").pack(side="left")
@@ -1137,6 +1184,42 @@ class App(tk.Tk):
         self.res_canvas.get_tk_widget().pack(fill="both", expand=True)
         self._live = None
         self._res_drawn = 0.0
+
+    CFL_PRESETS = {"обычный": dict(cfl_start="5", cfl_limit="1e6", cfl_growth="1.25", first_order="30",
+                                   rollback_factor="100"),
+                   "осторожный": dict(cfl_start="2", cfl_limit="1e4", cfl_growth="1.1", first_order="60",
+                                      rollback_factor="20")}
+
+    def _apply_cfl_preset(self):
+        p = self.CFL_PRESETS.get(self.cfl_preset.get())
+        if p:
+            for k, v in p.items():
+                self.cfl_vars[k].set(v)
+
+    def solver_settings(self):
+        """Параметры решателя RANS из окна (для RansSolver через solver_opts)."""
+        num = lambda v: float(v.get().replace(",", "."))
+        try:
+            o = {k: num(v) for k, v in self.cfl_vars.items()}
+        except ValueError:
+            raise ValueError("Невязки: параметры шага — проверьте числа") from None
+        if not (0 < o["cfl_start"] <= o["cfl_limit"]) or o["cfl_growth"] < 1.0 or o["rollback_factor"] <= 1.0:
+            raise ValueError("Невязки: CFL нач. > 0 и ≤ наибольшего, рост ≥ 1, откат при росте > 1")
+        o["first_order"] = int(o["first_order"])
+        o["prec_fill"] = int(self.prec_fill.get())
+        return o
+
+    def halve_cfl(self):
+        ctl = getattr(self, "_rans_ctl", None)
+        if ctl is not None and self.worker and self.worker.is_alive():
+            ctl.cfl_factor = 0.5
+            self.status.set("CFL уменьшен вдвое (со следующей итерации)")
+
+    def rollback_now(self):
+        ctl = getattr(self, "_rans_ctl", None)
+        if ctl is not None and self.worker and self.worker.is_alive():
+            ctl.rollback = True
+            self.status.set("Откат к состоянию с наименьшей невязкой (со следующей итерации)…")
 
     def conv_settings(self):
         from .rans import Convergence
@@ -1158,7 +1241,7 @@ class App(tk.Tk):
 
     @staticmethod
     def _new_res():
-        return dict(angles={}, rref=1.0, last=None)
+        return dict(angles={}, rref=1.0, last=None, events=[])
 
     @staticmethod
     def _res_add(D, a, it, res, rn, cl, cd):
@@ -1172,6 +1255,10 @@ class App(tk.Tk):
     def _on_iter(self, d):
         L = self._live
         if L is None:
+            return
+        if "event" in d:                                   # откат и т. п.
+            L["events"].append((float(d["alpha"]), int(d["it"]), d["event"]))
+            self.status.set(f"α = {d['alpha']:g}°, итерация {d['it']}: {d['event']}")
             return
         self._res_add(L, d["alpha"], d["it"], d["res"], d["rn"], d["cl"], d["cd"])
         L["rref"] = max(L["rref"], d["rref"])
@@ -1193,6 +1280,7 @@ class App(tk.Tk):
                     for j in range(len(H["it"])):
                         self._res_add(D, a, int(H["it"][j]), H["res"][j], H["rn"][j], H["cl"][j], H["cd"][j])
                     D["rref"] = max(D["rref"], H.get("rref", 1.0))
+                    D["events"] += [(float(a), int(e[0]), e[1]) for e in H.get("events", [])]
                 return D
         return None
 
@@ -1257,6 +1345,12 @@ class App(tk.Tk):
             ax1.set_ylabel("невязка (ср. кв. по ячейкам)")
         if lvl:
             ax1.axhline(lvl, color="#d62728", ls="--", lw=1.0, label=lbl)
+        evs = [e for e in D.get("events", []) if sel == "все углы" or abs(e[0] - float(sel)) < 1e-9]
+        for k_, (a_, it_, txt) in enumerate(evs):
+            ax1.axvline(it_, color="#ff7f0e", lw=0.9, ls="-.", label="откат / ручное действие" if k_ == 0 else None)
+        if evs:
+            ax1.text(0.01, 0.02, f"последнее: α = {evs[-1][0]:g}°, итер. {evs[-1][1]}: {evs[-1][2]}",
+                     transform=ax1.transAxes, fontsize=7, color="#b35900")
         ax1.grid(alpha=0.3, which="both")
         ax1.legend(fontsize=7, ncol=3, loc="upper right")
         ax2.grid(alpha=0.3)
@@ -1287,6 +1381,7 @@ class App(tk.Tk):
         try:
             rit = int(self.rans_iter.get())
             conv = self.conv_settings()
+            sopts = self.solver_settings()
             from .parallel import resolve_workers
             nw = resolve_workers(self.cores.get())
         except ValueError as e:
@@ -1312,7 +1407,7 @@ class App(tk.Tk):
                     self.q.put(("progress", text, frac))
                     return self.stop_flag.is_set()
                 q = core.continue_rans(p, cb, rit, conv=conv, control=self._rans_ctl, workers=nw,
-                                       solver_opts={"prec_fill": int(self.prec_fill.get())})
+                                       solver_opts=sopts)
                 self.q.put(("done", q))
             except Exception as e:  # noqa: BLE001
                 self.q.put(("error", f"{e}\n\n{traceback.format_exc(limit=3)}"))

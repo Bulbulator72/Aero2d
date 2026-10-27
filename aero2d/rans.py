@@ -76,12 +76,15 @@ class RansControl:
     """Связь с окном программы во время расчёта: monitor(info) вызывается
     на каждой итерации (info — словарь: alpha, it, res — невязки 5 уравнений,
     rn, cl, cd, cfl, rref); skip=True — принять текущий угол и перейти к
-    следующему; stop=True — прекратить расчёт поляры."""
+    следующему; stop=True — прекратить расчёт поляры; cfl_factor — умножить CFL;
+    rollback=True — откат к лучшему состоянию."""
 
     def __init__(self, monitor=None):
         self.monitor = monitor
         self.skip = False
         self.stop = False
+        self.cfl_factor = 1.0          # ≠ 1 — умножить текущий CFL (кнопка «CFL ×0,5»)
+        self.rollback = False          # True — откатиться к состоянию с наименьшей невязкой
 
 
 def _jnp():
@@ -112,6 +115,13 @@ class RansSolver:
         self.cfl_mode = "grow"
         self.cfl_growth = 1.25
         self.conv = Convergence()      # критерий перехода к следующему углу
+        # шаг по псевдовремени и защита от развала
+        self.cfl_start = 5.0           # CFL первой итерации
+        self.cfl_limit = 1e6           # наибольший CFL
+        self.first_order = 30          # итераций первым порядком при старте с нуля
+        self.rollback_factor = 100.0   # невязка выросла во столько раз от наименьшей — откат
+        self.rollback_first_order = 15 # после отката — итераций первым порядком
+        self.max_rollbacks = 4         # больше откатов — угол «неустойчив»
         self.sa_raw_grad = False       # True: источник SA по неограниченным градиентам (на механизации хуже сходится)
         self.visc_raw_grad = False     # True: вязкие потоки по неограниченным градиентам
         self.freeze_limiter = True     # заморозка ограничителя при застое невязки
@@ -605,11 +615,14 @@ class RansSolver:
         return dict(cl=Lp + Lv, cd=Dp + Dv, cdp=Dp, cdf=Dv, cm=cm, cp=cp, cf=cf, elements=per)
 
     # ------------------------------------------------------------------
-    def solve(self, alpha, Q0=None, max_iter=300, tol=1e-7, cfl0=5.0, cfl_max=1e6, first_order_iters=30,
+    def solve(self, alpha, Q0=None, max_iter=300, tol=1e-7, cfl0=None, cfl_max=None, first_order_iters=None,
               verbose=False, callback=None, gmres_tol=0.01, gmres_iter=60, conv=None, control=None):
         """Установление до выполнения критерия conv (Convergence; по умолчанию —
         self.conv) или до max_iter итераций Ньютона. control — RansControl."""
         crit = conv or self.conv
+        cfl0 = self.cfl_start if cfl0 is None else cfl0
+        cfl_max = self.cfl_limit if cfl_max is None else cfl_max
+        first_order_iters = self.first_order if first_order_iters is None else first_order_iters
         import scipy.sparse.linalg as spla
         jax, jnp = self.jax, self.jnp
         winf = self.freestream(alpha)
@@ -647,15 +660,32 @@ class RansSolver:
         fh = []
         lu, lu_it = None, 0
         H = dict(it=[], res=[], rn=[], cl=[], cd=[], cfl=[])
+        events = []                                   # (итерация, событие, невязка, худшие ячейки)
+        best = dict(rn=np.inf, Q=None, it=0, cfl=cfl0, order=0)
+        first_until = 0
+        n_back = 0
+        R = None
         conv = False
         status = ""
         it = 0
+
+        def worst_cells(Rm, k=8):
+            rc = np.sqrt(np.sum((Rm / self.vol[:, None]) ** 2, 1))
+            rc = np.where(np.isfinite(rc), rc, np.inf)
+            return [int(i) for i in np.argsort(-rc)[:k]]
         for it in range(1, max_iter + 1):
-            if control is not None and (control.skip or control.stop):
-                status = "принято вручную" if control.skip else "остановлено"
-                control.skip = False
-                break
-            order = 1 if it <= first_order_iters and Q0 is None else self.order
+            if control is not None:
+                sk, st = bool(control.skip), bool(control.stop)
+                if sk or st:
+                    status = "принято вручную" if sk else "остановлено"
+                    control.skip = False
+                    break
+                f_ = float(control.cfl_factor)
+                if f_ != 1.0:
+                    cfl = max(1.0, cfl * f_)
+                    control.cfl_factor = 1.0
+                    events.append((it, f"CFL вручную → {cfl:.3g}", np.nan, []))
+            order = 1 if (it <= first_order_iters and Q0 is None) or it <= first_until else self.order
             if order == 1:
                 resf, jvpf = res1, jvp1
             else:
@@ -666,9 +696,38 @@ class RansSolver:
             gm = jnp.asarray(self.gamma_vortex if self.vortex_bc else 0.0)
             R = np.asarray(resf(Qj, winf_j, gm))
             rn = float(np.sqrt(np.mean((R / self.vol[:, None]) ** 2, 0)).sum())
+            # --- защита от развала: откат к состоянию с наименьшей невязкой
+            manual = control is not None and control.rollback
+            if manual:
+                control.rollback = False
+            if best["order"] != order:                    # смена порядка — своя шкала невязки
+                best.update(rn=np.inf, order=order)
+            blowup = (not np.isfinite(rn)) or (rn > self.rollback_factor * best["rn"] and it - best["it"] >= 3)
+            if (blowup or manual) and best["Q"] is not None:
+                n_back += int(not manual)
+                why = "вручную" if manual else ("NaN" if not np.isfinite(rn) else
+                                                  f"невязка ×{rn / best['rn']:.3g} от наименьшей")
+                events.append((it, f"откат к итерации {best['it']} ({why})", rn, worst_cells(R)))
+                if verbose:
+                    print(f"  it {it:4d}: откат к итерации {best['it']} ({why}), CFL → "
+                          f"{max(cfl0, min(cfl, best['cfl']) * 0.1):.3g}", flush=True)
+                if control is not None and control.monitor is not None:
+                    control.monitor(dict(alpha=alpha, it=it, event=f"откат к итерации {best['it']} ({why})"))
+                if n_back > self.max_rollbacks:
+                    Q = best["Q"].copy()
+                    status = f"неустойчиво: {n_back - 1} откатов не помогли (сохранено лучшее состояние)"
+                    break
+                Q = best["Q"].copy()
+                cfl = max(cfl0, min(cfl, best["cfl"]) * 0.1)
+                first_until = it + self.rollback_first_order
+                phi = None
+                best.update(rn=np.inf, it=it)
+                continue
             if not np.isfinite(rn):
                 status = "расходится"
                 break
+            if rn < 0.95 * best["rn"]:
+                best.update(rn=rn, Q=Q.copy(), it=it, cfl=cfl, order=order)
             if r0 is None or (order == 2 and len(hist) and hist[-1][1] == 1):
                 r0 = rn
             hist.append((rn, order))
@@ -807,12 +866,30 @@ class RansSolver:
                       f"Cl {fr['cl']:.4f} Cd {fr['cd']:.5f}", flush=True)
             if callback and callback(it, rn):
                 break
+        if status == "расходится" and best["Q"] is not None:
+            Q = best["Q"].copy()
+            status = "расходится (сохранено лучшее состояние)"
         fr = self.forces(Q, alpha)
-        if not status:
-            status = "сошлось" if conv else ("расходится" if hist and not np.isfinite(hist[-1][0])
-                                             else "не сошлось за отведённые итерации")
         H = {k_: np.array(v_) for k_, v_ in H.items()}
+        if not status:
+            status = "сошлось" if conv else "не сошлось за отведённые итерации"
+            # колебания сил без тренда — вероятно, нестационарное течение (за Cl_max)
+            cl_h = H["cl"][-60:]
+            if not conv and len(cl_h) >= 60:
+                amp = 0.5 * (cl_h.max() - cl_h.min())
+                trend = abs(cl_h[30:].mean() - cl_h[:30].mean())
+                if amp > 5 * crit.cl_tol * max(0.2, abs(cl_h.mean())) and trend < 0.5 * amp:
+                    H["cl_mean"], H["cd_mean"] = float(cl_h.mean()), float(H["cd"][-60:].mean())
+                    status = (f"не установилось: Cl колеблется {cl_h.mean():.3f} ± {amp:.3f} "
+                              "(вероятно, нестационарное течение)")
         H["rref"] = float(getattr(self, "_rref", 0.0) or (max(H["rn"]) if len(H["rn"]) else 1.0))
+        H["events"] = events
+        if n_back:
+            status += f"; откатов: {n_back}"
+        if R is not None:
+            rc = np.sqrt(np.sum((R / self.vol[:, None]) ** 2, 1))
+            H["res_cell"] = np.where(np.isfinite(rc), rc, np.nan).astype(np.float32)
+            H["worst"] = worst_cells(R)
         return RansResult(alpha, fr["cl"], fr["cd"], fr["cdp"], fr["cdf"], fr["cm"], conv, it,
                           [h[0] for h in hist], fr["elements"], Q, status, H)
 
@@ -861,36 +938,120 @@ def _seq_order(alphas):
     return list(order[i0:]) + list(order[:i0][::-1])
 
 
+def _solve_angle(solver, a, Q, a_src, max_iter, verbose, cb, conv, control, depth=0):
+    """Один угол; если он развалился при старте от соседнего угла a_src, —
+    промежуточный угол (a + a_src)/2 и затем снова a (до двух делений)."""
+    r = solver.solve(float(a), Q0=Q, max_iter=max_iter, verbose=verbose, callback=cb, conv=conv, control=control)
+    bad = r.status.startswith(("расходится", "неустойчиво"))
+    if (bad and Q is not None and a_src is not None and abs(a - a_src) > 1.0 and depth < 2
+            and not (control is not None and control.stop)):
+        mid = round(0.5 * (a + a_src), 3)
+        rm = _solve_angle(solver, mid, Q, a_src, max_iter, verbose, cb, conv, control, depth + 1)
+        if rm.converged or rm.status == "принято вручную":
+            r2 = _solve_angle(solver, a, rm.state, mid, max_iter, verbose, cb, conv, control, depth + 1)
+            r2.status += f" (через промежуточный α = {mid:g}°)"
+            return r2
+        r.status += f"; промежуточный α = {mid:g}° тоже не сошёлся"
+    return r
+
+
+def _keep_state(r):
+    return r.converged or r.status == "принято вручную"
+
+
 def _solve_sequence(solver, alphas, idx, states, out, max_iter, verbose, conv, control, on_iter, on_done,
-                    init=None):
-    """Углы idx по порядку, каждый — от ближайшего посчитанного (states) или
-    от своего прежнего решения (init: номер угла → состояние, «досчитать»)."""
+                    init=None, Q0=None, a0=None):
+    """Углы idx по порядку, каждый — от ближайшего посчитанного (states), от
+    своего прежнего решения (init: номер угла → состояние, «досчитать») или,
+    если посчитанных ещё нет, — от Q0 (решение при угле a0)."""
     init = init or {}
     for i in idx:
-        Q = None
+        Q, a_src = Q0, a0
         if i in init:
-            Q = init[i]
+            Q, a_src = init[i], None
         elif states:
             j = min(states, key=lambda jj: abs(alphas[jj] - alphas[i]))
-            Q = states[j]
-        r = solver.solve(float(alphas[i]), Q0=Q, max_iter=max_iter, verbose=verbose,
-                         callback=(lambda it, rn: on_iter(i, it, rn)), conv=conv, control=control)
+            Q, a_src = states[j], float(alphas[j])
+        r = _solve_angle(solver, float(alphas[i]), Q, a_src, max_iter, verbose,
+                         (lambda it, rn: on_iter(i, it, rn)), conv, control)
         out[i] = r
-        if r.converged or r.status == "принято вручную" or (not states and Q is None):
+        if _keep_state(r) or (not states and Q is None):
             states[i] = r.state
         if on_done(i, r) or (control is not None and control.stop):
             return True
     return False
 
 
+def transfer_state(mesh_from, Q, mesh_to):
+    """Перенос решения на другую сетку: значения ближайшей ячейки; у стенок
+    скорость и ρν̃ уменьшаются пропорционально расстоянию до стенки (новая
+    сетка может иметь ячейки ближе к стенке)."""
+    from scipy.spatial import cKDTree
+    Q = np.asarray(Q, float)
+    _, j = cKDTree(mesh_from.centroid).query(mesh_to.centroid)
+    Qn = Q[j].copy()
+    s = np.clip(mesh_to.wall_dist / np.maximum(mesh_from.wall_dist[j], 1e-30), 0.0, 1.0)
+    rho = Qn[:, 0]
+    ke = 0.5 * (Qn[:, 1] ** 2 + Qn[:, 2] ** 2) / rho
+    Qn[:, 1] *= s
+    Qn[:, 2] *= s
+    Qn[:, 3] -= ke * (1 - s ** 2)
+    Qn[:, 4] *= s
+    return Qn
+
+
+def coarse_options(elements, opts=None):
+    """Параметры грубой сетки для быстрого старта: вдвое меньше точек на
+    поверхности, крупнее ячейки у стенок, в щелях и по следу (слой у стенки
+    с тем же y⁺ — иначе модель турбулентности работает иначе)."""
+    from dataclasses import replace
+    from .rans_mesh import MeshOptions
+    o = opts or MeshOptions()
+    n_side = o.n_surface or max(len(e.x) for e in elements) // 2
+    multi = len(elements) > 1
+    near = o.near_size or (0.003 if multi else 0.004)
+    return replace(o, n_surface=max(40, int(n_side) // 2), near_size=2.5 * near, wake_size=2.5 * o.wake_size,
+                   ratio=max(o.ratio, 1.3), growth=max(o.growth, 0.35))
+
+
 class _ProcControl(RansControl):
     """RansControl внутри процесса-исполнителя: монитор — в общую очередь,
     «следующий угол» и «стоп» — через общие флаги."""
 
-    def __init__(self, queue, skip_gen, stop_ev):
+    def __init__(self, queue, skip_gen, stop_ev, cfl_gen=None, back_gen=None):
         super().__init__(monitor=lambda d: queue.put(("iter", d)))
         self._q, self._gen, self._stop = queue, skip_gen, stop_ev
         self._seen = skip_gen.value
+        self._cg, self._bg = cfl_gen, back_gen
+        self._cseen = cfl_gen.value if cfl_gen is not None else 0
+        self._bseen = back_gen.value if back_gen is not None else 0
+
+    @property
+    def cfl_factor(self):
+        if self._cg is None:
+            return 1.0
+        g = self._cg.value
+        f = 0.5 ** (g - self._cseen)
+        self._cseen = g
+        return f
+
+    @cfl_factor.setter
+    def cfl_factor(self, v):
+        pass
+
+    @property
+    def rollback(self):
+        if self._bg is None:
+            return False
+        g = self._bg.value
+        if g != self._bseen:
+            self._bseen = g
+            return True
+        return False
+
+    @rollback.setter
+    def rollback(self, v):
+        pass
 
     @property
     def skip(self):
@@ -917,50 +1078,61 @@ def _rans_chunk(args):
     """Исполнитель: часть поляры в отдельном процессе."""
     import warnings
     warnings.filterwarnings("ignore")
-    (mesh, mach, re, chord, xref, alphas, idx, Q0, rref, max_iter, conv, queue, skip_gen, stop_ev, init,
-     sopts) = args
+    (mesh, mach, re, chord, xref, alphas, idx, Q0, a0, rref, max_iter, conv, queue, flags, init, sopts) = args
+    skip_gen, stop_ev, cfl_gen, back_gen = flags
     solver = RansSolver(mesh, mach, re, chord=chord, xref=xref)
     for k_, v_ in (sopts or {}).items():
         setattr(solver, k_, v_)
-    solver._rref = rref
-    ctl = _ProcControl(queue, skip_gen, stop_ev)
+    if rref:
+        solver._rref = rref
+    ctl = _ProcControl(queue, skip_gen, stop_ev, cfl_gen, back_gen)
     out = [None] * len(alphas)
     st = {}
-    for i in idx:
-        # каждый следующий угол — от ближайшего посчитанного в этом куске, первый — от Q0
-        if i in init:
-            Q = init[i]
-        else:
-            Q = st[min(st, key=lambda jj: abs(alphas[jj] - alphas[i]))] if st else Q0
-        r = solver.solve(float(alphas[i]), Q0=Q, max_iter=max_iter, conv=conv, control=ctl)
-        out[i] = r
-        if r.converged or r.status == "принято вручную":
-            st[i] = r.state
+
+    def on_done(i, r):
         queue.put(("done", i, r.alpha, r.cl, r.status))
-        if ctl.stop:
-            break
+        return False
+    _solve_sequence(solver, alphas, idx, st, out, max_iter, False, conv, ctl, lambda i, it, rn: False, on_done,
+                    init, Q0, a0)
     return [(i, out[i]) for i in idx if out[i] is not None]
+
+
+def _split_chunks(alphas, seq, i0, w):
+    """Непрерывные куски по α в обе стороны от угла i0 (он — в первом куске вверх)."""
+    up = [i for i in seq if alphas[i] >= alphas[i0]]
+    dn = [i for i in seq if alphas[i] < alphas[i0]]
+    tot = len(up) + len(dn)
+    w = int(max(1, min(w, tot)))
+    w_up = int(round(w * len(up) / tot)) if up else 0
+    w_up = min(max(w_up, 1 if up else 0), len(up))
+    w_dn = min(max(w - w_up, 1 if dn else 0), len(dn))
+    chunks = [list(c) for c in np.array_split(up, w_up) if len(c)] if up else []
+    chunks += [list(c) for c in np.array_split(dn, w_dn) if len(c)] if dn else []
+    return chunks
 
 
 def rans_polar(elements, alphas, re, mach=0.15, chord=1.0, xref=None, mesh=None, callback=None,
                max_iter=250, verbose=False, conv=None, control=None, workers=1, init=None, rref=None,
-               solver_opts=None):
+               solver_opts=None, mesh_opts=None, coarse_start="auto"):
     """Поляра RANS для одно- или многоэлементного профиля: сетка строится один
     раз (сгущение по линиям следа невязкого решения при среднем угле), углы
     атаки считаются от ближайшего к нулю в обе стороны, каждый — от решения
     ближайшего посчитанного.
-    workers > 1: первый угол считается здесь, остальные делятся на непрерывные
-    куски и считаются одновременно в отдельных процессах (каждый кусок стартует
-    от решения первого угла).
+    coarse_start: первый угол сначала считается на грубой сетке (coarse_options),
+    решение переносится на рабочую сетку («auto» — если в ней > 20 тыс. ячеек).
+    workers > 1: при старте с грубой сетки все углы сразу делятся на куски и
+    считаются одновременно (каждый кусок стартует от решения грубой сетки);
+    иначе первый угол считается здесь, остальные — параллельно.
+    Если угол развалился при старте от соседнего, считается промежуточный угол.
     callback(k, n, it, res, result_or_None) -> True для остановки.
     conv — критерий сходимости (Convergence), control — RansControl (монитор
-    итераций, «следующий угол», остановка).
+    итераций, «следующий угол», остановка, CFL ×0,5, откат).
     init — {номер угла: прежнее состояние}: эти углы продолжаются со своего решения
     («досчитать»); rref — опорная невязка прежнего расчёта (для критерия сходимости)."""
     alphas = np.asarray(alphas, float)
     init = dict(init or {})
     if mesh is None:
-        mesh = mesh_for(elements, float(np.median(alphas)), re, chord)
+        mesh = mesh_for(elements, float(np.median(alphas)), re, chord, opts=mesh_opts)
     xs = np.concatenate([e.x for e in elements])
     xr = xref if xref is not None else (float(xs.min()) + 0.25 * chord, 0.0)
     solver = RansSolver(mesh, mach, re, chord=chord, xref=xr)
@@ -980,32 +1152,47 @@ def rans_polar(elements, alphas, re, mach=0.15, chord=1.0, xref=None, mesh=None,
     def on_done(i, r):
         count[0] += 1
         return bool(callback and callback(count[0], n, 0, 0.0, r))
-    workers = int(max(1, min(workers, n - 1)))
-    if workers <= 1:
-        _solve_sequence(solver, alphas, seq, states, out, max_iter, verbose, conv, control, on_iter, on_done, init)
-        return out, mesh
-    # --- первый угол здесь, остальные — параллельно
-    stop = _solve_sequence(solver, alphas, seq[:1], states, out, max_iter, verbose, conv, control, on_iter, on_done,
-                           init)
-    if stop:
-        return out, mesh
     i0 = seq[0]
-    Q0 = states.get(i0, out[i0].state)
-    rest = seq[1:]
-    up = [i for i in rest if alphas[i] >= alphas[i0]]
-    dn = [i for i in rest if alphas[i] < alphas[i0]]
-    # куски пропорционально числу углов в каждую сторону
-    w_up = int(round(workers * len(up) / len(rest))) if up else 0
-    w_up = min(max(w_up, 1 if up else 0), len(up))
-    w_dn = min(max(workers - w_up, 1 if dn else 0), len(dn))
-    chunks = [list(c) for c in np.array_split(up, w_up) if len(c)] if up else []
-    chunks += [list(c) for c in np.array_split(dn, w_dn) if len(c)] if dn else []
+    Q0, a0 = None, None
+    # --- быстрый старт: первый угол на грубой сетке
+    use_coarse = (coarse_start is True or (coarse_start == "auto" and mesh.n_cells > 20000)) and not init
+    if use_coarse:
+        if callback:
+            callback(0, n, 0, 0.0, None)
+        cm = mesh_for(elements, float(np.median(alphas)), re, chord, opts=coarse_options(elements, mesh_opts))
+        cs = RansSolver(cm, mach, re, chord=chord, xref=xr)
+        for k_, v_ in (solver_opts or {}).items():
+            setattr(cs, k_, v_)
+        rc = cs.solve(float(alphas[i0]), max_iter=max_iter, verbose=verbose, conv=Convergence(2.0, 10, 2e-3, 2e-4),
+                      callback=lambda it, rn: on_iter(i0, it, rn), control=control)
+        if verbose:
+            print(f"  грубая сетка ({cm.n_cells} ячеек): α {alphas[i0]:g}°, Cl {rc.cl:.4f}, {rc.status}", flush=True)
+        if control is not None and control.stop:
+            return out, mesh
+        Q0, a0 = transfer_state(cm, rc.state, mesh), float(alphas[i0])
+    workers = int(max(1, min(workers, n)))
+    if workers <= 1 or n == 1:
+        _solve_sequence(solver, alphas, seq, states, out, max_iter, verbose, conv, control, on_iter, on_done,
+                        init, Q0, a0)
+        return out, mesh
+    if Q0 is None and len(init) < n:
+        # первый угол здесь (с нуля), остальные — параллельно от его решения
+        stop = _solve_sequence(solver, alphas, seq[:1], states, out, max_iter, verbose, conv, control, on_iter,
+                               on_done, init)
+        if stop:
+            return out, mesh
+        Q0, a0 = states.get(i0, out[i0].state), float(alphas[i0])
+        rest = seq[1:]
+    else:
+        rest = seq                                         # все углы — сразу параллельно
+    chunks = _split_chunks(alphas, rest, i0, workers)
     import multiprocessing as mp
     from concurrent.futures import ProcessPoolExecutor, FIRST_COMPLETED, wait
     from .parallel import cpu_count
     ctx = mp.get_context("spawn")
     mgr = ctx.Manager()
-    queue, skip_gen, stop_ev = mgr.Queue(), mgr.Value("i", 0), mgr.Event()
+    queue = mgr.Queue()
+    skip_gen, stop_ev, cfl_gen, back_gen = mgr.Value("i", 0), mgr.Event(), mgr.Value("i", 0), mgr.Value("i", 0)
     rref = getattr(solver, "_rref", 0.0)
     # потоки XLA: на каждый процесс — своя доля ядер
     keep = os.environ.get("XLA_FLAGS")
@@ -1014,12 +1201,11 @@ def rans_polar(elements, alphas, re, mach=0.15, chord=1.0, xref=None, mesh=None,
         os.environ["XLA_FLAGS"] = ((keep or "") + " --xla_cpu_multi_thread_eigen=false").strip()
     try:
         with ProcessPoolExecutor(len(chunks), mp_context=ctx) as ex:
-            futs = [ex.submit(_rans_chunk, (mesh, mach, re, chord, xr, alphas, c, Q0, rref, max_iter, conv,
-                                            queue, skip_gen, stop_ev, {i: init[i] for i in c if i in init},
-                                            solver_opts))
+            futs = [ex.submit(_rans_chunk, (mesh, mach, re, chord, xr, alphas, c, Q0, a0, rref, max_iter, conv,
+                                            queue, (skip_gen, stop_ev, cfl_gen, back_gen),
+                                            {i: init[i] for i in c if i in init}, solver_opts))
                     for c in chunks]
             pending = set(futs)
-            last_skip = False
             while pending:
                 done, pending = wait(pending, timeout=0.3, return_when=FIRST_COMPLETED)
                 for f in done:
@@ -1034,7 +1220,7 @@ def rans_polar(elements, alphas, re, mach=0.15, chord=1.0, xref=None, mesh=None,
                         d = msg[1]
                         if control is not None and control.monitor is not None:
                             control.monitor(d)
-                        if callback and callback(count[0], n, d["it"], d["rn"], None):
+                        if "rn" in d and callback and callback(count[0], n, d["it"], d["rn"], None):
                             stop_ev.set()
                     elif msg[0] == "done":
                         count[0] += 1
@@ -1048,10 +1234,15 @@ def rans_polar(elements, alphas, re, mach=0.15, chord=1.0, xref=None, mesh=None,
                 if control is not None:
                     if control.stop:
                         stop_ev.set()
-                    if control.skip and not last_skip:
+                    if control.skip:
                         skip_gen.value += 1
                         control.skip = False
-                    last_skip = False
+                    if control.cfl_factor != 1.0:
+                        cfl_gen.value += max(1, int(round(-np.log2(control.cfl_factor))))
+                        control.cfl_factor = 1.0
+                    if control.rollback:
+                        back_gen.value += 1
+                        control.rollback = False
     finally:
         if keep is None:
             os.environ.pop("XLA_FLAGS", None)
