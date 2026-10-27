@@ -112,6 +112,13 @@ class RansSolver:
         self.sa_raw_grad = False       # True: источник SA по неограниченным градиентам (на механизации хуже сходится)
         self.visc_raw_grad = False     # True: вязкие потоки по неограниченным градиентам
         self.freeze_limiter = True     # заморозка ограничителя при застое невязки
+        # предобусловливатель GMRES: "ilu" — блочный ILU(k) якобиана первого порядка с
+        # заполнением уровня prec_fill (0 — ILU(0); 2–3 — в 2–4 раза меньше итераций GMRES
+        # за счёт памяти); "lu" — точное разложение (SuperLU: годится только для небольших
+        # сеток, на 40 тыс. ячеек — минуты и гигабайты); prec_reuse — для "lu"
+        self.prec = "ilu"
+        self.prec_fill = 3
+        self.prec_reuse = 1
         self.right_prec = False        # True: правое предобусловливание GMRES (точнее линейные решения, но на практике медленнее)
         self.fd_matvec = False         # True: матрица-вектор разностью (в ~3 раза быстрее JVP, но неточно на изломах ограничителя)
         self.zmin = 0.0
@@ -621,12 +628,12 @@ class RansSolver:
                                                self._wall_values(self.prim(q))))
         phi = None                                    # «замороженный» ограничитель (при застое невязки)
         from .bilu import BlockILU0
-        if not hasattr(self, "_bilu"):
+        if not hasattr(self, "_bilu") or self._bilu.fill != int(self.prec_fill):
             self._want_blocks = True
             r_, c_, _ = self.jac1(jnp.asarray(np.tile(np.asarray(self.cons(jnp.asarray(winf[None]))), (self.nc, 1))),
                                   jnp.asarray(winf), jnp.asarray(0.0), np.ones(self.nc))
             self._want_blocks = False
-            self._bilu = BlockILU0(self.nc, r_, c_)
+            self._bilu = BlockILU0(self.nc, r_, c_, fill=int(self.prec_fill))
         if not hasattr(self, "_jac1_fn") or getattr(self, "_jac_alpha", None) != alpha:
             self._jac1_fn = jax.jit(self._jac1_parts)
             self._jac_alpha = alpha
@@ -635,6 +642,7 @@ class RansSolver:
         cfl = cfl0
         self._last_ok, self._last_lin = True, 0.0
         fh = []
+        lu, lu_it = None, 0
         H = dict(it=[], res=[], rn=[], cl=[], cd=[], cfl=[])
         conv = False
         status = ""
@@ -716,14 +724,26 @@ class RansSolver:
                             1.0 if rn < 3.0 * hist[-2][0] and ok_ else 0.5)
                     cfl = min(cfl_max, max(cfl0, cfl * grow))
             dt = self.local_dt(Q, cfl)
-            self._want_blocks = True
-            _, _, blocks = self.jac1(Qj, winf_j, gm, dt)
-            self._want_blocks = False
-            ilu = self._bilu.factor(blocks)
-            if not np.all(np.isfinite(ilu.invU)):
-                cfl = max(cfl0, cfl / 10)
-                continue
             N5 = 5 * self.nc
+            if self.prec == "lu":
+                if lu is None or it - lu_it >= max(1, self.prec_reuse):
+                    try:
+                        A1 = self.jac1(Qj, winf_j, gm, dt)
+                        lu = spla.splu(A1.tocsc(), permc_spec="COLAMD")
+                        lu_it = it
+                    except RuntimeError:                # вырожденная матрица — уменьшить шаг
+                        lu = None
+                        cfl = max(cfl0, cfl / 10)
+                        continue
+                ilu = lu
+            else:
+                self._want_blocks = True
+                _, _, blocks = self.jac1(Qj, winf_j, gm, dt)
+                self._want_blocks = False
+                ilu = self._bilu.factor(blocks)
+                if not np.all(np.isfinite(ilu.invU)):
+                    cfl = max(cfl0, cfl / 10)
+                    continue
             M = spla.LinearOperator((N5, N5), ilu.solve)
             Vdt = np.repeat(self.vol / dt, 5)
 
@@ -894,8 +914,11 @@ def _rans_chunk(args):
     """Исполнитель: часть поляры в отдельном процессе."""
     import warnings
     warnings.filterwarnings("ignore")
-    (mesh, mach, re, chord, xref, alphas, idx, Q0, rref, max_iter, conv, queue, skip_gen, stop_ev, init) = args
+    (mesh, mach, re, chord, xref, alphas, idx, Q0, rref, max_iter, conv, queue, skip_gen, stop_ev, init,
+     sopts) = args
     solver = RansSolver(mesh, mach, re, chord=chord, xref=xref)
+    for k_, v_ in (sopts or {}).items():
+        setattr(solver, k_, v_)
     solver._rref = rref
     ctl = _ProcControl(queue, skip_gen, stop_ev)
     out = [None] * len(alphas)
@@ -917,7 +940,8 @@ def _rans_chunk(args):
 
 
 def rans_polar(elements, alphas, re, mach=0.15, chord=1.0, xref=None, mesh=None, callback=None,
-               max_iter=250, verbose=False, conv=None, control=None, workers=1, init=None, rref=None):
+               max_iter=250, verbose=False, conv=None, control=None, workers=1, init=None, rref=None,
+               solver_opts=None):
     """Поляра RANS для одно- или многоэлементного профиля: сетка строится один
     раз (сгущение по линиям следа невязкого решения при среднем угле), углы
     атаки считаются от ближайшего к нулю в обе стороны, каждый — от решения
@@ -937,6 +961,8 @@ def rans_polar(elements, alphas, re, mach=0.15, chord=1.0, xref=None, mesh=None,
     xs = np.concatenate([e.x for e in elements])
     xr = xref if xref is not None else (float(xs.min()) + 0.25 * chord, 0.0)
     solver = RansSolver(mesh, mach, re, chord=chord, xref=xr)
+    for k_, v_ in (solver_opts or {}).items():          # например {"prec_fill": 3}
+        setattr(solver, k_, v_)
     if rref:
         solver._rref = float(rref)
     seq = _seq_order(alphas)
@@ -986,7 +1012,8 @@ def rans_polar(elements, alphas, re, mach=0.15, chord=1.0, xref=None, mesh=None,
     try:
         with ProcessPoolExecutor(len(chunks), mp_context=ctx) as ex:
             futs = [ex.submit(_rans_chunk, (mesh, mach, re, chord, xr, alphas, c, Q0, rref, max_iter, conv,
-                                            queue, skip_gen, stop_ev, {i: init[i] for i in c if i in init}))
+                                            queue, skip_gen, stop_ev, {i: init[i] for i in c if i in init},
+                                            solver_opts))
                     for c in chunks]
             pending = set(futs)
             last_skip = False

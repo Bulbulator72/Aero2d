@@ -402,7 +402,7 @@ def run_multi_viscous_batch(elements, alphas, mach: float, re_list, ncrit: float
 
 def run_rans(af, alphas, mach: float, re: float, callback=None, max_iter: int = 250,
              name: str | None = None, chord=None, mesh=None, mesh_opts=None, conv=None,
-             control=None, workers: int = 1, init=None, rref=None) -> Polar:
+             control=None, workers: int = 1, init=None, rref=None, solver_opts=None) -> Polar:
     """RANS (Навье–Стокс + Спаларт–Аллмарас, полностью турбулентный) для профиля
     или механизации (список элементов). Медленно, но описывает отрыв и слияние
     следов в щелях — для Cl_max механизации. callback(text, fraction) -> True для остановки.
@@ -443,7 +443,8 @@ def run_rans(af, alphas, mach: float, re: float, callback=None, max_iter: int = 
                    f"(первая итерация каждого процесса включает компиляцию)")
         return callback(txt, min(1.0, (k + (it / max_iter if r is None else 0)) / n))
     res, mesh = rans_polar(elements, alphas, re, mach=mach, chord=chord, callback=cb, max_iter=max_iter,
-                           mesh=mesh, conv=conv, control=control, workers=workers, init=init, rref=rref)
+                           mesh=mesh, conv=conv, control=control, workers=workers, init=init, rref=rref,
+                           solver_opts=solver_opts)
     done = np.array([r is not None for r in res])
     nan = float("nan")
     cl = np.array([r.cl if r else nan for r in res])
@@ -492,7 +493,7 @@ def run_rans(af, alphas, mach: float, re: float, callback=None, max_iter: int = 
 
 
 def continue_rans(p: Polar, callback=None, max_iter: int = 300, conv=None, control=None, workers: int = 1,
-                  only_bad: bool = True) -> Polar:
+                  only_bad: bool = True, solver_opts=None) -> Polar:
     """Досчитать поляру RANS: несошедшиеся (или все при only_bad=False) углы
     продолжаются каждый со своего решения на той же сетке; не посчитанные —
     от ближайшего посчитанного. Возвращает новую поляру (прежняя не меняется)."""
@@ -513,7 +514,8 @@ def continue_rans(p: Polar, callback=None, max_iter: int = 300, conv=None, contr
         init[j] = ctx["states"][src]
     rref = max([H.get("rref", 0.0) for H in ctx["history"] if H] or [0.0]) or None
     q = run_rans(ctx["elements"], alphas[idx], p.mach, p.re, callback, max_iter, chord=ctx["chord"],
-                 mesh=ctx["mesh"], conv=conv, control=control, workers=workers, init=init, rref=rref)
+                 mesh=ctx["mesh"], conv=conv, control=control, workers=workers, init=init, rref=rref,
+                 solver_opts=solver_opts)
     out = copy.copy(p)
     out.label = p.label if p.label.endswith("(досчитано)") else p.label + " (досчитано)"
     for name in ("cl", "cd", "cm", "cdf", "ok"):

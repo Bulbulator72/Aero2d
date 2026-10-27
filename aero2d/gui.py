@@ -173,8 +173,15 @@ class App(tk.Tk):
         ttk.Label(f, text="   Итераций на угол, не более:").grid(row=12, column=0, sticky="w")
         self.rans_iter = tk.StringVar(value="400")
         ttk.Entry(f, textvariable=self.rans_iter, width=8).grid(row=12, column=1, sticky="w")
+        rp = ttk.Frame(f)
+        rp.grid(row=13, column=0, columnspan=2, sticky="w")
+        ttk.Label(rp, text="   предобусловливатель ILU(k), k =").pack(side="left")
+        self.prec_fill = tk.StringVar(value="3")
+        ttk.Combobox(rp, textvariable=self.prec_fill, values=["0", "1", "2", "3", "4"], state="readonly",
+                     width=3).pack(side="left")
+        ttk.Label(rp, text=" (больше — быстрее, больше памяти)", foreground="#555").pack(side="left")
         ttk.Label(f, text="   сетка — вкладка «Сетка», сходимость — «Невязки»", foreground="#555").grid(
-            row=13, column=0, columnspan=2, sticky="w")
+            row=14, column=0, columnspan=2, sticky="w")
 
         # --- кнопки
         f = ttk.Frame(left, padding=(0, 6))
@@ -604,7 +611,8 @@ class App(tk.Tk):
                         p_ = core.run_rans(af, alphas, mach, r_, cb, rit, nm,
                                            chord=(1.0 if isinstance(af, list) and self.src.get() != "mfile" else None),
                                            mesh=(mesh0 if r_ == re0 else None), mesh_opts=mopts, conv=conv,
-                                           control=ctl, workers=nw)
+                                           control=ctl, workers=nw,
+                                           solver_opts={"prec_fill": int(self.prec_fill.get())})
                         ps.append(p_)
                         if p_.field_ctx and r_ == re0 and mesh0 is None:
                             self.q.put(("mesh", sig, p_.field_ctx["mesh"], r_, p_.field_ctx["chord"]))
@@ -1303,7 +1311,8 @@ class App(tk.Tk):
                 def cb(text, frac):
                     self.q.put(("progress", text, frac))
                     return self.stop_flag.is_set()
-                q = core.continue_rans(p, cb, rit, conv=conv, control=self._rans_ctl, workers=nw)
+                q = core.continue_rans(p, cb, rit, conv=conv, control=self._rans_ctl, workers=nw,
+                                       solver_opts={"prec_fill": int(self.prec_fill.get())})
                 self.q.put(("done", q))
             except Exception as e:  # noqa: BLE001
                 self.q.put(("error", f"{e}\n\n{traceback.format_exc(limit=3)}"))

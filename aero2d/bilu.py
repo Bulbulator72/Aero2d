@@ -11,10 +11,13 @@ import numpy as np
 
 
 class BlockILU0:
-    def __init__(self, n, rows, cols, k=5, perm=None):
+    def __init__(self, n, rows, cols, k=5, perm=None, fill=0):
         """Структура: n блочных строк, ненулевые блоки (rows[e], cols[e]) —
         без повторов, диагональ обязательна. perm — новый порядок строк
-        (perm[новый] = старый); по умолчанию — обратный Катхилл–Макки."""
+        (perm[новый] = старый); по умолчанию — обратный Катхилл–Макки.
+        fill — уровень заполнения: 0 — ILU(0); 1, 2 — ILU(k): добавляются
+        блоки, которые появились бы при исключении (больше памяти, сильнее
+        предобусловливатель)."""
         import scipy.sparse as sp
         from scipy.sparse.csgraph import reverse_cuthill_mckee
         rows, cols = np.asarray(rows), np.asarray(cols)
@@ -24,21 +27,31 @@ class BlockILU0:
         inv = np.empty(n, int)
         inv[perm] = np.arange(n)
         self.n, self.k, self.perm, self.iperm = n, k, perm, inv
-        r, c = inv[rows], inv[cols]
+        r0, c0 = inv[rows], inv[cols]
+        # шаблон с заполнением уровня fill (в новой нумерации)
+        P = sp.csr_matrix((np.ones(len(r0)), (r0, c0)), shape=(n, n))
+        for _ in range(int(fill)):
+            Lp = sp.tril(P, -1).tocsr()
+            Up = sp.triu(P, 1).tocsr()
+            P = (P + Lp @ Up).tocsr()
+        P = P.tocoo()
+        r, c = P.row.astype(np.int64), P.col.astype(np.int64)
         order = np.lexsort((c, r))
-        self.src = order                          # исходный номер блока для каждой позиции
         r, c = r[order], c[order]
+        key = r * n + c
+        # где в шаблоне стоят исходные блоки
+        self.src_pos = np.searchsorted(key, r0.astype(np.int64) * n + c0)
+        self.nnz_orig = len(r0)
+        self.fill = int(fill)
         self.r, self.c = r, c
         nnz = len(r)
-        key = r.astype(np.int64) * n + c
-        lookup = {int(kk): e for e, kk in enumerate(key)}
-        self.diag = np.array([lookup[i * n + i] for i in range(n)])
+        self.diag = np.searchsorted(key, np.arange(n, dtype=np.int64) * (n + 1))
         low = np.where(c < r)[0]
         up = np.where(c > r)[0]
-        # уровни для нижнего треугольника
-        lev = np.zeros(n, int)
         start = np.searchsorted(r, np.arange(n))
         end = np.searchsorted(r, np.arange(n), side="right")
+        # уровни для нижнего и верхнего треугольника (строки уровня независимы)
+        lev = np.zeros(n, int)
         for i in range(n):
             cc = c[start[i]:end[i]]
             lo = cc[cc < i]
@@ -51,38 +64,49 @@ class BlockILU0:
             if len(hi):
                 levu[i] = levu[hi].max() + 1
         self.lev, self.levu = lev, levu
-        # ранг нижнего элемента в строке
+        # ранг нижнего элемента в строке (номер по возрастанию столбца)
         rank = np.zeros(nnz, int)
-        for i in range(n):
-            ee = np.arange(start[i], end[i])
-            ee = ee[c[ee] < i]
-            rank[ee] = np.arange(len(ee))
-        # пары обновлений для каждого нижнего e=(i,k): (i,j) −= (i,k)(k,j), j > k
-        pairs_e, pairs_ij, pairs_kj = [], [], []
-        for e in low:
-            i, kk = r[e], c[e]
-            for e2 in range(start[kk], end[kk]):
-                j = c[e2]
-                if j > kk:
-                    eij = lookup.get(int(i * n + j))
-                    if eij is not None:
-                        pairs_e.append(e); pairs_ij.append(eij); pairs_kj.append(e2)
-        pairs_e, pairs_ij, pairs_kj = (np.array(a, int) for a in (pairs_e, pairs_ij, pairs_kj))
-        # расписание разложения: (уровень, ранг)
+        nlow_row = np.bincount(r[low], minlength=n)
+        first_low = start                                    # нижние идут первыми в строке
+        rank[low] = low - first_low[r[low]]
+        # пары обновлений для каждого нижнего e=(i,k): (i,j) −= (i,k)(k,j), j > k — векторно
+        nup = end - start - nlow_row - 1                     # верхних в строке (без диагонали)
+        up_first = self.diag + 1                             # верхние — сразу после диагонали
+        cnt = nup[c[low]]
+        tot = int(cnt.sum())
+        E = np.repeat(low, cnt)
+        offs = np.arange(tot) - np.repeat(np.cumsum(cnt) - cnt, cnt)
+        kj = np.repeat(up_first[c[low]], cnt) + offs
+        kij = r[E].astype(np.int64) * n + c[kj]
+        loc = np.searchsorted(key, kij)
+        loc = np.minimum(loc, nnz - 1)
+        ok = key[loc] == kij
+        pairs_e, pairs_ij, pairs_kj = E[ok], loc[ok], kj[ok]
+        self.n_pairs = len(pairs_e)
+        # расписание разложения: (уровень, ранг) — группировка сортировкой
         self.fact = []
         L = lev.max() + 1
-        maxr = rank[low].max() + 1 if len(low) else 0
+        maxr = int(rank[low].max()) + 1 if len(low) else 1
         lev_e = lev[r]
-        for l in range(L):
+        gl = lev_e[low] * maxr + rank[low]
+        o_l = np.argsort(gl, kind="stable")
+        gl_s, low_s = gl[o_l], low[o_l]
+        gp = lev_e[pairs_e] * maxr + rank[pairs_e]
+        o_p = np.argsort(gp, kind="stable")
+        gp_s = gp[o_p]
+        pe, pij, pkj = pairs_e[o_p], pairs_ij[o_p], pairs_kj[o_p]
+        rows_by_lev = np.argsort(lev, kind="stable")
+        lev_bounds = np.searchsorted(lev[rows_by_lev], np.arange(L + 1))
+        for l_ in range(L):
             steps = []
-            for p in range(maxr):
-                E = low[(lev_e[low] == l) & (rank[low] == p)]
-                if len(E) == 0:
+            for p_ in range(maxr):
+                g = l_ * maxr + p_
+                a, b = np.searchsorted(gl_s, g), np.searchsorted(gl_s, g, side="right")
+                if a == b:
                     continue
-                m = np.isin(pairs_e, E)
-                steps.append((E, pairs_e[m], pairs_ij[m], pairs_kj[m]))
-            rws = np.where(lev == l)[0]
-            self.fact.append((steps, rws))
+                a2, b2 = np.searchsorted(gp_s, g), np.searchsorted(gp_s, g, side="right")
+                steps.append((low_s[a:b], pe[a2:b2], pij[a2:b2], pkj[a2:b2]))
+            self.fact.append((steps, rows_by_lev[lev_bounds[l_]:lev_bounds[l_ + 1]]))
         # расписание решения
         self.fwd = []
         for l in range(L):
@@ -99,7 +123,8 @@ class BlockILU0:
 
     def factor(self, blocks):
         """blocks — блоки в исходном порядке (как rows/cols конструктора)."""
-        B = np.array(blocks, float)[self.src]
+        B = np.zeros((len(self.r), self.k, self.k))
+        B[self.src_pos] = np.asarray(blocks, float)
         invU = np.zeros((self.n, self.k, self.k))
         for steps, rws in self.fact:
             for E, pe, pij, pkj in steps:
