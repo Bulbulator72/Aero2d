@@ -1192,7 +1192,8 @@ class App(tk.Tk):
         self._res_drawn = 0.0
 
     TURB_MODELS = {"SA (Спаларт–Аллмарас)": "sa",
-                   "SA-RC (поправка на кривизну)": "sa-rc"}
+                   "SA-RC (поправка на кривизну)": "sa-rc",
+                   "SA-AFT (переход, Ñкрит из окна)": "sa-aft"}
 
     CFL_PRESETS = {"обычный": dict(cfl_start="5", cfl_limit="1e6", cfl_growth="1.25", first_order="30",
                                    rollback_factor="100"),
@@ -1217,6 +1218,13 @@ class App(tk.Tk):
         o["first_order"] = int(o["first_order"])
         o["prec_fill"] = int(self.prec_fill.get())
         o["turb_model"] = self.TURB_MODELS[self.turb_model.get()]
+        if o["turb_model"].endswith("aft"):
+            try:
+                o["ncrit"] = num(self.ncrit)
+            except ValueError:
+                raise ValueError("Ñкрит — проверьте число") from None
+            if not 1.0 <= o["ncrit"] <= 14.0:
+                raise ValueError("Ñкрит для модели перехода: от 1 до 14")
         return o
 
     def halve_cfl(self):

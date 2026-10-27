@@ -9,6 +9,9 @@
   rc    (1–2 часа): модель SA-RC (поправка на кривизну) — NACA 0012 α = 0° и 10° против
          эталона NASA для SA-RC и механизация GA(W)-1 с закрылком 40° (α = 0, 5, 10°),
          где SA расходится с опытом.
+  aft   (1–2 часа): модель перехода SA-AFT (Ñкрит = 9): профиль E387 при Re 2·10⁵ и 3·10⁵,
+         α = 0, 2, 4, 6° — против продувки NASA LTPT (TM-4062), вязкого метода aero2d
+         (точки перехода) и полностью турбулентного SA.
 Отчёт: benchmarks/verify_report.txt — его и нужно прислать.
 """
 from __future__ import annotations
@@ -149,11 +152,61 @@ def rc():
                 f"закр. {r.elements[1]['cl']:.3f}, итераций {r.iterations}, {r.status}")
 
 
+def aft():
+    import json
+    import numpy as np
+    from aero2d.geometry import load_airfoil, repanel
+    from aero2d.parallel import auto_workers
+    from aero2d.rans import Convergence, mesh_for, rans_polar
+    from aero2d.viscous import ViscousSolver
+    lt = json.load(open(os.path.join(HERE, "data", "ltpt", "e387_ltpt.json")))
+    af = load_airfoil(os.path.join(HERE, "data", "uiuc", "e387_coord.dat"))
+    af = repanel(af, 180)
+    alphas = [0.0, 2.0, 4.0, 6.0]
+    for re in (2e5, 3e5):
+        rows = np.array(lt["polars"][str(int(re))])
+        mesh = mesh_for([af], 3.0, re)
+        log(f"\n--- SA-AFT, E387, Re {re:.0f}, M 0,1: сетка {mesh.n_cells} ячеек")
+        vs = ViscousSolver(af, re, ncrit=9.0, mach=0.1)
+        ref = {}
+        for a in alphas:
+            r = vs.solve(a)
+            ref[a] = (r.cl, r.cd, r.xtr_u, r.xtr_l)
+        t0 = time.time()
+        out = {}
+        for tm in ("sa-aft", "sa"):
+            def cb(k, n, it, rn, r, tm=tm):
+                if r is not None:
+                    log(f"  {tm} α {r.alpha:4.1f}: Cl {r.cl:.3f} Cd {r.cd:.4f}, {r.status}, {time.time() - t0:.0f} с")
+                return False
+            res, _ = rans_polar([af], alphas, re, mach=0.1, mesh=mesh, callback=cb, max_iter=500,
+                                conv=Convergence(), workers=auto_workers(), coarse_start=False,
+                                solver_opts={"turb_model": tm, "ncrit": 9.0})
+            out[tm] = res
+        from aero2d.core import _rans_xtr
+        from scipy.spatial import cKDTree
+        log("   α  | LTPT Cl  Cd    | вязк. Cl  Cd     x_tr верх/низ | SA-AFT Cl  Cd     x_tr верх/низ | SA Cl  Cd")
+        for i, a in enumerate(alphas):
+            e = np.interp(a, rows[:, 0], rows[:, 1]), np.interp(a, rows[:, 0], rows[:, 2])
+            v = ref[a]
+            ra, rs = out["sa-aft"][i], out["sa"][i]
+            xt = (np.nan, np.nan)
+            if ra is not None and ra.elements[0].get("gam") is not None:
+                el = ra.elements[0]
+                _, j = cKDTree(np.column_stack([af.x, af.y])).query(np.column_stack([el["x"], el["y"]]))
+                o = np.argsort(j, kind="stable")
+                xt = _rans_xtr(np.asarray(af.x), j[o], el["x"][o], el["gam"][o])
+            f = lambda r: f"{r.cl:.3f} {r.cd:.4f}" if r is not None else "—"
+            log(f" {a:4.1f} | {e[0]:.3f} {e[1]:.4f} | {v[0]:.3f} {v[1]:.4f}  {v[2]:.2f}/{v[3]:.2f} | "
+                f"{f(ra)}  {xt[0]:.2f}/{xt[1]:.2f} | {f(rs)}")
+        log(f"  всего {time.time() - t0:.0f} с")
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "quick"
     header()
     t = time.time()
-    jobs = (("rc", rc),) if mode == "rc" else (("naca", naca), ("gaw", gaw))
+    jobs = (("rc", rc),) if mode == "rc" else (("aft", aft),) if mode == "aft" else (("naca", naca), ("gaw", gaw))
     for name, fn in jobs:
         if name == "gaw" and mode != "full":
             continue

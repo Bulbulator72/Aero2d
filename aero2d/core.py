@@ -456,20 +456,29 @@ def run_rans(af, alphas, mach: float, re: float, callback=None, max_iter: int = 
     # Cp вдоль контура каждого элемента (грани стенки — по порядку точек контура)
     from scipy.spatial import cKDTree
     xs_all, cps_all = [], []
-    for r in res:
+    xtr_u, xtr_l = np.full(n, nan), np.full(n, nan)
+    for i_, r in enumerate(res):
         if r is None:
             xs_all.append(np.array([nan])); cps_all.append(np.array([nan]))
             continue
         xx, cc = [], []
-        for e, el in zip(elements, r.elements):
+        for e_i, (e, el) in enumerate(zip(elements, r.elements)):
             _, j = cKDTree(np.column_stack([e.x, e.y])).query(np.column_stack([el["x"], el["y"]]))
             o = np.argsort(j, kind="stable")
             xx.append(np.append(el["x"][o], nan)); cc.append(np.append(el["cp"][o], nan))
+            if e_i == 0 and el.get("gam") is not None:
+                xtr_u[i_], xtr_l[i_] = _rans_xtr(np.asarray(e.x), j[o], el["x"][o], el["gam"][o], chord)
         xs_all.append(np.concatenate(xx)); cps_all.append(np.concatenate(cc))
+    tm = (solver_opts or {}).get("turb_model", "sa")
+    if tm.endswith("aft"):
+        tr_txt = (f"; ламинарно-турбулентный переход — модель AFT2017b (Coder, NASA: усиление волн "
+                  f"Толмина–Шлихтинга ñ по огибающей eᴺ и перемежаемость γ), Ñкрит = "
+                  f"{(solver_opts or {}).get('ncrit', 9):g}. ")
+    else:
+        tr_txt = "; пограничный слой турбулентный от носка (переход не моделируется). "
     notes = [f"RANS: уравнения Навье–Стокса, осреднённые по Рейнольдсу, модель турбулентности "
              f"Спаларта–Аллмараса" + (" с поправкой Спаларта–Шура на вращение и кривизну линий тока (SA-RC)"
-                                      if (solver_opts or {}).get("turb_model") == "sa-rc" else "") +
-             f"; пограничный слой турбулентный от носка (переход не моделируется). "
+                                      if tm == "sa-rc" else "") + tr_txt +
              f"Сетка gmsh: {mesh.n_cells} ячеек. Re = {re:.3g}, M = {mach:g}.",
              "Проверка: NACA 0012 (NASA TMR) и GA(W)-1 + закрылок Фаулера (CR-2443) — в README."]
     if m_note:
@@ -492,13 +501,41 @@ def run_rans(af, alphas, mach: float, re: float, callback=None, max_iter: int = 
         notes.append("Cl по элементам: " + "; ".join(
             f"{r.alpha:g}°: " + ", ".join(f"{e['cl']:.3f}" for e in r.elements) for r in res if r))
     nm = name or (elements[0].name if len(elements) == 1 else "многоэлементный")
-    tm = (solver_opts or {}).get("turb_model", "sa")
-    tname = {"sa": "SA", "sa-rc": "SA-RC"}.get(tm, tm.upper())
+    tname = {"sa": "SA", "sa-rc": "SA-RC", "sa-aft": "SA-AFT"}.get(tm, tm.upper())
+    if np.isfinite(xtr_u).any():
+        notes.append("Переход (начало турбулентного слоя), x/c верх / низ: " + "; ".join(
+            f"{a:g}° — {u:.3f} / {l_:.3f}" for a, u, l_ in zip(alphas, xtr_u, xtr_l) if np.isfinite(u)))
     return Polar(f"{nm}, RANS-{tname}, Re={re:.3g}, M={mach:g}", "rans", mach, alphas, cl, cd, cm, ok,
                  xs_all, cps_all, notes, re=re, cdf=cdf,
+                 xtr_u=xtr_u if np.isfinite(xtr_u).any() else None,
+                 xtr_l=xtr_l if np.isfinite(xtr_l).any() else None,
                  field_ctx=dict(method="rans", mesh=mesh, elements=elements, mach=mach, re=re, chord=chord,
                                 alpha=alphas, states=[r.state if r else None for r in res],
                                 history=[r.history if r else None for r in res]))
+
+
+def _rans_xtr(xc, jnode, x, gam, chord=1.0):
+    """Точки перехода по признаку турбулентного слоя у стенки (ν̃/(κ u_τ y) > 0,5): на каждой
+    поверхности (от передней кромки назад) — начало последнего турбулентного участка.
+    Возвращает x/c верха и низа."""
+    ile = int(np.argmin(xc))
+    x0 = float(xc.min())
+    out = []
+    for side in (jnode <= ile, jnode > ile):            # обход контура: верх от з.к. к носку, затем низ
+        xs, gs = x[side], gam[side]
+        if len(xs) == 0:
+            out.append(np.nan)
+            continue
+        o = np.argsort(xs)
+        xs, gs = xs[o], gs[o]
+        lam = np.where(gs < 0.5)[0]
+        if len(lam) == 0:
+            out.append(0.0)
+        elif lam[-1] == len(xs) - 1:
+            out.append(1.0)                                # ламинарный до задней кромки
+        else:
+            out.append((xs[lam[-1] + 1] - x0) / chord)
+    return out[0], out[1]
 
 
 def continue_rans(p: Polar, callback=None, max_iter: int = 300, conv=None, control=None, workers: int = 1,
@@ -531,6 +568,12 @@ def continue_rans(p: Polar, callback=None, max_iter: int = 300, conv=None, contr
         arr = np.array(getattr(p, name), copy=True)
         arr[idx] = getattr(q, name)
         setattr(out, name, arr)
+    for name in ("xtr_u", "xtr_l"):
+        if getattr(q, name) is not None:
+            arr = (np.array(getattr(p, name), float, copy=True) if getattr(p, name) is not None
+                   else np.full(len(alphas), np.nan))
+            arr[idx] = getattr(q, name)
+            setattr(out, name, arr)
     out.cp_x, out.cp = list(p.cp_x), list(p.cp)
     states, hist = list(ctx["states"]), list(ctx["history"])
     for j, k in enumerate(idx):

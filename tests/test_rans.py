@@ -147,3 +147,34 @@ def test_sa_rc_factor_near_one_in_boundary_layer():
     f = np.asarray(s.fr1(w, s.gradients(w, s._wall_values(w))))
     k = (m.wall_dist < 1e-3) & (m.centroid[:, 0] > 0.05) & (m.centroid[:, 0] < 0.95)
     assert 0.95 < np.median(f[k]) < 1.05 and f.min() >= 0 and f.max() <= 1.25
+
+
+@pytest.mark.skipif(gmsh_missing, reason="нет gmsh")
+def test_sa_aft_transition_model_basics():
+    from aero2d.rans import RansSolver, wall_direction
+    from aero2d.rans_mesh import build_mesh
+    m = build_mesh([repanel(naca4("0012", 120), 60)], re=1e6, far_radius=20)
+    d, g = wall_direction(m)
+    assert np.allclose(np.hypot(g[:, 0], g[:, 1]), 1.0) and np.all(d <= m.wall_dist + 1e-9)
+    s = RansSolver(m, 0.15, 1e6)
+    s.turb_model = "sa-aft"
+    assert s.nv == 7 and len(s.freestream(2.0)) == 7 and s.freestream(2.0)[4] == 0.1
+    r = s.solve(2.0, max_iter=6)
+    assert r.state.shape == (m.n_cells, 7) and np.all(np.isfinite(r.state))
+    # в набегающем потоке ñ = 0, γ̃ = 0; в ламинарном слое у стенки γ̃ < 0 (γ → 1/c3)
+    assert r.elements[0]["gam"] is not None
+    s2 = RansSolver(m, 0.15, 1e6)                           # тёплый старт SA → SA-AFT и обратно
+    s2.turb_model = "sa"
+    r2 = s2.solve(2.0, Q0=r.state, max_iter=2)
+    assert r2.state.shape == (m.n_cells, 5)
+
+
+def test_rans_xtr_from_indicator():
+    from aero2d.core import _rans_xtr
+    xc = np.array([1.0, 0.5, 0.0, 0.5, 1.0])            # верх (з.к. → носок), низ
+    x = np.linspace(0, 1, 11)
+    jn = np.r_[np.zeros(11, int), np.full(11, 4)]
+    xs = np.r_[x, x]
+    ind = np.r_[(x > 0.42).astype(float), np.zeros(11)]   # верх: турбулентный с 0,5; низ ламинарный
+    u, l_ = _rans_xtr(xc, jn, xs, ind)
+    assert abs(u - 0.5) < 1e-12 and l_ == 1.0
