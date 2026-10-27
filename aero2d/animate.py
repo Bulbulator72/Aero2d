@@ -78,7 +78,12 @@ def make_gif(mesh, elements, run, path, quantity="vorticity", box=(-0.5, 2.5, -0
         fields.append((t, z, f))
         if progress and progress(k, 2 * len(frames)):
             return 0
-    allz = np.concatenate([np.ravel(z[np.isfinite(z)]) for _, z, _ in fields])
+    # пределы шкалы — без тонкого слоя у стенок (там завихренность на порядки больше,
+    # чем в отрыве и следе, и вихри стали бы неразличимы)
+    from scipy.ndimage import distance_transform_edt
+    dpx = (box[1] - box[0]) / max(X.shape[1] - 1, 1)
+    far = distance_transform_edt(~inside) * dpx > 0.02 if inside.any() else np.ones(X.shape, bool)
+    allz = np.concatenate([np.ravel(z[np.isfinite(z) & far]) for _, z, _ in fields])
     if vlim is None:
         if quantity == "vorticity":
             a = float(np.percentile(np.abs(allz), 99.0)) or 1.0

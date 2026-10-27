@@ -1,8 +1,9 @@
 """Проверка RANS на компьютере пользователя: скорость и правильность.
 
 Запуск: python benchmarks/verify_rans.py [quick | full]
-  quick (по умолчанию, ~10–30 мин): NACA 0012, M 0,15, Re 6·10⁶, α = 0° и 10°,
-         предобусловливатель ILU(0) и ILU(3) — сравнение времени и с эталоном NASA.
+  quick (по умолчанию, ~10–30 мин): NACA 0012, M 0,15, Re 6·10⁶, α = 0° и 10°
+         (продолжением) и α = 10° отдельно, ограничитель у задних кромок (по умолчанию)
+         и везде (как раньше) — время, итерации и сравнение с эталоном NASA.
   full  (около часа): то же + GA(W)-1 с закрылком Фаулера 30°, α = 0…12° через 2°
          (7 углов): старт на грубой сетке, затем все углы параллельно на ядрах —
          сравнение с продувкой NASA CR-2443 и время на этом ПК.
@@ -67,17 +68,26 @@ def naca():
     mesh = build_mesh([af], re=6e6, far_radius=50)
     log(f"\n--- NACA 0012, M 0,15, Re 6e6: сетка {quality(mesh)['cells']} ячеек ({time.time() - t:.1f} с)")
     log("эталон NASA TMR (CFL3D): α=0: Cd 0,00819; α=10: Cl 1,0909, Cd 0,01231")
-    for fill in (3, 0):
+    # ограничитель: "te" — только у задних кромок (по умолчанию с 10.2026), "all" — везде (как раньше)
+    for zone in ("te", "all"):
         s = RansSolver(mesh, 0.15, 6e6)
-        s.prec_fill = fill
-        Q = None
+        s.limiter_zone = zone
+        Q, a0 = None, None
         for a in (0.0, 10.0):
             t = time.time()
-            r = s.solve(a, Q0=Q, max_iter=400)
+            r = s.solve(a, Q0=Q, max_iter=400, alpha0=a0)
             ref = TMR[a]
-            log(f"ILU({fill})  α {a:4.1f}: Cl {r.cl:.4f} (эталон {ref[0]:.4f})  Cd {r.cd:.5f} (эталон {ref[1]:.5f})  "
-                f"итераций {r.iterations}, {r.status}, {time.time() - t:.0f} с")
-            Q = r.state
+            log(f"ограничитель {zone:3s} α {a:4.1f}: Cl {r.cl:.4f} (эталон {ref[0]:.4f})  Cd {r.cd:.5f} "
+                f"(эталон {ref[1]:.5f}; давл. {r.cdp:.5f}, трение {r.cdf:.5f})  итераций {r.iterations}, "
+                f"{r.status}, {time.time() - t:.0f} с")
+            Q, a0 = r.state, a
+        # та же точка отдельно (с нуля) — должна совпасть с точкой поляры
+        t = time.time()
+        r1 = RansSolver(mesh, 0.15, 6e6)
+        r1.limiter_zone = zone
+        r1 = r1.solve(10.0, max_iter=400)
+        log(f"ограничитель {zone:3s} α 10,0 отдельно: Cl {r1.cl:.4f} Cd {r1.cd:.5f} (в поляре {r.cl:.4f} / "
+            f"{r.cd:.5f}), итераций {r1.iterations}, {time.time() - t:.0f} с")
 
 
 def gaw():
