@@ -345,7 +345,10 @@ class App(tk.Tk):
         ttk.Checkbutton(bar, text="линии тока", variable=self.fl_lines,
                         command=self._redraw_field).pack(side="left", padx=6)
         ttk.Button(bar, text="Построить", command=self.plot_field).pack(side="left", padx=6)
-        ttk.Button(bar, text="Анимация по времени (GIF)…", command=self.animate_dialog).pack(side="left", padx=6)
+        b_ = ttk.Button(bar, text="Анимация по времени (GIF, RANS)…", command=self.animate_dialog)
+        b_.pack(side="left", padx=6)
+        Tooltip(b_, "Нестационарный расчёт RANS от выбранной точки поляры RANS и ролик поля течения. "
+                    "Вязкий и панельный методы стационарные — у них поле строится кнопкой «Построить».")
         self._field_cache = {}
         self._build_res_tab(nb)
         # таблица
@@ -1290,8 +1293,11 @@ class App(tk.Tk):
         cand = [p for p in self.polars if p.method == "rans" and p.field_ctx]
         sel = [p for p in cand if p.label == self.fl_polar.get()] or cand[-1:]
         if not sel:
-            messagebox.showinfo("Анимация", "Анимация по времени строится нестационарным RANS: сначала "
-                                "посчитайте поляру (или одну точку) методом RANS, затем выберите α.")
+            messagebox.showinfo("Анимация", "Анимация показывает развитие течения во времени, а это есть "
+                                "только в нестационарном расчёте RANS.\n\nВязкий метод (панели + пограничный "
+                                "слой) стационарный: поле течения для любого α — кнопка «Построить».\n\n"
+                                "Для ролика: выберите метод RANS, посчитайте точку или поляру, затем снова "
+                                "нажмите эту кнопку.", parent=self)
             return
         p = sel[-1]
         if a is None or not np.isclose(p.alpha, a).any():
