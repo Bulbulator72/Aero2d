@@ -82,6 +82,7 @@ class App(tk.Tk):
         self.title("aero2d — аэродинамика профилей")
         self.geometry("1280x880")
         self.minsize(1000, 650)
+        self._init_fonts()
         self.polars: list[core.Polar] = []
         self.airfoil = None
         self.q: queue.Queue = queue.Queue()
@@ -101,7 +102,7 @@ class App(tk.Tk):
         self.status = tk.StringVar(value="Готово. Выберите профиль и нажмите «Рассчитать».")
         ttk.Label(sb, textvariable=self.status, anchor="w").pack(side="left", fill="x", expand=True, padx=8)
         ttk.Separator(self, orient="horizontal").pack(side="bottom", fill="x")
-        left = ttk.Frame(self, padding=8, width=470)
+        left = self._left = ttk.Frame(self, padding=8, width=470)
         left.pack(side="left", fill="y")
         left.pack_propagate(False)                     # ширина панели не «прыгает» при смене метода
         right = ttk.Frame(self)
@@ -271,6 +272,16 @@ class App(tk.Tk):
         fm.add_separator()
         fm.add_command(label="Выход", command=self.destroy)
         mb.add_cascade(label="Файл", menu=fm)
+        vm = tk.Menu(mb, tearoff=0)
+        vm.add_command(label="Крупнее шрифт", accelerator="Ctrl++", command=lambda: self.set_font_scale(+1))
+        vm.add_command(label="Мельче шрифт", accelerator="Ctrl+−", command=lambda: self.set_font_scale(-1))
+        vm.add_command(label="Обычный размер", accelerator="Ctrl+0", command=lambda: self.set_font_scale(0))
+        mb.add_cascade(label="Вид", menu=vm)
+        for k in ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"):
+            self.bind_all(k, lambda _: self.set_font_scale(+1))
+        for k in ("<Control-minus>", "<Control-KP_Subtract>"):
+            self.bind_all(k, lambda _: self.set_font_scale(-1))
+        self.bind_all("<Control-Key-0>", lambda _: self.set_font_scale(0))
         self.config(menu=mb)
         self._buttons_frame = f
         Tooltip(self.btn_run, "Ctrl+Enter")
@@ -354,8 +365,9 @@ class App(tk.Tk):
                                   "x/c перехода, низ", "Надёжно"], [55, 75, 80, 80, 75, 75, 145, 145, 70]):
             self.table.heading(c, text=t)
             self.table.column(c, width=w, anchor="e", stretch=False)
+        self._table_widths = dict(zip(("#0",) + cols, (260, 55, 75, 80, 80, 75, 75, 145, 145, 70)))
         self.table.tag_configure("bad", foreground="#b03a2e")
-        self.table.tag_configure("group", font=("TkDefaultFont", 10, "bold"))
+        self.table.tag_configure("group", font="BoldFont")
         sb = ttk.Scrollbar(tf, orient="vertical", command=self.table.yview)
         self.table.configure(yscrollcommand=sb.set)
         self.table.pack(side="left", fill="both", expand=True)
@@ -367,6 +379,8 @@ class App(tk.Tk):
         self.notes.pack(fill="both", expand=True)
         self.nb = nb
         self._on_method()
+        self.replot()                                  # пустые графики — с подсказкой, что делать
+        self.set_font_scale(None)                      # сохранённый размер шрифта — и для панелей, графиков
 
     # ------------------------------------------------------------- профиль
     def open_file(self):
@@ -526,6 +540,60 @@ class App(tk.Tk):
             apply()
         ttk.Button(bf, text="Без механизации", command=reset).pack(side="right")
 
+    SETTINGS = os.path.join(os.path.expanduser("~"), ".aero2d_gui.json")
+
+    def _init_fonts(self):
+        """Именованные шрифты окна; их размер меняется меню «Вид» и запоминается между запусками."""
+        from tkinter import font as tkfont
+        self._fonts = {n: tkfont.nametofont(n) for n in ("TkDefaultFont", "TkTextFont", "TkFixedFont",
+                                                         "TkMenuFont", "TkHeadingFont", "TkTooltipFont")}
+        self._font_base = {n: abs(int(f.cget("size"))) or 9 for n, f in self._fonts.items()}
+        base = self._fonts["TkDefaultFont"].actual()
+        self._fonts["BoldFont"] = tkfont.Font(self, name="BoldFont", family=base["family"], weight="bold")
+        self._fonts["SmallFont"] = tkfont.Font(self, name="SmallFont", family=base["family"])
+        self._font_base["BoldFont"] = self._font_base["TkDefaultFont"] + 1
+        self._font_base["SmallFont"] = max(self._font_base["TkDefaultFont"] - 1, 7)
+        self._font_step = 0
+        try:
+            import json
+            with open(self.SETTINGS, encoding="utf-8") as fh:
+                self._font_step = int(json.load(fh).get("font_step", 0))
+        except (OSError, ValueError, AttributeError):
+            pass
+        self.set_font_scale(None)
+
+    def set_font_scale(self, d):
+        """d = +1 / −1 — на пункт крупнее/мельче, 0 — обычный размер, None — применить сохранённый."""
+        if d is not None:
+            self._font_step = 0 if d == 0 else min(max(self._font_step + d, -3), 6)
+        for n, f in self._fonts.items():
+            f.configure(size=self._font_base[n] + self._font_step)
+        rh = int(self._fonts["TkDefaultFont"].metrics("linespace") * 1.35)
+        ttk.Style(self).configure("Treeview", rowheight=rh)
+        k = (self._font_base["TkDefaultFont"] + self._font_step) / self._font_base["TkDefaultFont"]
+        if hasattr(self, "_left"):
+            self._left.configure(width=int(470 * k))
+        if hasattr(self, "_table_widths"):
+            for c, w in self._table_widths.items():
+                self.table.column(c, width=int(w * k))
+        # графики: надписи matplotlib крупнее вместе со шрифтом окна (dpi фигуры, размер в пикселях тот же)
+        canv = [t.canvas for t in vars(self).values() if isinstance(t, PlotTab)]
+        canv += [c for c in (getattr(self, "mesh_canvas", None), getattr(self, "res_canvas", None)) if c]
+        for c in canv:
+            fig, w = c.figure, c.get_tk_widget()
+            fig._original_dpi = 100 * k              # Tk-бэкенд пересчитывает dpi от исходного
+            fig.set_dpi(100 * k)
+            if w.winfo_width() > 1:
+                fig.set_size_inches(w.winfo_width() / fig.dpi, w.winfo_height() / fig.dpi, forward=False)
+            c.draw_idle()
+        if d is not None:
+            try:
+                import json
+                with open(self.SETTINGS, "w", encoding="utf-8") as fh:
+                    json.dump({"font_step": self._font_step}, fh)
+            except OSError:
+                pass
+
     def show_error(self, title, text, details=""):
         """Понятное сообщение об ошибке; техническая трасса — по кнопке «Подробнее»."""
         w = tk.Toplevel(self)
@@ -538,7 +606,7 @@ class App(tk.Tk):
         if isinstance(text, str) and not any(ord(c) > 0x400 for c in text):
             ttk.Label(fr_, text="Если сообщение непонятно — пришлите текст из «Подробнее» разработчику.",
                       foreground="#555", wraplength=460).pack(anchor="w", pady=(6, 0))
-        box = tk.Text(fr_, width=80, height=14, font=("Courier", 9))
+        box = tk.Text(fr_, width=80, height=14, font="TkFixedFont")
         box.insert("end", details)
         box.configure(state="disabled")
         bb = ttk.Frame(fr_)
@@ -666,7 +734,7 @@ class App(tk.Tk):
             ax.set_aspect("equal")
             ax.grid(alpha=0.3)
             ax.legend(fontsize=8)
-            ax.set_title(f"Многоэлементный профиль: {len(af)} элемента(ов). Расчёт — невязкий")
+            ax.set_title(f"Многоэлементный профиль, элементов: {len(af)}")
             ax.set_xlabel("x/c")
             ax.set_ylabel("y/c")
             self.t_geo.draw()
@@ -698,25 +766,83 @@ class App(tk.Tk):
         return float(np.max(np.interp(xs, xu, yu) - np.interp(xs, xl, yl)))
 
     # --------------------------------------------------------------- расчёт
-    def _params(self):
-        num = lambda v: float(v.get().replace(",", ".").replace(" ", ""))
+    class InputError(ValueError):
+        """Неверное значение в поле окна: какое поле и что в нём не так."""
+
+        def __init__(self, var, field, msg):
+            super().__init__(f"«{field}»: {msg}")
+            self.var = var
+
+    def _num(self, var, field, lo=None, hi=None, integer=False, example="1,5"):
+        """Число из поля var (запятая или точка); при ошибке — InputError с названием поля."""
+        t = var.get().strip().replace(" ", "").replace(",", ".")
         try:
-            mach = num(self.mach)
-            alphas = core.alpha_range(num(self.a0), num(self.a1), num(self.da))
-            niter = int(self.niter.get())
-            txt = self.re.get().strip().replace(", ", ";").replace(" ", ";")
-            re_ = [float(t.replace(",", ".")) for t in txt.split(";") if t.strip()]
-            if not re_:
-                raise ValueError("не задано Re")
-            from .parallel import resolve_workers
+            x = int(t) if integer else float(t)
+        except ValueError:
+            what = "целое число" if integer else f"число, например {example}"
+            raise self.InputError(var, field, f"введите {what} (сейчас: «{var.get().strip()}»)") from None
+        if (lo is not None and x < lo) or (hi is not None and x > hi):
+            g = lambda v: f"{v:g}".replace(".", ",")
+            rng = f"от {g(lo)} до {g(hi)}" if lo is not None and hi is not None else \
+                f"не меньше {g(lo)}" if lo is not None else f"не больше {g(hi)}"
+            raise self.InputError(var, field, f"допустимо {rng} (сейчас: {g(x)})")
+        return x
+
+    def _mark_field(self, var):
+        """Подсветить поле с ошибкой и поставить в него курсор; подсветка снимается при правке."""
+        def walk(w):
+            for c in w.winfo_children():
+                yield c
+                yield from walk(c)
+        for w in walk(self):
+            try:
+                if str(w.cget("textvariable")) != str(var):
+                    continue
+            except tk.TclError:
+                continue
+            ttk.Style(self).configure("Bad.TEntry", fieldbackground="#fde2df")
+            old = w.cget("style")
+            w.configure(style="Bad.TEntry")
+            w.focus_set()
+            w.select_range(0, "end")
+            tid = []
+            tid.append(var.trace_add("write", lambda *_: (w.configure(style=old),
+                                                          var.trace_remove("write", tid[0]))))
+            return
+
+    def _params(self):
+        mach = self._num(self.mach, "Число Маха M", 0.0, 3.0, example="0,15")
+        alphas = core.alpha_range(self._num(self.a0, "Угол атаки: от", -90, 90, example="-4"),
+                                  self._num(self.a1, "Угол атаки: до", -90, 90, example="14"),
+                                  self._num(self.da, "Угол атаки: шаг", 1e-3, 90, example="0,5"))
+        niter = self._num(self.niter, "Итераций Эйлера", 1, integer=True) if self.method.get() == "euler" else 100
+        txt = self.re.get().strip().replace(", ", ";").replace(" ", ";")
+        re_ = []
+        for t in (t for t in txt.split(";") if t.strip()):
+            try:
+                re_.append(float(t.replace(",", ".")))
+            except ValueError:
+                raise self.InputError(self.re, "Число Рейнольдса Re",
+                                      f"«{t}» — не число; пример: 1e6 или несколько через «;»: 3e5; 1e6") from None
+        if not re_:
+            raise self.InputError(self.re, "Число Рейнольдса Re", "введите число, например 1e6")
+        for r in re_:
+            if not 1e3 <= r <= 1e9:
+                raise self.InputError(self.re, "Число Рейнольдса Re", f"допустимо от 1e3 до 1e9 (сейчас: {r:g})")
+        from .parallel import resolve_workers
+        try:
             self._workers = resolve_workers(self.cores.get())
-            ncrit = num(self.ncrit)
-            xtr = (num(self.xtru), num(self.xtrl))
-        except ValueError as e:
-            raise ValueError(f"Проверьте числа в полях: {e}") from None
-        if not 0 <= mach < 3.5:
-            raise ValueError("M должно быть в диапазоне 0…3")
+        except ValueError:
+            raise self.InputError(self.cores, "Ядер ЦП", "выберите «авто» или число ядер") from None
+        ncrit = self._num(self.ncrit, "Ñкрит", 0.1, 20, example="9")
+        xtr = (self._num(self.xtru, "Переход не дальше x/c: верх", 0, 1, example="1"),
+               self._num(self.xtrl, "Переход не дальше x/c: низ", 0, 1, example="1"))
         return mach, alphas, niter, re_, ncrit, xtr
+
+    def _input_error(self, e):
+        if isinstance(e, self.InputError):
+            self._mark_field(e.var)
+        messagebox.showerror("Проверьте данные", str(e), parent=self)
 
     def run(self):
         if self.worker and self.worker.is_alive():
@@ -725,7 +851,7 @@ class App(tk.Tk):
             af = self.get_config()
             mach, alphas, niter, re_, ncrit, xtr = self._params()
         except Exception as e:  # noqa: BLE001
-            messagebox.showerror("Ошибка", str(e))
+            self._input_error(e)
             return
         self.airfoil = af
         method, grid = self.method.get(), self.grid_name.get()
@@ -736,7 +862,7 @@ class App(tk.Tk):
                 sopts = self.solver_settings()
                 els_, re0, a_mid, mopts, _, sig = self._mesh_inputs()
             except ValueError as e:
-                messagebox.showerror("Ошибка", str(e) if str(e) else "Итераций на угол — целое число")
+                self._input_error(e if str(e) else ValueError("Итераций на угол — целое число"))
                 return
             mesh0 = self._mesh[1] if self._mesh and self._mesh[0] == sig else None
             from .rans import RansControl
@@ -934,20 +1060,37 @@ class App(tk.Tk):
             self._style(axd2, "Cd", "Cl")
         else:
             axd1.text(0.5, 0.5, "Сопротивление даёт вязкий метод\n(и метод Эйлера — только волновое)",
-                      ha="center", va="center", transform=axd1.transAxes, color="#777")
+                      ha="center", va="center", transform=axd1.transAxes, color="#555")
             axd1.set_axis_off(); axd2.set_axis_off()
-        axl.set_title("× — расчёт не сошёлся или вне границ применимости метода", fontsize=8, color="#777")
+        axl.set_title("× — расчёт не сошёлся или вне границ применимости метода", fontsize=8, color="#555")
+        if not self.polars:
+            for ax in (axl, axm, axd1, axd2):
+                ax.clear()
+                ax.set_axis_off()
+            for ax in (axl, axm, axd1):
+                self._empty(ax)
         for t in (self.t_cl, self.t_cd, self.t_cm):
             t.draw()
         self.plot_cp()
         self.plot_bl()
 
+    EMPTY = "Результатов пока нет.\nЗадайте условия слева и нажмите «Рассчитать» (Ctrl+Enter)."
+
+    def _empty(self, ax, text=None):
+        """Пустое состояние графика: что здесь будет и как это получить."""
+        ax.set_axis_off()
+        ax.text(0.5, 0.5, text or self.EMPTY, ha="center", va="center", transform=ax.transAxes,
+                color="#666", fontsize=11)
+
     def plot_cp(self):
         ax = self.t_cp.ax
         ax.clear()
+        ax.set_axis_on()
         try:
             a = float(self.cp_alpha.get())
         except ValueError:
+            if not self.polars:
+                self._empty(ax)
             self.t_cp.draw()
             return
         for i, p in enumerate(self.polars):
@@ -976,6 +1119,8 @@ class App(tk.Tk):
         try:
             a = float(self.cp_alpha.get())
         except ValueError:
+            if not self.polars:
+                self._empty(fig.add_subplot(111))
             self.t_bl.draw()
             return
         axs = fig.subplots(2, 2, sharex=True)
@@ -1005,7 +1150,7 @@ class App(tk.Tk):
                     ax.axvline(p.xtr_l[k[0]], color=c, lw=0.6, ls="--", alpha=0.5)
         if not found:
             axs[0, 0].text(0.5, 0.5, "Распределения пограничного слоя\nдаёт вязкий метод",
-                           ha="center", va="center", transform=axs[0, 0].transAxes, color="#777")
+                           ha="center", va="center", transform=axs[0, 0].transAxes, color="#555")
         else:
             axs[0, 0].legend(fontsize=7)
             axs[0, 0].axhline(0, color="#999", lw=0.6)
@@ -1076,7 +1221,7 @@ class App(tk.Tk):
         ttk.Label(fr, text="хорда c — физический размер опорной хорды расчёта (её значение в координатах — "
                   "в «Примечаниях»); V∞ по умолчанию — M·340,3 м/с. Для силы на 1 м размаха b = 1.",
                   foreground="#555", wraplength=700).grid(row=2, column=0, columnspan=8, sticky="w", pady=(2, 4))
-        txt = tk.Text(fr, width=110, height=22, font=("Courier", 9))
+        txt = tk.Text(fr, width=110, height=22, font="TkFixedFont")
         txt.grid(row=4, column=0, columnspan=8, sticky="nsew")
         out = {}
 
@@ -1158,7 +1303,7 @@ class App(tk.Tk):
         w.transient(self)
         fr = ttk.Frame(w, padding=10)
         fr.pack(fill="both", expand=True)
-        ttk.Label(fr, text=f"{p.label}, α = {a:g}°", font=("", 10, "bold")).grid(row=0, column=0, columnspan=3,
+        ttk.Label(fr, text=f"{p.label}, α = {a:g}°", font="BoldFont").grid(row=0, column=0, columnspan=3,
                                                                                 sticky="w", pady=(0, 6))
         v_t = tk.StringVar(value="4")
         v_n = tk.StringVar(value="40")
@@ -1397,7 +1542,7 @@ class App(tk.Tk):
         self.t_mesh_frame = fr
         side = ttk.Frame(fr, padding=6)
         side.pack(side="left", fill="y")
-        ttk.Label(side, text="Сетка для RANS (gmsh)", font=("", 10, "bold")).grid(row=0, column=0, columnspan=2,
+        ttk.Label(side, text="Сетка для RANS (gmsh)", font="BoldFont").grid(row=0, column=0, columnspan=2,
                                                                                  sticky="w")
         self.mesh_vars = {}
         for r, (key, lbl, val, tip) in enumerate(self.MESH_FIELDS, start=1):
@@ -1405,7 +1550,7 @@ class App(tk.Tk):
             v = tk.StringVar(value=val)
             ttk.Entry(side, textvariable=v, width=8).grid(row=2 * r - 1, column=1, sticky="w", pady=(3, 0))
             if tip:
-                ttk.Label(side, text=tip, foreground="#777", font=("", 8), wraplength=230).grid(
+                ttk.Label(side, text=tip, foreground="#555", font="SmallFont", wraplength=230).grid(
                     row=2 * r, column=0, columnspan=2, sticky="w")
             self.mesh_vars[key] = v
         r0 = 2 * len(self.MESH_FIELDS) + 1
@@ -1788,7 +1933,7 @@ class App(tk.Tk):
         if not D or not D["angles"]:
             ax = fig.add_subplot(111)
             ax.text(0.5, 0.5, "Ход невязок появится во время расчёта RANS", ha="center", va="center",
-                    transform=ax.transAxes, color="#777")
+                    transform=ax.transAxes, color="#555")
             ax.set_axis_off()
             self.res_canvas.draw_idle()
             return
