@@ -127,6 +127,11 @@ class MultiViscousSolver(ViscousSolver):
     (по умолчанию свободный переход); wake_length — длина следа за самой
     дальней задней кромкой, в опорных хордах."""
 
+    # поляра механизации — продолжением от первой сошедшейся заданной точки, как при
+    # сверке с NASA CR-2443: канонический путь от α = 0 (ViscousSolver.solve_path)
+    # перебирал до 7 холодных стартов по минуте и больше каждый
+    canonical_path = False
+
     def __init__(self, elements, re: float, ncrit: float = 9.0, mach: float = 0.0, xtr=None,
                  chord: float = 1.0, xref=None, n_panels=None, wake_length: float = 1.0,
                  n_wake: int | None = None, confluent: bool = False):

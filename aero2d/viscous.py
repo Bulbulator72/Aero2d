@@ -893,6 +893,7 @@ class ViscousSolver:
         hist, damp, rhist = [], 1.0, []
         it = 0
         best_r, best_it = np.inf, 0
+        n_wild = 0
         for it in range(1, max_iter + 1):
             R, J = self._assemble(X)
             rmax_ = float(np.abs(R).max())
@@ -974,6 +975,12 @@ class ViscousSolver:
             X = X1
             rms = np.sqrt(np.mean(np.concatenate([rels[0][1], rels[1][1], rels[2][1]]) ** 2))
             hist.append(rms)
+            # явная расходимость (|Ue|/V∞ ≫ любого физического, у механизации < ~6) —
+            # не досчитывать до застоя: каждая итерация механизации стоит секунды,
+            # а неудачную попытку подхватит продолжение по связи, углу закрылка, Re
+            n_wild = n_wild + 1 if (not np.isfinite(rms) or np.abs(self._ue).max() > 50.0) else 0
+            if n_wild >= 2:
+                break
             if verbose:
                 ir = np.unravel_index(np.abs(R).argmax(), R.shape)
                 print(f"   it {it:3d} rms {rms:.2e} rlx {rl:.3f} {why}  |R| {np.abs(R).max():.2e} at st{ir[0]} eq{ir[1]}  min ue {self._ue.min():.3f}")
@@ -1151,6 +1158,9 @@ class ViscousSolver:
 
     # шаг «канонического» пути продолжения по α (см. solve_path)
     canon_step = 2.0
+    # поляра по каноническому пути (True) или продолжением от первой сошедшейся
+    # заданной точки (False — механизация, см. MultiViscousSolver)
+    canonical_path = True
 
     def _advance(self, a_t, r0, verbose=False, max_iter=50, depth=0):
         """Переход от сошедшегося решения r0 к углу a_t; при неудаче — через
@@ -1229,11 +1239,39 @@ class ViscousSolver:
             if callback:
                 callback(done[0], n, r)
 
-        for i in np.argsort(np.abs(alphas), kind="stable"):
-            report(i, self.solve_path(alphas[i], verbose=verbose, max_iter=max_iter))
-
         def advance(a_t, r0, depth=0):
             return self._advance(a_t, r0, verbose, max_iter, depth)
+
+        if self.canonical_path:
+            for i in np.argsort(np.abs(alphas), kind="stable"):
+                report(i, self.solve_path(alphas[i], verbose=verbose, max_iter=max_iter))
+        else:
+            # опорная точка — первая сошедшаяся среди заданных углов в порядке |α|,
+            # от неё — вверх и вниз продолжением (механизация: холодный старт стоит
+            # минуты и при α = 0 с отклонённым закрылком может не находиться вовсе)
+            anchor = None
+            for i in np.argsort(np.abs(alphas), kind="stable"):
+                r = self.solve(alphas[i], verbose=verbose, max_iter=max_iter)
+                report(i, r)
+                if r.converged:
+                    anchor = i
+                    break
+            if anchor is None:
+                for i in range(n):
+                    if out[i] is None:
+                        report(i, self.solve(alphas[i], verbose=verbose, max_iter=max_iter))
+                return out
+            for direction in (1, -1):
+                last_ok = out[anchor]
+                for i in [i for i in np.argsort(alphas * direction, kind="stable")
+                          if direction * (alphas[i] - alphas[anchor]) > 0]:
+                    r = advance(alphas[i], last_ok)
+                    if out[i] is None:
+                        report(i, r)
+                    else:
+                        out[i] = r
+                    if r.converged:
+                        last_ok = r
 
         # повторная попытка для несошедшихся точек — от соседей с другой стороны
         order = np.argsort(alphas)

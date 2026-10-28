@@ -315,6 +315,10 @@ def repanel(af: Airfoil, n_side: int = 100, spacing: str = "cosine", keep_frame:
     x, y = x[keep], y[keep]
     s = np.concatenate([[0.0], np.cumsum(np.hypot(np.diff(x), np.diff(y)))])
     cuts = _corners(x, y, corner_angle) if corner_angle else np.array([], int)
+    # углы торца тупой задней кромки (у самых концов контура) не сохраняются: торец
+    # стал бы отдельными крошечными панелями рядом с длинными, и пограничный слой
+    # стартовал бы с него; сплайн через торец — как раньше (и как в XFOIL)
+    cuts = cuts[(s[cuts] > 0.02 * s[-1]) & (s[cuts] < 0.98 * s[-1])]
     sp = _PiecewiseSpline(s, x, y, cuts)
     # передняя кромка — минимум x на сплайне
     sf = np.linspace(0, s[-1], 20001)
@@ -330,10 +334,20 @@ def repanel(af: Airfoil, n_side: int = 100, spacing: str = "cosine", keep_frame:
         s1 = sle * 0.5 * (1 - np.cos(b))
         s2 = sle + (s[-1] - sle) * 0.5 * (1 - np.cos(b))
     st = np.concatenate([s1, s2[1:]])
-    # изломы — точно в узлах (ближайший узел переносится в излом)
+    # изломы — точно в узлах: ближайший узел переносится в излом, а соседние
+    # сдвигаются следом с затуханием (перенос одного узла давал рядом панели,
+    # различающиеся по длине в десятки раз, — пограничный слой на них не сходился)
+    m = 6
+    fixed = set()
     for sc in s[cuts]:
         k = int(np.argmin(np.abs(st[1:-1] - sc))) + 1
+        d = sc - st[k]
+        for j in range(-m, m + 1):
+            i = k + j
+            if 0 < i < len(st) - 1 and i not in fixed:
+                st[i] += d * (1.0 - abs(j) / (m + 1))
         st[k] = sc
+        fixed.add(k)
     st = np.sort(st)
     xo, yo = sp(st)
     out = Airfoil(xo, yo, af.name)
