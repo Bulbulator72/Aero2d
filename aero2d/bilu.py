@@ -227,3 +227,73 @@ class NestedLU:
 
     def solve(self, b):
         return self.lu.solve(np.asarray(b, float)[self.bperm])[self.inv]
+
+
+class JaxTriSolve:
+    """Прямой и обратный ход ILU (BlockILU0) одним скомпилированным циклом JAX
+    (lax.scan по уровням; уровни дополнены до одинакового размера фиктивными
+    элементами — нулевой блок и строка n). В numpy каждый уровень — несколько
+    вызовов с накладными расходами Python; на сетке 35 тыс. ячеек с ILU(3)
+    (667 уровней) это 0,2 с на применение, здесь — миллисекунды."""
+
+    def __init__(self, ilu: BlockILU0):
+        import jax
+        import jax.numpy as jnp
+        jax.config.update("jax_enable_x64", True)
+        self.ilu = ilu
+        n, k, nnz = ilu.n, ilu.k, len(ilu.r)
+        r, c = ilu.r, ilu.c
+
+        def pad(groups, width_of, fill):
+            P = max(1, max(width_of(g) for g in groups))
+            return P, fill
+        P = max(1, max(len(E) for _, E, _, _ in ilu.fwd))
+        FE = np.full((len(ilu.fwd), P), nnz, np.int32)
+        FR = np.full((len(ilu.fwd), P), n, np.int32)
+        FC = np.full((len(ilu.fwd), P), n, np.int32)
+        for l, (_, E, _, _) in enumerate(ilu.fwd):
+            FE[l, :len(E)], FR[l, :len(E)], FC[l, :len(E)] = E, r[E], c[E]
+        P = max(1, max(len(E) for _, E, _, _ in ilu.bwd))
+        Pr = max(1, max(len(rw) for rw, _, _, _ in ilu.bwd))
+        nb = len(ilu.bwd)
+        BE = np.full((nb, P), nnz, np.int32)
+        BR = np.full((nb, P), n, np.int32)
+        BC = np.full((nb, P), n, np.int32)
+        BW = np.full((nb, Pr), n, np.int32)
+        for l, (rw, E, _, _) in enumerate(ilu.bwd):
+            BE[l, :len(E)], BR[l, :len(E)], BC[l, :len(E)] = E, r[E], c[E]
+            BW[l, :len(rw)] = rw
+        self.idx = tuple(jnp.asarray(a) for a in (FE, FR, FC, BE, BR, BC, BW))
+        perm = jnp.asarray(ilu.perm)
+
+        def solve(B, invU, b, idx):
+            FE, FR, FC, BE, BR, BC, BW = idx
+            y = jnp.zeros((n + 1, k), b.dtype).at[:n].set(b.reshape(n, k)[perm])
+
+            def fwd(y, ix):
+                e, rr, cc = ix
+                return y.at[rr].add(-jnp.einsum("eab,eb->ea", B[e], y[cc])), None
+            y, _ = jax.lax.scan(fwd, y, (FE, FR, FC))
+
+            def bwd(x, ix):
+                e, rr, cc, rw = ix
+                x = x.at[rr].add(-jnp.einsum("eab,eb->ea", B[e], x[cc]))
+                return x.at[rw].set(jnp.einsum("eab,eb->ea", invU[rw], x[rw])), None
+            x, _ = jax.lax.scan(bwd, y, (BE, BR, BC, BW))
+            out = jnp.zeros((n, k), b.dtype).at[perm].set(x[:n])
+            return out.reshape(-1)
+        self._solve = jax.jit(solve)
+        self._B = None
+
+    def factor(self, blocks):
+        """Разложение (numpy, BlockILU0.factor) и перенос множителей в JAX."""
+        import jax.numpy as jnp
+        self.ilu.factor(blocks)
+        k = self.ilu.k
+        self._B = jnp.asarray(np.concatenate([self.ilu.B, np.zeros((1, k, k))]))
+        self._invU = jnp.asarray(np.concatenate([self.ilu.invU, np.zeros((1, k, k))]))
+        self.invU = self.ilu.invU
+        return self
+
+    def solve(self, b):
+        return np.array(self._solve(self._B, self._invU, np.asarray(b, float), self.idx))

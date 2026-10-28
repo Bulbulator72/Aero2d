@@ -185,6 +185,9 @@ class RansSolver:
         self.step_reject = 3.0         # невязка выросла за шаг больше чем в столько раз — шаг
                                        # отменяется, CFL ×0,3 (поле не «выбивается» из решения)
         self.max_rejects = 6           # подряд отменённых шагов не больше
+        self.prec_lag = 1              # >1: разложение ILU повторно до prec_lag итераций (CFL ×2 — заново); на
+                                       # механизации это ухудшило сходимость — по умолчанию каждую итерацию
+        self.jax_trisolve = True       # прямой/обратный ход ILU — скомпилированным циклом JAX
         self.max_rollbacks = 4         # больше откатов — угол «неустойчив»
         self.sa_raw_grad = False       # True: источник SA по неограниченным градиентам (на механизации хуже сходится)
         self.visc_raw_grad = False     # True: вязкие потоки по неограниченным градиентам
@@ -961,6 +964,13 @@ class RansSolver:
                                   jnp.asarray(winf), jnp.asarray(0.0), np.ones(self.nc))
             self._want_blocks = False
             self._bilu = BlockILU0(self.nc, r_, c_, k=nv, fill=int(self.prec_fill))
+            self._tri = None
+        if self.jax_trisolve and getattr(self, "_tri", None) is None:
+            from .bilu import JaxTriSolve
+            self._tri = JaxTriSolve(self._bilu)
+        elif not self.jax_trisolve:
+            self._tri = None
+        ilu_state = None                              # (итерация, CFL, порядок) последнего разложения ILU
         # опорная невязка критерия сходимости — невязка однородного набегающего потока
         # при этом угле (не зависит от того, откуда начат расчёт: поляра и отдельная
         # точка сходятся до одного и того же уровня)
@@ -1045,6 +1055,7 @@ class RansSolver:
                     status = f"неустойчиво: {n_back - 1} откатов не помогли (сохранено лучшее состояние)"
                     break
                 Q = best["Q"].copy()
+                ilu_state = None
                 cfl = max(cfl0, min(cfl, best["cfl"]) * 0.1)
                 first_until = it + (self.rollback_first_order if not np.isfinite(rn) else 0)
                 phi = None
@@ -1056,6 +1067,7 @@ class RansSolver:
                     and (not np.isfinite(rn) or rn > self.step_reject * prev[1])
                     and not (warm and it <= 8) and not manual):
                 n_rej += 1
+                ilu_state = None
                 Q = prev[0].copy()
                 cfl = max(cfl0, cfl * 0.3)
                 events.append((it, f"шаг отменён (невязка ×{rn / prev[1]:.3g}), CFL → {cfl:.3g}", rn, []))
@@ -1164,15 +1176,23 @@ class RansSolver:
                         continue
                 ilu = lu
             else:
-                self._want_blocks = True
-                _, _, blocks = self.jac1(Qj, winf_j, gm, dt)
-                self._want_blocks = False
-                ilu = self._bilu.factor(blocks)
-                if not np.all(np.isfinite(ilu.invU)):
-                    if verbose:
-                        print(f"  it {it:4d}: ILU вырождена, CFL {cfl:.3g} → {max(cfl0, cfl / 10):.3g}", flush=True)
-                    cfl = max(cfl0, cfl / 10)
-                    continue
+                # разложение ILU (и сборка якобиана первого порядка) повторно используется до
+                # prec_lag итераций, пока CFL изменился меньше чем вдвое: это лишь
+                # предобусловливатель, точный якобиан-на-вектор считается на каждой итерации
+                fresh = (ilu_state is None or it - ilu_state[0] >= max(1, int(self.prec_lag))
+                         or not (0.5 < cfl / ilu_state[1] < 2.0) or ilu_state[2] != order)
+                if fresh:
+                    self._want_blocks = True
+                    _, _, blocks = self.jac1(Qj, winf_j, gm, dt)
+                    self._want_blocks = False
+                    ilu = self._tri.factor(blocks) if self._tri is not None else self._bilu.factor(blocks)
+                    if not np.all(np.isfinite(ilu.invU)):
+                        if verbose:
+                            print(f"  it {it:4d}: ILU вырождена, CFL {cfl:.3g} → {max(cfl0, cfl / 10):.3g}", flush=True)
+                        cfl = max(cfl0, cfl / 10)
+                        ilu_state = None
+                        continue
+                    ilu_state = (it, cfl, order)
             M = spla.LinearOperator((N5, N5), ilu.solve)
             Vdt = np.repeat(self.vol / dt, nv)
 
