@@ -260,3 +260,74 @@ def quality(mesh: Mesh) -> dict:
     return dict(cells=mesh.n_cells, quads=sum(len(c) == 4 for c in mesh.cells),
                 vmin=float(mesh.volume.min()), vol_ratio_max=float(np.max(np.maximum(vr, 1 / vr))),
                 wall_faces=int((mesh.face_tag == 1).sum()))
+
+
+# показатели качества (как в ICEM CFD: Determinant 2x2, Quality, Min angle, Volume change)
+QUALITY_METRICS = {
+    "det": ("Determinant 2x2", "отношение наименьшего определителя якобиана в углах ячейки к "
+            "наибольшему: 1 — параллелограмм, ≤ 0 — вывернутая; у треугольника всегда 1"),
+    "quality": ("Quality", "наименьший нормированный якобиан (синус угла; у треугольника — "
+                "делённый на sin 60°): 1 — прямоугольник / равносторонний треугольник"),
+    "angle": ("Min angle, °", "наименьший внутренний угол ячейки"),
+    "vol_ratio": ("Volume change", "наибольшее отношение объёмов ячейки и её соседей (≥ 1)"),
+    "nonortho": ("Non-orthogonality, °", "наибольший угол между нормалью грани и линией центров ячеек"),
+}
+
+
+def cell_quality(mesh: Mesh) -> dict:
+    """Показатели качества каждой ячейки (массивы длины n_cells), см. QUALITY_METRICS."""
+    n = mesh.n_cells
+    det = np.ones(n)
+    qual = np.ones(n)
+    amin = np.full(n, 180.0)
+    for k in (3, 4):
+        idx = np.array([i for i, c in enumerate(mesh.cells) if len(c) == k], int)
+        if not len(idx):
+            continue
+        P = mesh.nodes[np.array([mesh.cells[i] for i in idx])]           # (m,k,2)
+        e_next = np.roll(P, -1, axis=1) - P
+        e_prev = np.roll(P, 1, axis=1) - P
+        J = e_next[..., 0] * e_prev[..., 1] - e_next[..., 1] * e_prev[..., 0]   # (m,k)
+        ln = np.linalg.norm(e_next, axis=2) * np.linalg.norm(e_prev, axis=2)
+        s = J / np.maximum(ln, 1e-300)                                     # синус угла в вершине
+        cosang = np.sum(e_next * e_prev, axis=2) / np.maximum(ln, 1e-300)
+        ang = np.degrees(np.arctan2(s, cosang))                            # < 0 — вывернутый угол
+        amin[idx] = ang.min(1)
+        if k == 4:
+            jmax = np.max(J, 1)
+            det[idx] = np.where(jmax > 0, J.min(1) / np.where(jmax > 0, jmax, 1.0), -1.0)
+            qual[idx] = s.min(1)
+        else:
+            qual[idx] = s.min(1) / np.sin(np.pi / 3)
+            det[idx] = np.where(J.min(1) > 0, 1.0, -1.0)
+    l, r = mesh.face_cells.T
+    m = r >= 0
+    vr = mesh.volume[l[m]] / mesh.volume[r[m]]
+    vr = np.maximum(vr, 1.0 / vr)
+    vol_ratio = np.ones(n)
+    np.maximum.at(vol_ratio, l[m], vr)
+    np.maximum.at(vol_ratio, r[m], vr)
+    d = mesh.centroid[r[m]] - mesh.centroid[l[m]]
+    d /= np.maximum(np.linalg.norm(d, axis=1), 1e-300)[:, None]
+    no = np.degrees(np.arccos(np.clip(np.abs(np.sum(d * mesh.face_normal[m], 1)), 0.0, 1.0)))
+    nonortho = np.zeros(n)
+    np.maximum.at(nonortho, l[m], no)
+    np.maximum.at(nonortho, r[m], no)
+    return dict(det=det, quality=np.clip(qual, -1.0, 1.0), angle=amin, vol_ratio=vol_ratio, nonortho=nonortho)
+
+
+def quality_report(mesh: Mesh, cq: dict | None = None) -> str:
+    """Сводка как гистограмма Quality в ICEM: число ячеек по интервалам и худшие значения."""
+    cq = cq or cell_quality(mesh)
+    out = []
+    bins = [-1.0, 0.0, 0.1, 0.2, 0.3, 0.5, 0.7, 0.9, 1.0001]
+    for key in ("det", "quality"):
+        name = QUALITY_METRICS[key][0]
+        h, _ = np.histogram(cq[key], bins=bins)
+        parts = [f"{a:g}…{min(b, 1):g}: {c}" for a, b, c in zip(bins[:-1], bins[1:], h) if c]
+        out.append(f"{name}: мин. {cq[key].min():.3f}; " + ", ".join(parts))
+    out.append(f"Min angle: мин. {cq['angle'].min():.1f}°, ячеек < 10°: {(cq['angle'] < 10).sum()}")
+    out.append(f"Volume change: макс. {cq['vol_ratio'].max():.0f}, ячеек > 10: {(cq['vol_ratio'] > 10).sum()}, "
+               f"> 100: {(cq['vol_ratio'] > 100).sum()}")
+    out.append(f"Non-orthogonality: макс. {cq['nonortho'].max():.0f}°, ячеек > 70°: {(cq['nonortho'] > 70).sum()}")
+    return "\n".join(out)

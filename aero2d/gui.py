@@ -15,6 +15,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.figure import Figure  # noqa: E402
+from matplotlib import colors as mpl_colors  # noqa: E402
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk  # noqa: E402
 
 from . import core  # noqa: E402
@@ -167,6 +168,13 @@ class App(tk.Tk):
         ttk.Combobox(rc, textvariable=self.cores, width=6,
                      values=["авто"] + [str(n) for n in (1, 2, 4, 8, 12, 16, 24, 32) if n <= cpu_count()]
                      ).pack(side="left")
+        cr_ = ttk.Frame(f)
+        cr_.grid(row=10, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Label(cr_, text="Опорная хорда c (Re и Cl, Cd, Cm по ней):").pack(side="left")
+        self.cref = tk.StringVar(value="авто")
+        ttk.Entry(cr_, textvariable=self.cref, width=7).pack(side="left")
+        ttk.Label(f, text="   авто: 1 у профиля и механизации из профиля, габарит по x у файла механизации",
+                  foreground="#555", font=("", 8)).grid(row=10, column=0, columnspan=2, sticky="sw", pady=(26, 0))
         ttk.Radiobutton(f, text="RANS (Навье–Стокс + модель турбулентности):\n   отрыв, Cl_max механизации (минуты на угол)",
                         variable=self.method, value="rans").grid(row=11, column=0, columnspan=2, sticky="w",
                                                                  pady=(6, 0))
@@ -276,6 +284,11 @@ class App(tk.Tk):
         # таблица
         tf = ttk.Frame(nb)
         nb.add(tf, text="Таблица")
+        tb_ = ttk.Frame(tf)
+        tb_.pack(side="top", fill="x")
+        ttk.Label(tb_, text="  Cl = L′/(q∞·c), Cd = D′/(q∞·c), Cm = M′/(q∞·c²) — на единицу размаха "
+                  "(S = c·1), c — опорная хорда (см. «Примечания»).", foreground="#555").pack(side="left")
+        ttk.Button(tb_, text="Размерные силы…", command=self.forces_dialog).pack(side="right", padx=4, pady=2)
         cols = ("calc", "alpha", "cl", "cd", "cdf", "cm", "ch", "xu", "xl", "ok")
         self.table = ttk.Treeview(tf, columns=cols, show="headings")
         for c, t, w in zip(cols, ["Расчёт", "α, °", "Cl", "Cd", "Cd трения", "Cm", "Ch руля", "Переход верх",
@@ -451,6 +464,19 @@ class App(tk.Tk):
             apply()
         ttk.Button(bf, text="Без механизации", command=reset).pack(side="right")
 
+    def _cref(self, default):
+        """Опорная хорда из поля окна («авто» — default)."""
+        v = self.cref.get().strip().lower().replace(",", ".")
+        if v in ("", "авто", "auto"):
+            return default
+        try:
+            c = float(v)
+        except ValueError:
+            raise ValueError("Опорная хорда — число или «авто»") from None
+        if c <= 0:
+            raise ValueError("Опорная хорда должна быть > 0")
+        return c
+
     def get_config(self):
         """Один профиль (Airfoil) или список элементов механизации."""
         num = lambda v: float(v.get().replace(",", "."))
@@ -605,7 +631,7 @@ class App(tk.Tk):
                 nw = self._workers
                 if method in ("multi", "multi_viscous"):
                     nm = self.hl_desc.get() if self.src.get() != "mfile" else os.path.basename(self.mfile.get())
-                    ch = 1.0 if self.src.get() != "mfile" else None
+                    ch = self._cref(1.0 if self.src.get() != "mfile" else None)
                     if method == "multi":
                         ps = [core.run_multi(af, alphas, mach, nm, chord=ch)]
                     else:
@@ -622,7 +648,7 @@ class App(tk.Tk):
                         ctl = self._rans_ctl
                         ctl.stop = False
                         p_ = core.run_rans(af, alphas, mach, r_, cb, rit, nm,
-                                           chord=(1.0 if isinstance(af, list) and self.src.get() != "mfile" else None),
+                                           chord=self._cref(1.0 if isinstance(af, list) and self.src.get() != "mfile" else None),
                                            mesh=(mesh0 if r_ == re0 else None), mesh_opts=mopts, conv=conv,
                                            control=ctl, workers=nw, solver_opts=sopts,
                                            coarse_start=("auto" if self.coarse_start.get() else False))
@@ -707,7 +733,8 @@ class App(tk.Tk):
         self.polars.append(p)
         n_ok = int(p.ok.sum())
         self.status.set(f"Готово: {p.label}. Надёжных точек {n_ok} из {len(p.alpha)}.")
-        self.notes.insert("end", f"■ {p.label}\n" + "".join(f"   • {t}\n" for t in p.notes) + "\n")
+        self.notes.insert("end", f"■ {p.label}\n" + "".join(f"   • {t}\n" for t in p.notes + [core.coef_note(p)])
+                          + "\n")
         fmt = lambda arr, k, f: "—" if arr is None or not np.isfinite(arr[k]) else format(arr[k], f)
         for k in range(len(p.alpha)):
             self.table.insert("", "end", values=(
@@ -886,6 +913,88 @@ class App(tk.Tk):
             except Exception as e:  # noqa: BLE001
                 self.q.put(("field_error", str(e)))
         threading.Thread(target=job, daemon=True).start()
+
+    # ------------------------------------------------------------ размерные силы
+    def forces_dialog(self):
+        """Силы в ньютонах по коэффициентам выбранного расчёта: ρ, V, хорда и размах."""
+        if not self.polars:
+            messagebox.showinfo("Силы", "Сначала выполните расчёт.")
+            return
+        w = tk.Toplevel(self)
+        w.title("Размерные силы")
+        w.transient(self)
+        fr = ttk.Frame(w, padding=8)
+        fr.pack(fill="both", expand=True)
+        labels = [p.label for p in self.polars]
+        v_p = tk.StringVar(value=labels[-1])
+        ttk.Label(fr, text="Расчёт").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(fr, textvariable=v_p, values=labels, state="readonly", width=60).grid(row=0, column=1,
+                                                                                          columnspan=5, sticky="w")
+        p0 = self.polars[-1]
+        a_snd = 340.29
+        vals = dict(rho=tk.StringVar(value="1.225"), v=tk.StringVar(value=f"{max(p0.mach, 0.05) * a_snd:.1f}"),
+                    c=tk.StringVar(value="1.0"), b=tk.StringVar(value="1.0"))
+        for j, (k, t) in enumerate((("rho", "ρ, кг/м³"), ("v", "V∞, м/с"), ("c", "хорда c, м"), ("b", "размах b, м"))):
+            ttk.Label(fr, text=t).grid(row=1, column=2 * j, sticky="e", padx=(6, 2))
+            ttk.Entry(fr, textvariable=vals[k], width=8).grid(row=1, column=2 * j + 1, sticky="w")
+        ttk.Label(fr, text="хорда c — физический размер опорной хорды расчёта (её значение в координатах — "
+                  "в «Примечаниях»); V∞ по умолчанию — M·340,3 м/с. Для силы на 1 м размаха b = 1.",
+                  foreground="#555", wraplength=700).grid(row=2, column=0, columnspan=8, sticky="w", pady=(2, 4))
+        txt = tk.Text(fr, width=110, height=22, font=("Courier", 9))
+        txt.grid(row=4, column=0, columnspan=8, sticky="nsew")
+        out = {}
+
+        def calc(*_):
+            p = next(q for q in self.polars if q.label == v_p.get())
+            try:
+                rho, v, c, b = (float(vals[k].get().replace(",", ".")) for k in ("rho", "v", "c", "b"))
+            except ValueError:
+                messagebox.showerror("Силы", "Проверьте числа", parent=w)
+                return
+            f = core.dimensional_forces(p, rho, v, c, b)
+            out["p"], out["f"] = p, f
+            lines = [f"{p.label}",
+                     f"q∞ = ρV²/2 = {f['q']:.1f} Па; S = c·b = {f['S']:.4g} м²; опорная хорда расчёта "
+                     f"c = {p.chord_ref:.4g} (в координатах профиля), момент — относительно "
+                     f"({p.xref[0]:.4g}; {p.xref[1]:.4g}).",
+                     "L — подъёмная (⊥ потоку), D — сопротивление (вдоль потока), X, Y — по осям профиля; "
+                     "M > 0 — на кабрирование.", "",
+                     f"{'α, °':>7} {'Cl':>8} {'Cd':>9} {'Cm':>8} {'L, Н':>11} {'D, Н':>10} {'M, Н·м':>10} "
+                     f"{'X, Н':>10} {'Y, Н':>11}"]
+            for i, a in enumerate(p.alpha):
+                lines.append(f"{a:7.2f} {p.cl[i]:8.4f} {p.cd[i]:9.5f} {p.cm[i]:8.4f} {f['L'][i]:11.2f} "
+                             f"{f['D'][i]:10.3f} {f['M'][i]:10.3f} {f['X'][i]:10.3f} {f['Y'][i]:11.2f}")
+            if "elem_L" in f:
+                lines += ["", "По элементам (L, Н; D, Н — где рассчитано):"]
+                for i, a in enumerate(p.alpha):
+                    eL, eD = f["elem_L"][i], f["elem_D"][i]
+                    if eL is None:
+                        continue
+                    parts = [f"эл. {j + 1}: L {l_:.2f}" + (f", D {d_:.3f}" if np.isfinite(d_) else "")
+                             for j, (l_, d_) in enumerate(zip(eL, eD))]
+                    lines.append(f"{a:7.2f}°  " + ";  ".join(parts))
+            txt.delete("1.0", "end")
+            txt.insert("end", "\n".join(lines))
+
+        def save():
+            if "f" not in out:
+                return
+            path = filedialog.asksaveasfilename(parent=w, defaultextension=".csv", filetypes=[("CSV", "*.csv")])
+            if not path:
+                return
+            import csv
+            p, f = out["p"], out["f"]
+            with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+                wr = csv.writer(fh, delimiter=";")
+                wr.writerow(["alpha", "Cl", "Cd", "Cm", "L_N", "D_N", "M_Nm", "X_N", "Y_N"])
+                for i, a in enumerate(p.alpha):
+                    wr.writerow([f"{a:g}"] + [f"{v_:.6g}" for v_ in (p.cl[i], p.cd[i], p.cm[i], f["L"][i], f["D"][i],
+                                                                        f["M"][i], f["X"][i], f["Y"][i])])
+        bb = ttk.Frame(fr)
+        bb.grid(row=3, column=0, columnspan=8, sticky="w")
+        ttk.Button(bb, text="Рассчитать", command=calc).pack(side="left")
+        ttk.Button(bb, text="Сохранить CSV…", command=save).pack(side="left", padx=6)
+        calc()
 
     # ------------------------------------------------------------ анимация (GIF)
     def animate_dialog(self):
@@ -1186,6 +1295,14 @@ class App(tk.Tk):
         cr = ttk.Combobox(bar, textvariable=self.mesh_reg, values=list(REGIONS), state="readonly", width=26)
         cr.pack(side="left")
         cr.bind("<<ComboboxSelected>>", lambda _: self.draw_mesh())
+        from .rans_mesh import QUALITY_METRICS
+        self._qm_names = {"нет (только сетка)": None}
+        self._qm_names.update({v[0]: k for k, v in QUALITY_METRICS.items()})
+        ttk.Label(bar, text="   качество (как в ICEM): ").pack(side="left")
+        self.mesh_qm = tk.StringVar(value="нет (только сетка)")
+        cq_ = ttk.Combobox(bar, textvariable=self.mesh_qm, values=list(self._qm_names), state="readonly", width=20)
+        cq_.pack(side="left")
+        cq_.bind("<<ComboboxSelected>>", lambda _: self.draw_mesh())
         self.mesh_fig = Figure(figsize=(7, 5), dpi=100, layout="constrained")
         self.mesh_canvas = FigureCanvasTkAgg(self.mesh_fig, master=right)
         NavigationToolbar2Tk(self.mesh_canvas, right).update()
@@ -1221,7 +1338,7 @@ class App(tk.Tk):
         af = self.get_config()
         mach, alphas, niter, re_, ncrit, xtr = self._params()
         opts = self.mesh_opts()
-        chord = 1.0 if isinstance(af, list) and self.src.get() != "mfile" else None
+        chord = self._cref(1.0 if isinstance(af, list) and self.src.get() != "mfile" else None)
         els = af if isinstance(af, list) else [af]
         if not chord:
             chord = float(max(np.max(e.x) for e in els) - min(np.min(e.x) for e in els))
@@ -1246,9 +1363,10 @@ class App(tk.Tk):
         threading.Thread(target=job, daemon=True).start()
 
     def _set_mesh(self, sig, m, re, chord):
-        from .rans_mesh import quality
+        from .rans_mesh import quality, cell_quality, quality_report
         self._mesh = (sig, m)
         q = quality(m)
+        self._mesh_cq = cell_quality(m)
         wc = m.face_cells[m.face_tag == 1, 0]
         h1 = float(np.median(2 * m.wall_dist[wc]))
         cf = 0.026 * re ** (-1 / 7)
@@ -1258,7 +1376,7 @@ class App(tk.Tk):
             .replace(",", " ") +
             f"Высота первой ячейки ≈ {h1:.2e} c, оценка y⁺ ≈ {yp:.2f} (по Cf пластины).\n"
             f"Наибольшее отношение объёмов соседних ячеек — {q['vol_ratio_max']:.0f}.\n"
-            "Эта сетка будет использована в расчёте RANS." +
+            "Эта сетка будет использована в расчёте RANS.\n\nКачество:\n" + quality_report(m, self._mesh_cq) +
             ("\n⚠ y⁺ > 2: для модели SA без пристеночных функций слой у стенки грубоват." if yp > 2 else "") +
             ("\n⚠ Резкий скачок размеров соседних ячеек (> 300): возможен развал счёта — уменьшите "
              "«рост треугольников» или «ячейки у стенок и в щелях»." if q["vol_ratio_max"] > 300 else ""))
@@ -1274,8 +1392,32 @@ class App(tk.Tk):
         fig.clear()
         ax1, ax2 = fig.subplots(2, 1)
         polys = [m.nodes[c] for c in m.cells]
+        key = self._qm_names.get(self.mesh_qm.get())
+        cq = getattr(self, "_mesh_cq", None)
         for ax, box in ((ax1, None), (ax2, REGIONS[self.mesh_reg.get()])):
-            ax.add_collection(PolyCollection(polys, facecolor="none", edgecolor="#333", lw=0.15))
+            if key and cq is not None:
+                from .rans_mesh import QUALITY_METRICS
+                v = cq[key]
+                # «хорошо» — светлое: для det, quality, angle малое плохо; для vol_ratio, nonortho — большое
+                if key in ("det", "quality"):
+                    norm, cmap, cv = mpl_colors.Normalize(0.0, 1.0), "RdYlGn", v
+                elif key == "angle":
+                    norm, cmap, cv = mpl_colors.Normalize(0.0, 90.0), "RdYlGn", v
+                elif key == "vol_ratio":
+                    norm, cmap, cv = mpl_colors.LogNorm(1.0, max(10.0, float(v.max()))), "RdYlGn_r", v
+                else:
+                    norm, cmap, cv = mpl_colors.Normalize(0.0, 90.0), "RdYlGn_r", v
+                pc = PolyCollection(polys, array=cv, cmap=cmap, norm=norm, edgecolor="#333", lw=0.1)
+                ax.add_collection(pc)
+                if box is None:
+                    fig.colorbar(pc, ax=ax, shrink=0.8, label=QUALITY_METRICS[key][0])
+                worst = np.argsort(v if key in ("det", "quality", "angle") else -v)[:10]
+                ax.plot(m.centroid[worst, 0], m.centroid[worst, 1], "o", mfc="none", mec="#0050ff", ms=9,
+                        mew=1.4, zorder=5, label="10 худших ячеек")
+                if box is not None:
+                    ax.legend(fontsize=7, loc="upper right")
+            else:
+                ax.add_collection(PolyCollection(polys, facecolor="none", edgecolor="#333", lw=0.15))
             wf = m.face_tag == 1
             seg = m.nodes[m.face_nodes[wf]]
             for s_ in seg:

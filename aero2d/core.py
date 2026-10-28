@@ -39,6 +39,32 @@ class Polar:
     cp_inv: list = field(default_factory=list)
     field_ctx: dict | None = None          # данные для расчёта поля течения (field.py)
     ch: np.ndarray | None = None           # шарнирный момент руля (controls.py)
+    chord_ref: float = 1.0                 # опорная хорда: Cl = L′/(q∞·c), Cm = M′/(q∞·c²); Re — по ней
+    xref: tuple = (0.25, 0.0)              # точка приведения момента
+    elem: list | None = None               # по углам: [(Cl, Cd) каждого элемента] (механизация)
+
+
+def coef_note(p: "Polar") -> str:
+    """Определение коэффициентов (одна строка для «Примечаний»)."""
+    return (f"Коэффициенты — двумерные, на единицу размаха (опорная площадь S = c·1): Cl = L′/(q∞·c), "
+            f"Cd = D′/(q∞·c), Cm = M′/(q∞·c²) относительно точки ({p.xref[0]:.4g}; {p.xref[1]:.4g}), "
+            f"Cm > 0 — на кабрирование; c = {p.chord_ref:.4g} (в единицах координат профиля), по ней же "
+            f"число Рейнольдса. Размерные силы — «Таблица» → «Размерные силы…».")
+
+
+def dimensional_forces(p: "Polar", rho: float, v: float, c_m: float, b_m: float = 1.0) -> dict:
+    """Размерные силы по коэффициентам поляры: q = ρV²/2, L = Cl·q·c·b (Н), D = Cd·q·c·b,
+    M = Cm·q·c²·b (Н·м); на единицу размаха — те же при b = 1 м. c_m — опорная хорда в метрах."""
+    q = 0.5 * rho * v ** 2
+    s_ = c_m * b_m
+    a = np.radians(np.asarray(p.alpha, float))
+    L, D = np.asarray(p.cl) * q * s_, np.asarray(p.cd) * q * s_
+    out = dict(q=q, S=s_, L=L, D=D, M=np.asarray(p.cm) * q * s_ * c_m,
+               X=D * np.cos(a) - L * np.sin(a), Y=L * np.cos(a) + D * np.sin(a))
+    if p.elem is not None:
+        out["elem_L"] = [None if e is None else [c[0] * q * s_ for c in e] for e in p.elem]
+        out["elem_D"] = [None if e is None else [c[1] * q * s_ for c in e] for e in p.elem]
+    return out
 
 
 def make_airfoil(source: str, value: str, n_side: int = 100, smooth: bool = False) -> Airfoil:
@@ -181,6 +207,8 @@ def run_multi(elements, alphas, mach: float, name: str = "многоэлемен
         notes.append("Есть точки со сверхзвуковой зоной (Cp < Cp*): поправка Кармана–Цяня там неточна.")
     return Polar(f"{name}, панели, M={mach:g}", "multi", mach, np.asarray(alphas, float), np.array(cl),
                  np.full(len(cl), np.nan), np.array(cm), np.array(ok), xs, cps, notes,
+                 chord_ref=float(ms.chord), xref=tuple(float(v) for v in ms.xref),
+                 elem=[[(float(c), np.nan) for c in row] for row in per],
                  field_ctx=dict(method="multi", elements=elements, mach=mach, chord=chord,
                                 alpha=np.asarray(alphas, float)))
 
@@ -394,6 +422,9 @@ def run_multi_viscous_batch(elements, alphas, mach: float, re_list, ncrit: float
                          xtr_u=np.array([r.elements[imain]["xtr_u"] for r in res]),
                          xtr_l=np.array([r.elements[imain]["xtr_l"] for r in res]),
                          bl=[r.elements[imain]["side"] for r in res], cp_inv=cpi,
+                         chord_ref=float(chord),
+                         xref=(float(min(np.min(e.x) for e in elements)) + 0.25 * chord, 0.0),
+                         elem=[[(float(e["cl"]), float(e.get("cd", np.nan))) for e in r.elements] for r in res],
                          field_ctx=dict(method="multi_viscous", elements=elements, mach=mach, chord=chord,
                                         alpha=alphas, re=re, ncrit=ncrit, xtr=xt, n_panels=npn,
                                         states=[r.state for r in res])))
@@ -505,8 +536,12 @@ def run_rans(af, alphas, mach: float, re: float, callback=None, max_iter: int = 
     if np.isfinite(xtr_u).any():
         notes.append("Переход (начало турбулентного слоя), x/c верх / низ: " + "; ".join(
             f"{a:g}° — {u:.3f} / {l_:.3f}" for a, u, l_ in zip(alphas, xtr_u, xtr_l) if np.isfinite(u)))
+    xs_ = np.concatenate([e.x for e in elements])
+    xr_ = (float(xs_.min()) + 0.25 * chord, 0.0)
+    elem = [None if r is None else [(float(e["cl"]), float(e["cd"])) for e in r.elements] for r in res]
     return Polar(f"{nm}, RANS-{tname}, Re={re:.3g}, M={mach:g}", "rans", mach, alphas, cl, cd, cm, ok,
-                 xs_all, cps_all, notes, re=re, cdf=cdf,
+                 xs_all, cps_all, notes, re=re, cdf=cdf, chord_ref=float(chord), xref=xr_,
+                 elem=(elem if len(elements) > 1 else None),
                  xtr_u=xtr_u if np.isfinite(xtr_u).any() else None,
                  xtr_l=xtr_l if np.isfinite(xtr_l).any() else None,
                  field_ctx=dict(method="rans", mesh=mesh, elements=elements, mach=mach, re=re, chord=chord,
