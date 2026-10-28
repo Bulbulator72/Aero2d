@@ -37,7 +37,46 @@ class PlotTab:
         self.canvas.draw_idle()
 
 
+class Tooltip:
+    """Подсказка при наведении (через 0,5 с)."""
+
+    def __init__(self, widget, text):
+        self.w, self.text, self.tip, self.job = widget, text, None, None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _=None):
+        self._hide()
+        self.job = self.w.after(500, self._show)
+
+    def _show(self):
+        if self.tip or not self.text:
+            return
+        x = self.w.winfo_rootx() + 12
+        y = self.w.winfo_rooty() + self.w.winfo_height() + 4
+        self.tip = tk.Toplevel(self.w)
+        self.tip.wm_overrideredirect(True)
+        self.tip.wm_geometry(f"+{x}+{y}")
+        tk.Label(self.tip, text=self.text, justify="left", wraplength=360, background="#fffbe6",
+                 relief="solid", borderwidth=1, padx=6, pady=4).pack()
+
+    def _hide(self, _=None):
+        if self.job:
+            self.w.after_cancel(self.job)
+            self.job = None
+        if self.tip:
+            self.tip.destroy()
+            self.tip = None
+
+
 class App(tk.Tk):
+    # методы в списке «Метод»: подпись → значение self.method
+    METHODS_UI = [("Вязкий — панели + пограничный слой (как XFOIL)", "viscous"),
+                  ("Невязкий — панели (мгновенно, без Cd)", "panel"),
+                  ("Эйлер — сжимаемый, скачки (M ≥ 0,2)", "euler"),
+                  ("RANS — Навье–Стокс (экспериментально)", "rans")]
+
     def __init__(self):
         super().__init__()
         self.title("aero2d — аэродинамика профилей")
@@ -62,143 +101,155 @@ class App(tk.Tk):
         self.status = tk.StringVar(value="Готово. Выберите профиль и нажмите «Рассчитать».")
         ttk.Label(sb, textvariable=self.status, anchor="w").pack(side="left", fill="x", expand=True, padx=8)
         ttk.Separator(self, orient="horizontal").pack(side="bottom", fill="x")
-        left = ttk.Frame(self, padding=8)
+        left = ttk.Frame(self, padding=8, width=470)
         left.pack(side="left", fill="y")
+        left.pack_propagate(False)                     # ширина панели не «прыгает» при смене метода
         right = ttk.Frame(self)
         right.pack(side="left", fill="both", expand=True)
 
-        # --- профиль
+        # --- профиль: источник в левом столбце, его поле или кнопка — в правом
         f = ttk.LabelFrame(left, text="Профиль", padding=6)
         f.pack(fill="x", pady=4)
+        f.columnconfigure(1, weight=1)
         self.src = tk.StringVar(value="naca")
-        ttk.Radiobutton(f, text="NACA (2412, 0012-64, 16-012):", variable=self.src, value="naca",
-                        command=self.preview_airfoil).grid(row=0, column=0, sticky="w")
         self.naca = tk.StringVar(value="2412")
-        e = ttk.Entry(f, textvariable=self.naca, width=8)
-        e.grid(row=0, column=1, sticky="w")
-        e.bind("<Return>", lambda _: self.preview_airfoil())
-        e.bind("<FocusOut>", lambda _: self.preview_airfoil())
-        ttk.Radiobutton(f, text="Файл координат", variable=self.src, value="file",
-                        command=self.preview_airfoil).grid(row=1, column=0, sticky="w")
-        self.smooth = tk.BooleanVar(value=False)
-        ttk.Button(f, text="Открыть…", command=self.open_file).grid(row=1, column=1, sticky="w")
         self.file = tk.StringVar(value="")
-        ttk.Radiobutton(f, text="Многоэлементный файл", variable=self.src, value="mfile",
-                        command=self.preview_airfoil).grid(row=2, column=0, sticky="w")
-        ttk.Button(f, text="Открыть…", command=self.open_mfile).grid(row=2, column=1, sticky="w")
         self.mfile = tk.StringVar(value="")
-        self.file_disp = tk.StringVar(value="")
-        ttk.Label(f, textvariable=self.file_disp, foreground="#555", wraplength=250).grid(
-            row=3, column=0, columnspan=2, sticky="w")
-        ttk.Checkbutton(f, text="сгладить контур (измеренные координаты)", variable=self.smooth,
-                        command=self.preview_airfoil).grid(row=5, column=0, columnspan=2, sticky="w")
-        # --- встроенный набор (симметричные профили 6-й серии для оперения и др.)
+        self.smooth = tk.BooleanVar(value=False)
         lib = core.library()
         self._lib = dict(lib)
-        lf = ttk.Frame(f)
-        lf.grid(row=4, column=0, columnspan=2, sticky="w")
-        ttk.Radiobutton(lf, text="Из набора:", variable=self.src, value="lib",
-                        command=self.preview_airfoil).pack(side="left")
         self.lib_name = tk.StringVar(value=lib[0][0] if lib else "")
-        cl_ = ttk.Combobox(lf, textvariable=self.lib_name, values=[n for n, _ in lib], state="readonly", width=20)
-        cl_.pack(side="left")
+        rb = lambda text, val, r: ttk.Radiobutton(f, text=text, variable=self.src, value=val,
+                                                 command=self.preview_airfoil).grid(row=r, column=0, sticky="w",
+                                                                                    pady=1)
+        rb("NACA", "naca", 0)
+        e = ttk.Entry(f, textvariable=self.naca, width=12)
+        e.grid(row=0, column=1, sticky="w")
+        e.bind("<Return>", lambda _: (self.src.set("naca"), self.preview_airfoil()))
+        e.bind("<FocusOut>", lambda _: self.preview_airfoil())
+        Tooltip(e, "4 цифры (2412), модифицированный 4-значный (0012-64) или серия 16 (16-012); Enter — показать")
+        rb("Из набора", "lib", 1)
+        cl_ = ttk.Combobox(f, textvariable=self.lib_name, values=[n for n, _ in lib], state="readonly", width=20)
+        cl_.grid(row=1, column=1, sticky="w")
         cl_.bind("<<ComboboxSelected>>", lambda _: (self.src.set("lib"), self.preview_airfoil()))
+        rb("Файл координат", "file", 2)
+        b_ = ttk.Button(f, text="Открыть…", command=self.open_file)
+        b_.grid(row=2, column=1, sticky="w")
+        Tooltip(b_, "Формат Selig или Lednicer (как на сайте UIUC, airfoiltools)")
+        rb("Многоэлементный файл", "mfile", 3)
+        b_ = ttk.Button(f, text="Открыть…", command=self.open_mfile)
+        b_.grid(row=3, column=1, sticky="w")
+        Tooltip(b_, "Элементы механизации в одном файле, блоки разделены пустой строкой или «999 999» (как в MSES)")
+        self.file_disp = tk.StringVar(value="")
+        ttk.Label(f, textvariable=self.file_disp, foreground="#555", wraplength=300).grid(
+            row=4, column=0, columnspan=2, sticky="w")
+        c_ = ttk.Checkbutton(f, text="сгладить контур (измеренные координаты)", variable=self.smooth,
+                             command=self.preview_airfoil)
+        c_.grid(row=5, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        Tooltip(c_, "Шум координат у передней кромки (даже 0,1 мм) мешает расчёту пограничного слоя")
         self._control = None
         # --- механизация из одного профиля
         self.hl_cfg = {"flap": None, "slat": None}
-        hf = ttk.Frame(f)
-        hf.grid(row=6, column=0, columnspan=2, sticky="we", pady=(4, 0))
-        ttk.Label(hf, text="Механизация:").pack(side="left")
-        ttk.Button(hf, text="Настроить…", command=self.open_highlift).pack(side="right")
+        ttk.Separator(f).grid(row=6, column=0, columnspan=2, sticky="we", pady=4)
+        ttk.Label(f, text="Механизация, рули").grid(row=7, column=0, sticky="w")
+        ttk.Button(f, text="Настроить…", command=self.open_highlift).grid(row=7, column=1, sticky="w")
         self.hl_desc = tk.StringVar(value="нет")
-        ttk.Label(f, textvariable=self.hl_desc, foreground="#555", wraplength=250).grid(
-            row=7, column=0, columnspan=2, sticky="w")
+        ttk.Label(f, textvariable=self.hl_desc, foreground="#555", wraplength=300).grid(
+            row=8, column=0, columnspan=2, sticky="w")
 
-        # --- режим
-        f = ttk.LabelFrame(left, text="Режим", padding=6)
-        f.pack(fill="x", pady=4)
-        self.mach = tk.StringVar(value="0")
-        self.a0, self.a1, self.da = tk.StringVar(value="-4"), tk.StringVar(value="14"), tk.StringVar(value="1")
-        ttk.Label(f, text="Число Маха M").grid(row=0, column=0, sticky="w")
-        ttk.Entry(f, textvariable=self.mach, width=7).grid(row=0, column=1, sticky="w", pady=1)
-        ra = ttk.Frame(f)
-        ra.grid(row=1, column=0, columnspan=2, sticky="w")
-        for lbl, var in (("α, °: от", self.a0), (" до", self.a1), (" шаг", self.da)):
-            ttk.Label(ra, text=lbl).pack(side="left")
-            ttk.Entry(ra, textvariable=var, width=6).pack(side="left")
-
-        # --- метод
+        # --- метод: выбор списком; параметры — только выбранного метода
         f = ttk.LabelFrame(left, text="Метод", padding=6)
         f.pack(fill="x", pady=4)
         self.method = tk.StringVar(value="viscous")
-        ttk.Radiobutton(f, text="Вязкий: панели + погр. слой (Re, Cd)",
-                        variable=self.method, value="viscous").grid(row=0, column=0, columnspan=2, sticky="w")
+        self.method_name = tk.StringVar(value=self.METHODS_UI[0][0])
+        cm_ = ttk.Combobox(f, textvariable=self.method_name, values=[n for n, _ in self.METHODS_UI],
+                           state="readonly", width=44)
+        cm_.pack(fill="x")
+        cm_.bind("<<ComboboxSelected>>", lambda _: self._on_method())
+        Tooltip(cm_, "Вязкий — основной метод: панели + интегральный пограничный слой, переход eᴺ, Cd (как "
+                     "XFOIL/XFLR5). Невязкий — мгновенно, без сопротивления. Эйлер — сжимаемый, скачки. "
+                     "RANS — Навье–Стокс, экспериментально, долго.")
+
+        # --- условия расчёта: подписи слева, поля в одном столбце
+        f = ttk.LabelFrame(left, text="Условия расчёта", padding=6)
+        f.pack(fill="x", pady=4)
+        f.columnconfigure(1, weight=1)
+        self.mach = tk.StringVar(value="0")
         self.re = tk.StringVar(value="1e6")
         self.ncrit = tk.StringVar(value="9")
         self.xtru = tk.StringVar(value="1")
         self.xtrl = tk.StringVar(value="1")
-        for r, (lbl, var) in enumerate([("   Re (можно несколько: 1e5; 3e5)", self.re), ("   Ñкрит", self.ncrit)],
-                                       start=1):
-            ttk.Label(f, text=lbl).grid(row=r, column=0, sticky="w")
-            ttk.Entry(f, textvariable=var, width=8).grid(row=r, column=1, sticky="w")
-        rx = ttk.Frame(f)
-        rx.grid(row=3, column=0, columnspan=2, sticky="w")
-        ttk.Label(rx, text="   переход ≤ x/c: верх").pack(side="left")
-        ttk.Entry(rx, textvariable=self.xtru, width=5).pack(side="left")
-        ttk.Label(rx, text=" низ").pack(side="left")
-        ttk.Entry(rx, textvariable=self.xtrl, width=5).pack(side="left")
-        ttk.Radiobutton(f, text="Невязкий: панели (мгновенно, без Cd)",
-                        variable=self.method, value="panel").grid(row=5, column=0, columnspan=2, sticky="w")
-        ttk.Radiobutton(f, text="Эйлер: сжимаемый, скачки (M ≥ 0,2)",
-                        variable=self.method, value="euler").grid(row=6, column=0, columnspan=2, sticky="w")
-        re_ = ttk.Frame(f)
-        re_.grid(row=7, column=0, columnspan=2, sticky="w")
-        ttk.Label(re_, text="   сетка").pack(side="left")
-        self.grid_name = tk.StringVar(value=list(core.GRIDS)[0])
-        ttk.Combobox(re_, textvariable=self.grid_name, values=list(core.GRIDS), state="readonly",
-                     width=15).pack(side="left")
-        ttk.Label(re_, text=" итераций").pack(side="left")
-        self.niter = tk.StringVar(value="100")
-        ttk.Entry(re_, textvariable=self.niter, width=5).pack(side="left")
-        from .parallel import cpu_count, auto_workers
-        rc = ttk.Frame(f)
-        rc.grid(row=9, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        ttk.Label(rc, text=f"Ядер ЦП (здесь {cpu_count()}, авто = {auto_workers()}):").pack(side="left")
-        self.cores = tk.StringVar(value="авто")
-        ttk.Combobox(rc, textvariable=self.cores, width=6,
-                     values=["авто"] + [str(n) for n in (1, 2, 4, 8, 12, 16, 24, 32) if n <= cpu_count()]
-                     ).pack(side="left")
-        cr_ = ttk.Frame(f)
-        cr_.grid(row=10, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        ttk.Label(cr_, text="Опорная хорда c (Re и Cl, Cd, Cm по ней):").pack(side="left")
+        self.a0, self.a1, self.da = tk.StringVar(value="-4"), tk.StringVar(value="14"), tk.StringVar(value="1")
         self.cref = tk.StringVar(value="авто")
-        ttk.Entry(cr_, textvariable=self.cref, width=7).pack(side="left")
-        ttk.Label(f, text="   авто: 1 у профиля и механизации из профиля, габарит по x у файла механизации",
-                  foreground="#555", font=("", 8)).grid(row=10, column=0, columnspan=2, sticky="sw", pady=(26, 0))
-        ttk.Radiobutton(f, text="RANS (Навье–Стокс + модель турбулентности):\n   отрыв, Cl_max механизации (минуты на угол)",
-                        variable=self.method, value="rans").grid(row=11, column=0, columnspan=2, sticky="w",
-                                                                 pady=(6, 0))
-        ttk.Label(f, text="   Итераций на угол, не более:").grid(row=12, column=0, sticky="w")
+        self._cond_rows = {}
+
+        def row(r, key, label, widgets, tip):
+            lb = ttk.Label(f, text=label)
+            lb.grid(row=r, column=0, sticky="w", pady=2, padx=(0, 6))
+            fr_ = ttk.Frame(f)
+            fr_.grid(row=r, column=1, sticky="w", pady=2)
+            for w_ in widgets(fr_):
+                w_.pack(side="left", padx=(0, 3))
+            Tooltip(lb, tip)
+            for ch_ in fr_.winfo_children():
+                Tooltip(ch_, tip)
+            self._cond_rows[key] = (lb, fr_)
+        ent = lambda var, w=8: (lambda fr_: [ttk.Entry(fr_, textvariable=var, width=w)])
+        row(0, "re", "Число Рейнольдса Re", ent(self.re, 14),
+            "По опорной хорде. Можно несколько через «;» или пробел: 1e5; 3e5; 1e6 — все поляры за один запуск.")
+        row(1, "mach", "Число Маха M", ent(self.mach),
+            "Сжимаемость — поправкой Кармана–Цяня (вязкий и невязкий метод до M ≈ 0,6).")
+        row(2, "ncrit", "Ñкрит (переход eᴺ)", ent(self.ncrit),
+            "Возмущённость потока: 9 — обычная аэродинамическая труба; 10–11 — малотурбулентная труба "
+            "или спокойная атмосфера; 4–7 — турбулентный поток.")
+        row(3, "xtr", "Переход не дальше x/c",
+            lambda fr_: [ttk.Label(fr_, text="верх"), ttk.Entry(fr_, textvariable=self.xtru, width=5),
+                         ttk.Label(fr_, text="низ"), ttk.Entry(fr_, textvariable=self.xtrl, width=5)],
+            "Принудительный переход (турбулизатор): 1 — свободный переход; 0,05 — у передней кромки.")
+        row(4, "alpha", "Угол атаки α, °",
+            lambda fr_: [ttk.Label(fr_, text="от"), ttk.Entry(fr_, textvariable=self.a0, width=5),
+                         ttk.Label(fr_, text="до"), ttk.Entry(fr_, textvariable=self.a1, width=5),
+                         ttk.Label(fr_, text="шаг"), ttk.Entry(fr_, textvariable=self.da, width=4)],
+            "Диапазон углов атаки поляры. Для одной точки: «от» = «до».")
+        row(5, "cref", "Опорная хорда c", ent(self.cref),
+            "По ней считаются Re и коэффициенты Cl = L′/(q∞·c). «авто»: 1 у профиля и у механизации, "
+            "построенной из профиля; габарит по x — у многоэлементного файла.")
+        from .parallel import cpu_count, auto_workers
+        self.cores = tk.StringVar(value="авто")
+        row(6, "cores", f"Ядер ЦП (здесь {cpu_count()})",
+            lambda fr_: [ttk.Combobox(fr_, textvariable=self.cores, width=6,
+                                      values=["авто"] + [str(n) for n in (1, 2, 4, 8, 12, 16, 24, 32)
+                                                         if n <= cpu_count()])],
+            f"Поляра делится на куски по α, куски считаются одновременно. «авто» = {auto_workers()} "
+            "(все, кроме одного).")
+
+        # --- параметры Эйлера и RANS (показываются только для этих методов)
+        self.grid_name = tk.StringVar(value=list(core.GRIDS)[0])
+        self.niter = tk.StringVar(value="100")
+        fe = ttk.LabelFrame(left, text="Параметры метода Эйлера", padding=6)
+        ttk.Label(fe, text="сетка").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(fe, textvariable=self.grid_name, values=list(core.GRIDS), state="readonly",
+                     width=15).grid(row=0, column=1, sticky="w")
+        ttk.Label(fe, text="итераций").grid(row=1, column=0, sticky="w")
+        ttk.Entry(fe, textvariable=self.niter, width=6).grid(row=1, column=1, sticky="w")
+        fr = ttk.LabelFrame(left, text="Параметры RANS (экспериментально)", padding=6)
+        ttk.Label(fr, text="итераций на угол, не более").grid(row=0, column=0, sticky="w")
         self.rans_iter = tk.StringVar(value="400")
-        ttk.Entry(f, textvariable=self.rans_iter, width=8).grid(row=12, column=1, sticky="w")
-        rm = ttk.Frame(f)
-        rm.grid(row=13, column=0, columnspan=2, sticky="w")
-        ttk.Label(rm, text="   модель турбулентности").pack(side="left")
+        ttk.Entry(fr, textvariable=self.rans_iter, width=7).grid(row=0, column=1, sticky="w")
+        ttk.Label(fr, text="модель турбулентности").grid(row=1, column=0, sticky="w")
         self.turb_model = tk.StringVar(value=list(self.TURB_MODELS)[0])
-        ttk.Combobox(rm, textvariable=self.turb_model, values=list(self.TURB_MODELS), state="readonly",
-                     width=26).pack(side="left")
-        rp = ttk.Frame(f)
-        rp.grid(row=14, column=0, columnspan=2, sticky="w")
-        ttk.Label(rp, text="   предобусловл. ILU(k), k =").pack(side="left")
+        ttk.Combobox(fr, textvariable=self.turb_model, values=list(self.TURB_MODELS), state="readonly",
+                     width=22).grid(row=1, column=1, sticky="w")
+        ttk.Label(fr, text="предобусловливатель ILU(k), k").grid(row=2, column=0, sticky="w")
         self.prec_fill = tk.StringVar(value="3")
-        ttk.Combobox(rp, textvariable=self.prec_fill, values=["0", "1", "2", "3", "4"], state="readonly",
-                     width=3).pack(side="left")
-        ttk.Label(rp, text=" (больше — быстрее)", foreground="#555").pack(side="left")
+        ttk.Combobox(fr, textvariable=self.prec_fill, values=["0", "1", "2", "3", "4"], state="readonly",
+                     width=3).grid(row=2, column=1, sticky="w")
         self.coarse_start = tk.BooleanVar(value=True)
-        ttk.Checkbutton(f, text="старт на грубой сетке (если > 20 тыс. ячеек)",
-                        variable=self.coarse_start).grid(row=15, column=0, columnspan=2, sticky="w", padx=(14, 0))
-        ttk.Label(f, text="   сетка — «Сетка»; сходимость и шаг — «Невязки»", foreground="#555").grid(
-            row=16, column=0, columnspan=2, sticky="w")
+        ttk.Checkbutton(fr, text="старт на грубой сетке (если > 20 тыс. ячеек)",
+                        variable=self.coarse_start).grid(row=3, column=0, columnspan=2, sticky="w")
+        ttk.Label(fr, text="сетка — вкладка «Сетка»; сходимость и шаг — «Невязки»", foreground="#555").grid(
+            row=4, column=0, columnspan=2, sticky="w")
+        self._method_frames = {"euler": fe, "rans": fr}
 
         # --- кнопки
         f = ttk.Frame(left, padding=(0, 6))
@@ -221,6 +272,11 @@ class App(tk.Tk):
         fm.add_command(label="Выход", command=self.destroy)
         mb.add_cascade(label="Файл", menu=fm)
         self.config(menu=mb)
+        self._buttons_frame = f
+        Tooltip(self.btn_run, "Ctrl+Enter")
+        Tooltip(self.btn_stop, "Esc")
+        self.bind_all("<Control-Return>", lambda _: self.run())
+        self.bind_all("<Escape>", lambda _: self.stop() if self.worker and self.worker.is_alive() else None)
 
 
         # --- вкладки
@@ -289,12 +345,17 @@ class App(tk.Tk):
         ttk.Label(tb_, text="  Cl = L′/(q∞·c), Cd = D′/(q∞·c), Cm = M′/(q∞·c²) — на единицу размаха "
                   "(S = c·1), c — опорная хорда (см. «Примечания»).", foreground="#555").pack(side="left")
         ttk.Button(tb_, text="Размерные силы…", command=self.forces_dialog).pack(side="right", padx=4, pady=2)
-        cols = ("calc", "alpha", "cl", "cd", "cdf", "cm", "ch", "xu", "xl", "ok")
-        self.table = ttk.Treeview(tf, columns=cols, show="headings")
-        for c, t, w in zip(cols, ["Расчёт", "α, °", "Cl", "Cd", "Cd трения", "Cm", "Ch руля", "Переход верх",
-                                  "Переход низ", "Надёжно"], [300, 50, 75, 80, 80, 75, 75, 85, 85, 65]):
+        # расчёт — строка-заголовок группы (свернуть/развернуть), под ней его углы атаки
+        cols = ("alpha", "cl", "cd", "cdf", "cm", "ch", "xu", "xl", "ok")
+        self.table = ttk.Treeview(tf, columns=cols, show="tree headings")
+        self.table.heading("#0", text="Расчёт")
+        self.table.column("#0", width=260, stretch=True)
+        for c, t, w in zip(cols, ["α, °", "Cl", "Cd", "Cd трения", "Cm", "Ch руля", "x/c перехода, верх",
+                                  "x/c перехода, низ", "Надёжно"], [55, 75, 80, 80, 75, 75, 145, 145, 70]):
             self.table.heading(c, text=t)
-            self.table.column(c, width=w, anchor="w" if c == "calc" else "e")
+            self.table.column(c, width=w, anchor="e", stretch=False)
+        self.table.tag_configure("bad", foreground="#b03a2e")
+        self.table.tag_configure("group", font=("TkDefaultFont", 10, "bold"))
         sb = ttk.Scrollbar(tf, orient="vertical", command=self.table.yview)
         self.table.configure(yscrollcommand=sb.set)
         self.table.pack(side="left", fill="both", expand=True)
@@ -305,6 +366,7 @@ class App(tk.Tk):
         self.notes = tk.Text(nf, wrap="word", height=10)
         self.notes.pack(fill="both", expand=True)
         self.nb = nb
+        self._on_method()
 
     # ------------------------------------------------------------- профиль
     def open_file(self):
@@ -463,6 +525,78 @@ class App(tk.Tk):
             slat_on.set(False)
             apply()
         ttk.Button(bf, text="Без механизации", command=reset).pack(side="right")
+
+    def show_error(self, title, text, details=""):
+        """Понятное сообщение об ошибке; техническая трасса — по кнопке «Подробнее»."""
+        w = tk.Toplevel(self)
+        w.title(title)
+        w.transient(self)
+        w.resizable(False, False)
+        fr_ = ttk.Frame(w, padding=12)
+        fr_.pack(fill="both", expand=True)
+        ttk.Label(fr_, text=text, wraplength=460, justify="left").pack(anchor="w")
+        if isinstance(text, str) and not any(ord(c) > 0x400 for c in text):
+            ttk.Label(fr_, text="Если сообщение непонятно — пришлите текст из «Подробнее» разработчику.",
+                      foreground="#555", wraplength=460).pack(anchor="w", pady=(6, 0))
+        box = tk.Text(fr_, width=80, height=14, font=("Courier", 9))
+        box.insert("end", details)
+        box.configure(state="disabled")
+        bb = ttk.Frame(fr_)
+        bb.pack(fill="x", pady=(10, 0))
+
+        def toggle():
+            if box.winfo_ismapped():
+                box.pack_forget()
+            else:
+                box.pack(fill="both", expand=True, pady=(8, 0), before=bb)
+
+        def copy():
+            self.clipboard_clear()
+            self.clipboard_append(f"{text}\n\n{details}")
+        ttk.Button(bb, text="OK", command=w.destroy).pack(side="right")
+        if details:
+            ttk.Button(bb, text="Подробнее", command=toggle).pack(side="right", padx=6)
+            ttk.Button(bb, text="Копировать", command=copy).pack(side="right")
+        w.bind("<Return>", lambda _: w.destroy())
+        w.bind("<Escape>", lambda _: w.destroy())
+        self._center(w)
+        w.grab_set()
+
+    def _center(self, w):
+        """Окно-диалог — по центру главного окна."""
+        w.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - w.winfo_reqwidth()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - w.winfo_reqheight()) // 3
+        w.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+    def _on_method(self):
+        """Смена метода: параметры и вкладки — только нужные этому методу."""
+        m = dict(self.METHODS_UI).get(self.method_name.get(), "viscous")
+        self.method.set(m)
+        for key, fr_ in self._method_frames.items():
+            if key == m:
+                fr_.pack(fill="x", pady=4, before=self._buttons_frame)
+            else:
+                fr_.pack_forget()
+        need = {"re": m in ("viscous", "rans"), "ncrit": m == "viscous" or m == "rans",
+                "xtr": m == "viscous", "cref": m in ("viscous", "rans", "panel"),
+                "cores": m in ("viscous", "rans")}
+        for key, (lb, fr_) in self._cond_rows.items():
+            st = "normal" if need.get(key, True) else "disabled"
+            lb.configure(foreground="" if st == "normal" else "#999")
+            for ch_ in fr_.winfo_children():
+                try:
+                    ch_.configure(state=st)
+                except tk.TclError:
+                    pass
+        if m == "rans":
+            self.btn_skip.pack(fill="x", pady=2)
+        else:
+            self.btn_skip.pack_forget()
+        # вкладки «Сетка» и «Невязки» нужны только для RANS
+        for fr_ in (getattr(self, "t_mesh_frame", None), getattr(self, "t_res_frame", None)):
+            if fr_ is not None:
+                self.nb.tab(fr_, state=("normal" if m == "rans" else "hidden"))
 
     def _cref(self, default):
         """Опорная хорда из поля окна («авто» — default)."""
@@ -668,7 +802,7 @@ class App(tk.Tk):
                 for k, p in enumerate(ps):
                     self.q.put(("done" if k == len(ps) - 1 else "partial", p))
             except Exception as e:  # noqa: BLE001
-                self.q.put(("error", f"{e}\n\n{traceback.format_exc(limit=3)}"))
+                self.q.put(("error", str(e) or type(e).__name__, traceback.format_exc()))
 
         self.worker = threading.Thread(target=job, daemon=True)
         self.worker.start()
@@ -715,7 +849,7 @@ class App(tk.Tk):
                 elif msg[0] == "error":
                     self._finish()
                     self.status.set("Ошибка расчёта")
-                    messagebox.showerror("Ошибка расчёта", msg[1])
+                    self.show_error("Ошибка расчёта", msg[1], msg[2] if len(msg) > 2 else "")
         except queue.Empty:
             pass
         self.after(150, self._poll)
@@ -736,11 +870,13 @@ class App(tk.Tk):
         self.notes.insert("end", f"■ {p.label}\n" + "".join(f"   • {t}\n" for t in p.notes + [core.coef_note(p)])
                           + "\n")
         fmt = lambda arr, k, f: "—" if arr is None or not np.isfinite(arr[k]) else format(arr[k], f)
+        grp = self.table.insert("", "end", text=p.label, open=True, tags=("group",),
+                                values=("", "", "", "", "", "", "", "", f"{n_ok} из {len(p.alpha)}"))
         for k in range(len(p.alpha)):
-            self.table.insert("", "end", values=(
-                p.label, f"{p.alpha[k]:g}", f"{p.cl[k]:.4f}", fmt(p.cd, k, ".5f"), fmt(p.cdf, k, ".5f"),
+            self.table.insert(grp, "end", text="", tags=() if p.ok[k] else ("bad",), values=(
+                f"{p.alpha[k]:g}", f"{p.cl[k]:.4f}", fmt(p.cd, k, ".5f"), fmt(p.cdf, k, ".5f"),
                 f"{p.cm[k]:.4f}", fmt(p.ch, k, ".4f"), fmt(p.xtr_u, k, ".3f"), fmt(p.xtr_l, k, ".3f"),
-                "да" if p.ok[k] else "НЕТ"))
+                "да" if p.ok[k] else "нет"))
         self.cb_res_src["values"] = ["текущий расчёт"] + [q.label for q in self.polars if q.method == "rans"]
         fl = [q.label for q in self.polars if q.field_ctx is not None]
         self.cb_fl_polar["values"] = fl
@@ -1440,6 +1576,7 @@ class App(tk.Tk):
     def _build_res_tab(self, nb):
         fr = ttk.Frame(nb)
         nb.add(fr, text="Невязки")
+        self.t_res_frame = fr
         bar = ttk.Frame(fr, padding=(4, 4))
         bar.pack(side="top", fill="x")
         ttk.Label(bar, text="Переход к следующему углу: невязка ниже 10^−").pack(side="left")
@@ -1778,7 +1915,7 @@ class App(tk.Tk):
                                        solver_opts=sopts)
                 self.q.put(("done", q))
             except Exception as e:  # noqa: BLE001
-                self.q.put(("error", f"{e}\n\n{traceback.format_exc(limit=3)}"))
+                self.q.put(("error", str(e) or type(e).__name__, traceback.format_exc()))
         self.worker = threading.Thread(target=job, daemon=True)
         self.worker.start()
 
