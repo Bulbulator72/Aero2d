@@ -394,7 +394,7 @@ def run_multi_viscous_batch(elements, alphas, mach: float, re_list, ncrit: float
     npn = [max(80, int(round(180 * c / max(chords) / 20)) * 20) for c in chords]
     if not chord:
         chord = float(max(np.max(e.x) for e in elements) - min(np.min(e.x) for e in elements))
-    # холодный старт механизации дорогой (20–90 с) — куски по α не короче 3 точек
+    # холодный старт механизации дорогой (1–6 мин) — куски по α не короче 3 точек
     alphas, results, nproc = _run_parallel(
         "multi", lambda re, al: (elements, re, al, ncrit, mach, xt, chord, npn), alphas, re_list, workers, 3,
         callback)

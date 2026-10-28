@@ -882,7 +882,8 @@ class App(tk.Tk):
         self.btn_stop.configure(state="normal" if method not in ("panel", "multi") else "disabled")
         self.btn_skip.configure(state="normal" if method == "rans" else "disabled")
         self.progress["value"] = 0
-        self.status.set("Расчёт…")
+        self.status.set("Расчёт механизации: первая точка (холодный старт) ищется 1–5 мин, дальше — "
+                        "десятки секунд на угол…" if method == "multi_viscous" else "Расчёт…")
 
         control = self._control
 
