@@ -934,24 +934,36 @@ class MultiViscousSolver(ViscousSolver):
                     return rc
             finally:
                 self.cross = 1.0
-        # 2) продолжение по геометрии: закрылки поворачиваются вокруг носка на
-        #    меньший угол (где решение находится легче), затем шагами — к заданному
+        # 2) продолжение по числу Рейнольдса — сначала одна попытка с Re×4 (у щелевых
+        #    закрылков чаще всего срабатывает она), 3) затем продолжение по углу
+        #    закрылков (нужно при больших углах, δf ≈ 40°), 4) затем Re×16. Порядок —
+        #    от дешёвого к дорогому: каждая холодная попытка — маршевый проход слоя
+        #    (десятки секунд у механизации)
+        f_all = tuple(getattr(self, "re_factors", (4.0, 16.0)))
+        rr = self._re_continuation(alpha, f_all[:1], max_iter, tol, verbose)
+        if rr is not None:
+            return rr
         if init is None and self.E > 1 and getattr(self, "morph", True):
             rm = self._morph_solve(alpha, max_iter, tol)
             if rm is not None:
                 return rm
-        # 3) продолжение по числу Рейнольдса
+        rr = self._re_continuation(alpha, f_all[1:], max_iter, tol, verbose)
+        return rr if rr is not None else r
+
+    def _re_continuation(self, alpha, factors, max_iter, tol, verbose):
+        """Решение при Re·f (слои тоньше, связь слабее) и спуск к заданному Re с
+        адаптивным шагом; None — если не удалось."""
         re_t = self.re
         try:
             best = None
-            for f in getattr(self, "re_factors", (4.0, 16.0)):
+            for f in factors:
                 self.re = re_t * f
                 rk = self._solve(alpha, None, max_iter, tol, verbose)
                 if rk.converged:
                     best, best_re = rk, self.re
                     break
             if best is None:
-                return r
+                return None
             ratio, tries = 2.0, 0
             while best_re > re_t * 1.0001 and tries < 10:
                 tries += 1
@@ -965,7 +977,7 @@ class MultiViscousSolver(ViscousSolver):
                     ratio = ratio ** 0.5
                     if ratio < 1.08:
                         break
-            return best if best_re <= re_t * 1.0001 else r
+            return best if best_re <= re_t * 1.0001 else None
         finally:
             self.re = re_t
 
@@ -1004,6 +1016,7 @@ class MultiViscousSolver(ViscousSolver):
                                              wake_length=a["wake_length"], n_wake=a["n_wake"])
                     tmp.re = self.re
                     tmp.morph = False
+                    tmp.re_factors = ()           # внутри — без продолжения по Re (дорого)
                     r = tmp.solve(alpha, init=st, max_iter=max_iter, tol=tol, homotopy=(k == 0))
                 if not r.converged:
                     ok = False
