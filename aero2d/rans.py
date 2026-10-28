@@ -179,7 +179,12 @@ class RansSolver:
         self.cfl_limit = 1e6           # наибольший CFL
         self.first_order = 30          # итераций первым порядком при старте с нуля
         self.rollback_factor = 100.0   # невязка выросла во столько раз от наименьшей — откат
-        self.rollback_first_order = 15 # после отката — итераций первым порядком
+        self.rollback_first_order = 15 # после отката из-за NaN — итераций первым порядком (при
+                                       # росте невязки — нет: первый порядок уводит от уже
+                                       # сошедшегося решения второго порядка)
+        self.step_reject = 3.0         # невязка выросла за шаг больше чем в столько раз — шаг
+                                       # отменяется, CFL ×0,3 (поле не «выбивается» из решения)
+        self.max_rejects = 6           # подряд отменённых шагов не больше
         self.max_rollbacks = 4         # больше откатов — угол «неустойчив»
         self.sa_raw_grad = False       # True: источник SA по неограниченным градиентам (на механизации хуже сходится)
         self.visc_raw_grad = False     # True: вязкие потоки по неограниченным градиентам
@@ -964,6 +969,12 @@ class RansSolver:
         R_fs = np.asarray(F_["res2f"](self.cons(jnp.asarray(w_fs)), jnp.asarray(winf), jnp.asarray(0.0)))
         r_fs = float(np.sqrt(np.mean((R_fs / self.vol[:, None]) ** 2, 0)).sum())
         warm = Q0 is not None
+        if warm and self.vortex_bc:
+            # циркуляция для вихревой поправки на внешней границе — сразу по начальному полю
+            # (иначе первые итерации идут с Γ = 0, граница «дёргается» и невязка скачет)
+            self.gamma_vortex = 0.5 * self.forces(Q, alpha)["cl"] * self.mach * self.chord
+        prev = None                                   # (Q, невязка, порядок) до последнего шага
+        n_rej = 0
         hist = []
         r0 = None
         cfl = cfl0
@@ -1035,10 +1046,25 @@ class RansSolver:
                     break
                 Q = best["Q"].copy()
                 cfl = max(cfl0, min(cfl, best["cfl"]) * 0.1)
-                first_until = it + self.rollback_first_order
+                first_until = it + (self.rollback_first_order if not np.isfinite(rn) else 0)
                 phi = None
                 best.update(rn=np.inf, it=it)
                 continue
+            # отмена неудачного шага: невязка выросла в step_reject раз — вернуть поле,
+            # уменьшить CFL и повторить (без отката к «лучшему» и без первого порядка)
+            if (prev is not None and prev[2] == order and n_rej < self.max_rejects
+                    and (not np.isfinite(rn) or rn > self.step_reject * prev[1])
+                    and not (warm and it <= 8) and not manual):
+                n_rej += 1
+                Q = prev[0].copy()
+                cfl = max(cfl0, cfl * 0.3)
+                events.append((it, f"шаг отменён (невязка ×{rn / prev[1]:.3g}), CFL → {cfl:.3g}", rn, []))
+                if verbose:
+                    print(f"  it {it:4d}: шаг отменён (невязка ×{rn / prev[1]:.3g}), CFL → {cfl:.3g}", flush=True)
+                if control is not None and control.monitor is not None:
+                    control.monitor(dict(alpha=alpha, it=it, event=f"шаг отменён, CFL → {cfl:.3g}"))
+                continue
+            n_rej = 0
             if not np.isfinite(rn):
                 status = "расходится"
                 break
@@ -1206,6 +1232,7 @@ class RansSolver:
             lam = 1.0 if rel < 0.2 else 0.2 / rel
             if lam < 1.0:
                 cfl = max(cfl0, cfl * 0.5)
+            prev = (Q.copy(), rn, order)
             Q = Q + lam * dq
             # циркуляция для вихревой поправки
             if self.vortex_bc and it % 5 == 0:
