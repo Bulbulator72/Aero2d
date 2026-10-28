@@ -331,3 +331,101 @@ def quality_report(mesh: Mesh, cq: dict | None = None) -> str:
                f"> 100: {(cq['vol_ratio'] > 100).sum()}")
     out.append(f"Non-orthogonality: макс. {cq['nonortho'].max():.0f}°, ячеек > 70°: {(cq['nonortho'] > 70).sum()}")
     return "\n".join(out)
+
+
+class NodeInterp:
+    """Интерполяция величин из центров ячеек в произвольные точки по самой
+    расчётной сетке: значения переносятся в узлы (среднее по соседним ячейкам с
+    весом объёма; на стенке — заданные значения, например скорость 0), затем —
+    линейно внутри треугольников сетки (четырёхугольники делятся на два).
+    В отличие от триангуляции Делоне по центрам ячеек треугольники не
+    перекидываются через тело (тонкая задняя кромка, ниша закрылка), а у стенки
+    выполняется условие прилипания — без ложных полос вдоль контура."""
+
+    def __init__(self, mesh: Mesh):
+        import scipy.sparse as sp
+        from matplotlib.tri import Triangulation
+        tris, tcell = [], []
+        for i, c in enumerate(mesh.cells):
+            if len(c) == 3:
+                tris.append(c); tcell.append(i)
+            else:
+                tris += [[c[0], c[1], c[2]], [c[0], c[2], c[3]]]; tcell += [i, i]
+        self.tris = np.asarray(tris, int)
+        self.tcell = np.asarray(tcell, int)
+        self.tri = Triangulation(mesh.nodes[:, 0], mesh.nodes[:, 1], self.tris)
+        self.finder = self.tri.get_trifinder()
+        rows = np.concatenate([np.asarray(c, int) for c in mesh.cells])
+        cols = np.repeat(np.arange(mesh.n_cells), [len(c) for c in mesh.cells])
+        w = mesh.volume[cols]
+        W = sp.csr_matrix((w, (rows, cols)), shape=(len(mesh.nodes), mesh.n_cells))
+        s = np.asarray(W.sum(1)).ravel()
+        self.W = sp.diags(1.0 / np.maximum(s, 1e-300)) @ W
+        self.wall = np.zeros(len(mesh.nodes), bool)
+        self.wall[mesh.face_nodes[mesh.face_tag == 1].ravel()] = True
+        self.nodes = mesh.nodes
+        self._pts = None
+
+    def locate(self, x, y):
+        """Треугольник и барицентрические координаты точек (запоминаются для тех же точек)."""
+        x, y = np.asarray(x, float).ravel(), np.asarray(y, float).ravel()
+        key = (x.size, float(x.sum()), float(y.sum()))
+        if self._pts is not None and self._pts[0] == key:
+            return self._pts[1:]
+        ti = self.finder(x, y)
+        ok = ti >= 0
+        bc = np.zeros((x.size, 3))
+        P = self.nodes[self.tris[np.where(ok, ti, 0)]]                    # (n,3,2)
+        a, b, c = P[:, 0], P[:, 1], P[:, 2]
+        det = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (c[:, 0] - a[:, 0]) * (b[:, 1] - a[:, 1])
+        det = np.where(np.abs(det) < 1e-300, 1e-300, det)
+        l1 = ((x - a[:, 0]) * (c[:, 1] - a[:, 1]) - (c[:, 0] - a[:, 0]) * (y - a[:, 1])) / det
+        l2 = ((b[:, 0] - a[:, 0]) * (y - a[:, 1]) - (x - a[:, 0]) * (b[:, 1] - a[:, 1])) / det
+        bc[:, 0], bc[:, 1], bc[:, 2] = 1 - l1 - l2, l1, l2
+        self._pts = (key, ti, ok, bc)
+        return ti, ok, bc
+
+    def __call__(self, cell_vals, x, y, wall=None):
+        """cell_vals (n_cells, k) → (n_точек, k), вне сетки (внутри тел) — NaN.
+        wall — {номер столбца: значение на стенке} (например {0: 0.0, 1: 0.0} — прилипание)."""
+        V = np.asarray(cell_vals, float)
+        V = V[:, None] if V.ndim == 1 else V
+        Nv = self.W @ V
+        for j, val in (wall or {}).items():
+            Nv[self.wall, j] = val
+        ti, ok, bc = self.locate(x, y)
+        tn = self.tris[np.where(ok, ti, 0)]
+        out = np.einsum("pj,pjk->pk", bc, Nv[tn])
+        out[~ok] = np.nan
+        return out
+
+    def cell_at(self, x, y):
+        """Номер ячейки, в которой лежит точка (−1 — вне сетки): для кусочно-постоянных величин."""
+        ti, ok, _ = self.locate(x, y)
+        return np.where(ok, self.tcell[np.where(ok, ti, 0)], -1)
+
+
+def wall_loops(mesh: Mesh):
+    """Контуры тел по граням стенки самой сетки (замкнутые ломаные, по телам) — для
+    рисования: совпадают с границей расчётной области точно."""
+    out = []
+    wf = np.where(mesh.face_tag == 1)[0]
+    for b in np.unique(mesh.face_body[wf]):
+        edges = mesh.face_nodes[wf[mesh.face_body[wf] == b]]
+        nxt = {}
+        for a, c in edges:
+            nxt.setdefault(a, []).append(c)
+            nxt.setdefault(c, []).append(a)
+        start = int(edges[0, 0])
+        loop, prev, cur = [start], None, start
+        for _ in range(len(edges)):
+            cand = [n for n in nxt[cur] if n != prev]
+            if not cand:
+                break
+            prev, cur = cur, cand[0]
+            if cur == start:
+                break
+            loop.append(cur)
+        P = mesh.nodes[loop + [start]]
+        out.append((P[:, 0], P[:, 1]))
+    return out

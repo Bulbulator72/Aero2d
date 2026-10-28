@@ -116,7 +116,7 @@ def compute_field(ctx: dict, k: int, box=None, n: int = 220) -> dict:
         extra.update(bodies=bodies, disp=disp, wakes=wakes, converged=bool(r.converged))
         x, y = bodies[0]
     elif ctx["method"] == "rans":
-        from scipy.interpolate import LinearNDInterpolator
+        from .rans_mesh import NodeInterp
         mesh, Q = ctx["mesh"], ctx["states"][k]
         if Q is None:
             raise ValueError("для этого угла RANS не посчитан")
@@ -126,24 +126,25 @@ def compute_field(ctx: dict, k: int, box=None, n: int = 220) -> dict:
         u, v = Q[:, 1] / rho, Q[:, 2] / rho
         p = (GAM - 1) * (Q[:, 3] - 0.5 * rho * (u**2 + v**2))
         M = ctx["mach"]
-        tri = ctx.get("_tri")
-        if tri is None:
-            from scipy.spatial import Delaunay
-            tri = ctx["_tri"] = Delaunay(mesh.centroid)
+        ip = ctx.get("_interp")
+        if ip is None:
+            ip = ctx["_interp"] = NodeInterp(mesh)
         vals = np.column_stack([u / M, v / M, (p - 1 / GAM) / (0.5 * M**2),
                                 np.sqrt(u**2 + v**2) / np.sqrt(GAM * p / rho), Q[:, 4] / rho])
-        f = LinearNDInterpolator(tri, vals)(np.column_stack([xp, yp]))
+        # на стенке: прилипание (u = v = 0, M = 0), ν̃ = 0; давление — из соседних ячеек
+        f = ip(vals, xp, yp, wall={0: 0.0, 1: 0.0, 3: 0.0, 4: 0.0})
         U, V = f[:, 0], f[:, 1]
-        inside = np.zeros(xp.shape, bool)
-        bodies = []
-        for e in ctx["elements"]:
-            inside |= Path(np.column_stack([e.x, e.y])).contains_points(np.column_stack([xp, yp]))
-            bodies.append((np.asarray(e.x), np.asarray(e.y)))
+        from .rans_mesh import wall_loops
+        inside = ~np.isfinite(U)                       # вне расчётной области — внутри тел
+        bodies = ctx.get("_walls")
+        if bodies is None:
+            bodies = ctx["_walls"] = wall_loops(mesh)    # тела — по стенкам самой сетки
         extra.update(bodies=bodies, converged=True, mach_local=f[:, 3].reshape(X.shape),
                      nut=f[:, 4].reshape(X.shape), cp_rans=f[:, 2])
         H = (ctx.get("history") or [None] * (k + 1))[k]
         if H is not None and "res_cell" in H:
-            rc = LinearNDInterpolator(tri, np.asarray(H["res_cell"], float))(np.column_stack([xp, yp]))
+            ci = ip.cell_at(xp, yp)
+            rc = np.where(ci >= 0, np.asarray(H["res_cell"], float)[np.maximum(ci, 0)], np.nan)
             extra["res_cell"] = rc.reshape(X.shape)
             extra["worst_xy"] = mesh.centroid[np.asarray(H.get("worst", []), int)]
         x, y = bodies[0]

@@ -629,6 +629,8 @@ def continue_rans(p: Polar, callback=None, max_iter: int = 300, conv=None, contr
             hist[k] = Hn
     out.field_ctx = dict(ctx, states=states, history=hist)
     out.field_ctx.pop("_tri", None)
+    out.field_ctx.pop("_interp", None)
+    out.field_ctx.pop("_walls", None)
     out.notes = list(p.notes) + [f"Досчитано: α = {', '.join(f'{a:g}' for a in alphas[idx])}° — каждый угол "
                                  "продолжен со своего решения на той же сетке."] + \
         [n for n in q.notes if n.startswith("Итог") or n.startswith("Не сошлись")]

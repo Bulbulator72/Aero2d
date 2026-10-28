@@ -30,18 +30,19 @@ def _grid(box, n):
 
 
 def frame_fields(mesh, Q, mach, X, Y, tri=None):
-    """Поля кадра на сетке X, Y: u, v (в долях V∞), Cp, M, ν̃/ν∞, ω·c/V∞."""
-    from scipy.interpolate import LinearNDInterpolator
-    from scipy.spatial import Delaunay
+    """Поля кадра на сетке X, Y: u, v (в долях V∞), Cp, M, ν̃/ν∞, ω·c/V∞.
+    tri — rans_mesh.NodeInterp этой сетки (интерполяция по самой расчётной сетке,
+    с прилипанием на стенке; строится один раз на все кадры)."""
+    from .rans_mesh import NodeInterp
     if tri is None:
-        tri = Delaunay(mesh.centroid)
+        tri = NodeInterp(mesh)
     Q = np.asarray(Q, float)
     rho = Q[:, 0]
     u, v = Q[:, 1] / rho, Q[:, 2] / rho
     p = (GAM - 1) * (Q[:, 3] - 0.5 * rho * (u ** 2 + v ** 2))
     vals = np.column_stack([u / mach, v / mach, (p - 1 / GAM) / (0.5 * mach ** 2),
                             np.sqrt(u ** 2 + v ** 2) / np.sqrt(GAM * p / rho), Q[:, 4] / rho])
-    f = LinearNDInterpolator(tri, vals)(np.column_stack([X.ravel(), Y.ravel()])).reshape(X.shape + (5,))
+    f = tri(vals, X.ravel(), Y.ravel(), wall={0: 0.0, 1: 0.0, 3: 0.0, 4: 0.0}).reshape(X.shape + (5,))
     U, V = f[..., 0], f[..., 1]
     dx = X[0, 1] - X[0, 0]
     dy = Y[1, 0] - Y[0, 0]
@@ -60,17 +61,17 @@ def make_gif(mesh, elements, run, path, quantity="vorticity", box=(-0.5, 2.5, -0
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.path import Path
-    from scipy.spatial import Delaunay
     from PIL import Image
+    from .rans_mesh import NodeInterp
 
     mach = float(run.get("mach", 0.15)) if isinstance(run, dict) else 0.15
     frames = run["frames"]
     X, Y = _grid(box, n)
-    tri = Delaunay(mesh.centroid)
-    inside = np.zeros(X.shape, bool)
-    for e in elements:
-        inside |= Path(np.column_stack([e.x, e.y])).contains_points(
-            np.column_stack([X.ravel(), Y.ravel()])).reshape(X.shape)
+    from .rans_mesh import wall_loops
+    tri = NodeInterp(mesh)
+    ti, ok, _ = tri.locate(X.ravel(), Y.ravel())
+    inside = ~ok.reshape(X.shape)                      # вне расчётной области — внутри тел
+    walls = wall_loops(mesh)
     fields = []
     for k, (t, Q) in enumerate(frames):
         f = frame_fields(mesh, Q, mach, X, Y, tri)
@@ -113,8 +114,8 @@ def make_gif(mesh, elements, run, path, quantity="vorticity", box=(-0.5, 2.5, -0
                 ax.streamplot(X[0], Y[:, 0], uu, vv, density=1.0, color="k", linewidth=0.4, arrowsize=0.5)
             except Exception:                                   # noqa: BLE001 — линии тока не обязательны
                 pass
-        for e in elements:
-            ax.fill(e.x, e.y, color="#888", zorder=3)
+        for wx_, wy_ in walls:
+            ax.fill(wx_, wy_, color="#888", zorder=3)
         ax.set_xlim(box[0], box[1])
         ax.set_ylim(box[2], box[3])
         cl_t = np.interp(t, t_all, cl_all) if len(t_all) else np.nan
