@@ -1224,6 +1224,21 @@ class ViscousSolver:
                 return rc
         return r
 
+    @staticmethod
+    def _beyond_stall(alpha, like):
+        """Точка за срывом, которая не считалась: не сошлась, коэффициенты — NaN."""
+        import copy
+        r = copy.copy(like)
+        r.alpha, r.converged, r.state = float(alpha), False, None
+        for k in ("cl", "cd", "cdf", "cdp", "cm"):
+            setattr(r, k, np.nan)
+        if hasattr(r, "cp"):
+            r.cp = np.full_like(np.asarray(r.cp, float), np.nan)
+        if getattr(r, "elements", None):
+            r.elements = [dict(e, cl=np.nan, cd=np.nan, cp=np.full_like(np.asarray(e["cp"], float), np.nan))
+                          for e in r.elements]
+        return r
+
     def polar(self, alphas, verbose=False, callback=None, max_iter=50):
         """Поляра: каждая точка — по каноническому пути solve_path (результат не
         зависит от набора углов и совпадает с расчётом этой точки отдельно).
@@ -1266,9 +1281,10 @@ class ViscousSolver:
                 fails = 0
                 for i in [i for i in np.argsort(alphas * direction, kind="stable")
                           if direction * (alphas[i] - alphas[anchor]) > 0]:
-                    # за двумя неудачами подряд (срыв) — одна попытка без деления шага:
-                    # иначе каждая заведомо несходящаяся точка стоит минуты
-                    r = advance(alphas[i], last_ok, 3 if fails >= 2 else 0)
+                    # за двумя неудачами подряд (срыв) дальше не считается: прыжок от
+                    # последней сошедшейся точки через несколько градусов иногда
+                    # «сходится» на нефизичную ветвь, а каждая попытка стоит минуты
+                    r = self._beyond_stall(alphas[i], r) if fails >= 2 else advance(alphas[i], last_ok)
                     if out[i] is None:
                         report(i, r)
                     else:
