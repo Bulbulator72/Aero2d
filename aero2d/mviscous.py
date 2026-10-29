@@ -887,9 +887,13 @@ class MultiViscousSolver(ViscousSolver):
             if not bad:
                 break
             changed = False
+            okn = [out[j].converged for j in order]
             for i in bad:
                 if out[i].converged or fails >= getattr(self, "max_cold_fails", 2):
                     continue
+                pos = order.index(i)
+                if any(okn) and not (any(okn[:pos]) and any(okn[pos + 1:])):
+                    continue                          # за краем сошедшегося диапазона (срыв) — не холодный старт
                 r = self.solve(alphas[i], verbose=verbose, max_iter=max_iter)
                 if not r.converged:
                     fails += 1                        # дорогие попытки — не больше двух неудач

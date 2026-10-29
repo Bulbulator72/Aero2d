@@ -288,15 +288,22 @@ def _run_parallel(kind, make_payload, alphas, re_list, workers, min_len, callbac
     if kind == "multi":
         order = list(np.argsort(alphas, kind="stable"))
         p0 = int(np.argmin(np.abs(alphas[order])))
+        # плюс все углы у нуля (|α| ≤ max(2°, 2Δα)): опорная точка — первая сошедшаяся
+        # в порядке |α|, и если при α ≈ 0 холодный старт не находит решения, ею
+        # становится соседний угол (часто отрицательный), как в одном процессе
+        da = float(np.min(np.diff(np.sort(alphas)))) if len(alphas) > 1 else 1.0
+        near = [i for i in order if abs(alphas[i]) <= max(2.0, 2.0 * da) + 1e-9]
         lead = []
         for idx in chunks:
             pos = sorted(order.index(i) for i in idx)
             if pos[-1] < p0:
-                lead.append(np.array(order[pos[-1] + 1:p0 + 1], int))
+                path = order[pos[-1] + 1:p0 + 1]
             elif pos[0] > p0:
-                lead.append(np.array(order[p0:pos[0]], int))
+                path = order[p0:pos[0]]
             else:
-                lead.append(np.array([], int))
+                path = []
+            extra = [i for i in near if i not in set(idx) and i not in set(path)]
+            lead.append(np.array(list(path) + extra, int))
     tasks = []
     for ir, re in enumerate(re_list):
         for ic, idx in enumerate(chunks):

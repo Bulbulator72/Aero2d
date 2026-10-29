@@ -1263,15 +1263,21 @@ class ViscousSolver:
                 return out
             for direction in (1, -1):
                 last_ok = out[anchor]
+                fails = 0
                 for i in [i for i in np.argsort(alphas * direction, kind="stable")
                           if direction * (alphas[i] - alphas[anchor]) > 0]:
-                    r = advance(alphas[i], last_ok)
+                    # за двумя неудачами подряд (срыв) — одна попытка без деления шага:
+                    # иначе каждая заведомо несходящаяся точка стоит минуты
+                    r = advance(alphas[i], last_ok, 3 if fails >= 2 else 0)
                     if out[i] is None:
                         report(i, r)
                     else:
                         out[i] = r
                     if r.converged:
                         last_ok = r
+                        fails = 0
+                    else:
+                        fails += 1
 
         # повторная попытка для несошедшихся точек — от соседей с другой стороны
         order = np.argsort(alphas)
