@@ -886,6 +886,18 @@ class App(tk.Tk):
                         "десятки секунд на угол…" if method == "multi_viscous" else "Расчёт…")
 
         control = self._control
+        # всё, что нужно из окна, читается здесь: из потока расчёта переменные Tk
+        # трогать нельзя (ошибка «main thread is not in main loop» или зависание)
+        is_mfile = self.src.get() == "mfile"
+        nm_multi = os.path.basename(self.mfile.get()) if is_mfile else self.hl_desc.get()
+        try:
+            ch_multi = self._cref(None if is_mfile else 1.0)
+            ch_rans = self._cref(1.0 if isinstance(af, list) and not is_mfile else None)
+        except ValueError as e:
+            self._finish()
+            self._input_error(self.InputError(self.cref, "Опорная хорда c", str(e)))
+            return
+        coarse = "auto" if method == "rans" and self.coarse_start.get() else False
 
         def job():
             try:
@@ -894,17 +906,14 @@ class App(tk.Tk):
                     return self.stop_flag.is_set()
                 nw = self._workers
                 if method in ("multi", "multi_viscous"):
-                    nm = self.hl_desc.get() if self.src.get() != "mfile" else os.path.basename(self.mfile.get())
-                    ch = self._cref(1.0 if self.src.get() != "mfile" else None)
+                    nm, ch = nm_multi, ch_multi
                     if method == "multi":
                         ps = [core.run_multi(af, alphas, mach, nm, chord=ch)]
                     else:
                         ps = core.run_multi_viscous_batch(af, alphas, mach, re_, ncrit, xtr, cb, nm,
                                                           chord=ch, workers=nw)
                 elif method == "rans":
-                    nm = None
-                    if isinstance(af, list):
-                        nm = self.hl_desc.get() if self.src.get() != "mfile" else os.path.basename(self.mfile.get())
+                    nm = nm_multi if isinstance(af, list) else None
                     ps = []
                     for r_ in re_:
                         if self.stop_flag.is_set():
@@ -912,10 +921,10 @@ class App(tk.Tk):
                         ctl = self._rans_ctl
                         ctl.stop = False
                         p_ = core.run_rans(af, alphas, mach, r_, cb, rit, nm,
-                                           chord=self._cref(1.0 if isinstance(af, list) and self.src.get() != "mfile" else None),
+                                           chord=ch_rans,
                                            mesh=(mesh0 if r_ == re0 else None), mesh_opts=mopts, conv=conv,
                                            control=ctl, workers=nw, solver_opts=sopts,
-                                           coarse_start=("auto" if self.coarse_start.get() else False))
+                                           coarse_start=coarse)
                         ps.append(p_)
                         if p_.field_ctx and r_ == re0 and mesh0 is None:
                             self.q.put(("mesh", sig, p_.field_ctx["mesh"], r_, p_.field_ctx["chord"]))
