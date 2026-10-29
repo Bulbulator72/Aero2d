@@ -278,7 +278,11 @@ def _run_parallel(kind, make_payload, alphas, re_list, workers, min_len, callbac
     alphas = np.asarray(alphas, float)
     nw = resolve_workers(workers)
     per_re = max(1, nw // len(re_list))
-    chunks = split_alphas(alphas, per_re, min_len)
+    if kind == "multi":
+        # механизация: углы через один, не больше 3 кусков (шаг продолжения ≤ 3Δα)
+        chunks = split_alphas(alphas, min(per_re, 3), min_len, interleave=True)
+    else:
+        chunks = split_alphas(alphas, per_re, min_len)
     tasks = []
     for ir, re in enumerate(re_list):
         for ic, idx in enumerate(chunks):
@@ -295,9 +299,19 @@ def _run_parallel(kind, make_payload, alphas, re_list, workers, min_len, callbac
                                  done["n"] / total))
         return False
 
+    pts = {"n": 0}
+
+    def on_point(key, alpha, ok):
+        pts["n"] += 1
+        if callback:
+            re_txt = f", Re = {re_list[key[0]]:.3g}" if len(re_list) > 1 else ""
+            return bool(callback(f"Готово {pts['n']}/{total} точек: α = {alpha:g}°{re_txt} — "
+                                 f"{'сошлось' if ok else 'не сошлось'}", 0.98 * pts["n"] / total))
+        return False
+
     if callback:
         callback(f"Расчёт на {min(nw, len(tasks))} процессах (ядер для расчёта: {nw})…", 0.0)
-    out = run_tasks(tasks, nw, on_done)
+    out = run_tasks(tasks, nw, on_done, on_point if callback else None)
     if len(out) < len(tasks):
         raise RuntimeError("Расчёт остановлен")
     results = []
