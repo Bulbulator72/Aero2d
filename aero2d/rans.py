@@ -1497,10 +1497,18 @@ def mesh_for(elements, alpha, re, chord=1.0, fine=False, opts=None):
     near = o.near_size or ((0.002 if fine else 0.003) if multi else 0.004)
     kw = dict(yplus=o.yplus, ratio=o.ratio, bl_thickness=(o.bl_thickness or None), far_radius=o.far_radius,
               far_size=o.far_size, slot_size=near * chord, growth=o.growth)
-    if multi and o.wake_refine:
+    if o.wake_refine:
         wk = []
         for a_ in (o.wake_alphas or (0.0,)):
-            wk += wake_lines(els, float(a_), re, chord, length=o.wake_length) or []
+            if multi:
+                wk += wake_lines(els, float(a_), re, chord, length=o.wake_length) or []
+            else:
+                # один профиль: прямая от задней кромки по направлению потока
+                e = els[0]
+                i = int(np.argmax(e.x))
+                t_ = np.linspace(0.0, o.wake_length * chord, 25)
+                a = np.radians(float(a_))
+                wk.append((e.x[i] + t_ * np.cos(a), e.y[i] - t_ * np.sin(a)))
         kw.update(wakes=wk or None, wake_size=(0.006 if fine else o.wake_size))
     return build_mesh(els, chord=chord, re=re, **kw)
 

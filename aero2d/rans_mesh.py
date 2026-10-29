@@ -41,7 +41,7 @@ class MeshOptions:
 
     yplus        — y⁺ первой ячейки у стенки (1 — для модели SA без пристеночных функций);
     ratio        — рост высоты ячеек в слое четырёхугольников;
-    bl_thickness — толщина слоя четырёхугольников, доли хорды (авто: 0,02, но
+    bl_thickness — толщина слоя четырёхугольников, доли хорды (авто: 0,01, но
                    не больше 0,3 наименьшей щели между элементами);
     n_surface    — точек на сторону основного элемента (у остальных — пропорционально
                    хорде; 0 — как в исходном контуре);
@@ -87,7 +87,9 @@ def build_mesh(elements, chord=1.0, re=1e6, yplus=1.0, ratio=1.2, bl_thickness=N
             gaps.append(d)
     min_gap = min(gaps) if gaps else np.inf
     if bl_thickness is None:
-        bl_thickness = min(0.02 * chord, 0.3 * min_gap)
+        # 0,01c: веер у острой задней кромки тем шире, чем толще слой, а последний ряд
+        # слоя тем выше — при 0,02c у кромки перепад объёмов соседних ячеек был ~30
+        bl_thickness = min(0.01 * chord, 0.3 * min_gap)
     # interruptible=False: не ставить обработчик Ctrl+C — иначе gmsh падает,
     # когда сетка строится не в главном потоке (расчёт из окна программы)
     try:
@@ -100,7 +102,7 @@ def build_mesh(elements, chord=1.0, re=1e6, yplus=1.0, ratio=1.2, bl_thickness=N
         gmsh.option.setNumber("Mesh.RandomSeed", 1)
         gmsh.model.add("aero2d")
         geo = gmsh.model.geo
-        loops, wall_curves, fan_pts, body_curves = [], [], [], []
+        loops, wall_curves, fan_pts, body_curves, surf_pts, seg_len = [], [], [], [], [], []
         for e, af in enumerate(elements):
             x, y = np.asarray(af.x, float), np.asarray(af.y, float)
             if np.hypot(x[0] - x[-1], y[0] - y[-1]) < 1e-12:
@@ -109,10 +111,12 @@ def build_mesh(elements, chord=1.0, re=1e6, yplus=1.0, ratio=1.2, bl_thickness=N
             ds = np.hypot(np.diff(np.r_[x, x[0]]), np.diff(np.r_[y, y[0]]))
             lc = surf_ratio * np.maximum(np.r_[ds[-1], ds[:-1]], ds)
             pts = [geo.addPoint(xi, yi, 0, li) for xi, yi, li in zip(x, y, lc)]
+            surf_pts += list(zip(pts, np.maximum(np.r_[ds[-1], ds[:-1]], ds)))
             curves = []
             for k in range(len(pts)):
                 c = geo.addLine(pts[k], pts[(k + 1) % len(pts)])
                 curves.append(c)
+            seg_len += list(ds)
             loops.append(geo.addCurveLoop(curves))
             wall_curves += curves
             body_curves.append(curves)
@@ -127,8 +131,15 @@ def build_mesh(elements, chord=1.0, re=1e6, yplus=1.0, ratio=1.2, bl_thickness=N
         floop = geo.addCurveLoop(far)
         surf = geo.addPlaneSurface([floop] + loops)
         geo.synchronize()
-        for c in wall_curves:
-            gmsh.model.mesh.setTransfiniteCurve(c, 2)
+        smin = 0.004 * chord if slot_size is None else slot_size
+
+        def wall_divisions():
+            """Отрезки контура длиннее размера треугольников у стенки делятся: ширина
+            ячеек слоя вдоль поверхности ≈ размеру треугольников над слоем."""
+            for c, n in zip(wall_curves, seg_n):
+                gmsh.model.mesh.setTransfiniteCurve(c, n)
+        seg_n = [max(2, int(np.ceil(L / smin)) + 1) for L in seg_len]
+        wall_divisions()
         # слой четырёхугольников
         fbl = gmsh.model.mesh.field.add("BoundaryLayer")
         gmsh.model.mesh.field.setNumbers(fbl, "CurvesList", wall_curves)
@@ -138,21 +149,53 @@ def build_mesh(elements, chord=1.0, re=1e6, yplus=1.0, ratio=1.2, bl_thickness=N
         gmsh.model.mesh.field.setNumber(fbl, "Thickness", bl_thickness)
         gmsh.model.mesh.field.setNumber(fbl, "Quads", 1)
         gmsh.model.mesh.field.setAsBoundaryLayer(fbl)
-        # размер треугольников: растёт с расстоянием от стенок и следов
+        # размер треугольников растёт от КРАЯ слоя четырёхугольников (а не от стенки:
+        # иначе на краю слоя треугольник сразу в 2–3 раза больше последнего ряда слоя),
+        # а на самом краю равен шагу слоя: высоте последнего ряда и ширине ячеек вдоль
+        # поверхности (у кромок она мала — крупные треугольники над узкими ячейками
+        # слоя и над веером у задней кромки давали перепад объёмов в десятки раз)
+        h_last, tot, h = h0, 0.0, h0
+        while tot + h < bl_thickness and h < bl_thickness:
+            tot += h
+            h_last, h = h, h * ratio
+        s_far = far_size * chord
+
+        def ramp(dist_field, s0):
+            """Размер s0 на краю слоя, далее s0 + growth·(d − толщина слоя), до s_far."""
+            f = gmsh.model.mesh.field.add("Threshold")
+            gmsh.model.mesh.field.setNumber(f, "InField", dist_field)
+            gmsh.model.mesh.field.setNumber(f, "SizeMin", s0)
+            gmsh.model.mesh.field.setNumber(f, "SizeMax", s_far)
+            gmsh.model.mesh.field.setNumber(f, "DistMin", bl_thickness)
+            gmsh.model.mesh.field.setNumber(f, "DistMax", bl_thickness + (s_far - s0) / max(growth, 1e-3))
+            return f
         fields = []
         fd = gmsh.model.mesh.field.add("Distance")
         gmsh.model.mesh.field.setNumbers(fd, "CurvesList", wall_curves)
         gmsh.model.mesh.field.setNumber(fd, "Sampling", 20)
-        fm = gmsh.model.mesh.field.add("MathEval")
-        smin = 0.004 * chord if slot_size is None else slot_size
-        gmsh.model.mesh.field.setString(fm, "F", f"{smin} + {growth}*F{fd}")
-        fields.append(fm)
+        # размер на краю слоя — ширина ячеек слоя вдоль поверхности, но не меньше высоты
+        # его последнего ряда (подобрано по Volume change, Quality и неортогональности
+        # на одиночном профиле и механизации; см. README)
+        match = lambda w: max(w, 1.2 * h_last)
+        s0 = float(min(smin, match(smin)))
+        fields.append(ramp(fd, s0))
+        # мельче — по точкам контура, сгруппированным по шагу (уровни через ×1,5)
+        s_edge = np.array([match(min(d_, smin)) for _, d_ in surf_pts])
+        lev = np.floor(np.log(np.maximum(s_edge, 1e-12) / s0) / np.log(1.5))
+        for L in np.unique(lev[lev < 0]):
+            sel = [t for (t, _), l_ in zip(surf_pts, lev) if l_ == L]
+            fp = gmsh.model.mesh.field.add("Distance")
+            gmsh.model.mesh.field.setNumbers(fp, "PointsList", sel)
+            fields.append(ramp(fp, s0 * 1.5 ** L))
         if wakes:
             wpts = []
             for wx, wy in wakes:
                 for xx, yy in zip(wx, wy):
                     wpts.append(geo.addPoint(xx, yy, 0, wake_size * chord))
             geo.synchronize()
+            # повторная синхронизация сбрасывает разбиение стенки — задать заново
+            # (иначе каждый отрезок контура делился ещё на несколько)
+            wall_divisions()
             fw = gmsh.model.mesh.field.add("Distance")
             gmsh.model.mesh.field.setNumbers(fw, "PointsList", wpts)
             fwm = gmsh.model.mesh.field.add("MathEval")
