@@ -61,7 +61,9 @@ Esc — остановить. В «Таблице» строки сгруппи�
 `aero2d.exe` + `_internal` (≈ 650 МБ: JAX, SciPy, matplotlib, gmsh). Python на
 компьютере пользователя не нужен. Сборка — на Windows (PyInstaller не собирает
 под другую ОС): в офлайн-комплекте `12_build_EXE.bat`, вручную —
-`python -m PyInstaller --noconfirm packaging/aero2d.spec`.
+`python -m PyInstaller --noconfirm packaging/aero2d.spec`. Один файл `aero2d.exe` — с переменной
+окружения `AERO2D_ONEFILE=1` (в комплекте `13_build_EXE_onefile.bat`); он запускается
+на 10–30 с дольше.
 `aero2d.exe --selftest` — проверка собранной программы без окна (панели, вязкая
 поляра на двух процессах, JAX, сетка gmsh), отчёт — `aero2d_selftest.txt` рядом
 с exe. Режим «одна папка», а не «один файл»: иначе сотни МБ распаковывались бы

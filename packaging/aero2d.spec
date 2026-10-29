@@ -39,6 +39,12 @@ a = Analysis([os.path.join(SPECPATH, "aero2d_app.py")], pathex=[ROOT], binaries=
              hiddenimports=hidden, excludes=["pytest", "IPython", "jupyter", "notebook", "PyQt5", "PySide6"],
              noarchive=False)
 pyz = PYZ(a.pure)
-exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="aero2d", console=False,
-          icon=None, upx=False)
-coll = COLLECT(exe, a.binaries, a.datas, name="aero2d", upx=False)
+if os.environ.get("AERO2D_ONEFILE") == "1":
+    # один файл aero2d.exe: при каждом запуске (и в каждом процессе параллельного
+    # расчёта) распаковывается во временную папку — старт на 10–30 с дольше
+    exe = EXE(pyz, a.scripts, a.binaries, a.datas, [], name="aero2d", console=False, icon=None, upx=False,
+              runtime_tmpdir=None)
+else:
+    exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="aero2d", console=False,
+              icon=None, upx=False)
+    coll = COLLECT(exe, a.binaries, a.datas, name="aero2d", upx=False)
