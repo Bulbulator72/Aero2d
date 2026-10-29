@@ -44,17 +44,20 @@ def frame_fields(mesh, Q, mach, X, Y, tri=None):
                             np.sqrt(u ** 2 + v ** 2) / np.sqrt(GAM * p / rho), Q[:, 4] / rho])
     f = tri(vals, X.ravel(), Y.ravel(), wall={0: 0.0, 1: 0.0, 3: 0.0, 4: 0.0}).reshape(X.shape + (5,))
     U, V = f[..., 0], f[..., 1]
-    dx = X[0, 1] - X[0, 0]
-    dy = Y[1, 0] - Y[0, 0]
-    om = np.gradient(V, dx, axis=1) - np.gradient(U, dy, axis=0)
+    # завихренность — по самой сетке (узловое среднее градиентов), затем интерполяция
+    Nv = tri.W @ vals[:, :2]
+    Nv[tri.wall] = 0.0
+    om = tri.interp_nodes(tri.node_vorticity(Nv[:, 0], Nv[:, 1]), X.ravel(), Y.ravel()).reshape(X.shape)
     return dict(u=U, v=V, cp=f[..., 2], mach=f[..., 3], nut=f[..., 4], speed=np.hypot(U, V), vorticity=om)
 
 
 def make_gif(mesh, elements, run, path, quantity="vorticity", box=(-0.5, 2.5, -0.9, 0.9), n=320,
-             fps=12, dpi=90, vlim=None, streamlines=False, title="", progress=None):
+             fps=12, dpi=90, vlim=None, streamlines=False, title="", progress=None, scale="linear"):
     """GIF по результату RansSolver.solve_unsteady (run). quantity — ключ из
     QUANTITIES.values(). vlim — пределы шкалы (по умолчанию — по всем кадрам,
-    одинаковые для всего ролика). progress(k, n) → True — прервать.
+    одинаковые для всего ролика). scale="log" — логарифмическая шкала для
+    завихренности (симметричная: видны и слой у стенки, и слабый след, и вихри
+    вдали) и ν̃; у остальных величин — линейная. progress(k, n) → True — прервать.
     Возвращает число кадров."""
     import matplotlib
     matplotlib.use("Agg", force=False)
@@ -93,6 +96,15 @@ def make_gif(mesh, elements, run, path, quantity="vorticity", box=(-0.5, 2.5, -0
             vlim = (float(np.percentile(allz, 1.0)), float(np.percentile(allz, 99.5)))
         else:
             vlim = (float(np.percentile(allz, 0.5)), float(np.percentile(allz, 99.5)))
+    norm = None
+    if scale == "log" and quantity in ("vorticity", "nut"):
+        from matplotlib.colors import LogNorm, SymLogNorm
+        allw = np.concatenate([np.ravel(z[np.isfinite(z)]) for _, z, _ in fields])
+        top = float(np.percentile(np.abs(allw), 99.8)) or 1.0
+        if quantity == "vorticity":
+            norm = SymLogNorm(linthresh=top * 3e-3, vmin=-top, vmax=top, base=10)
+        else:
+            norm = LogNorm(vmin=max(top * 1e-4, 1e-3), vmax=top)
     cmap = {"vorticity": "RdBu_r", "cp": "RdBu_r", "speed": "viridis", "mach": "viridis",
             "nut": "magma"}.get(quantity, "viridis")
     label = {v: k for k, v in QUANTITIES.items()}.get(quantity, quantity)
@@ -104,8 +116,9 @@ def make_gif(mesh, elements, run, path, quantity="vorticity", box=(-0.5, 2.5, -0
         FigureCanvasAgg(fig)
         ax = fig.add_axes([0.10, 0.30, 0.77, 0.62])
         cax = fig.add_axes([0.89, 0.30, 0.02, 0.62])
-        im = ax.imshow(z, origin="lower", extent=box, cmap=cmap, vmin=vlim[0], vmax=vlim[1],
-                       interpolation="bilinear", aspect="equal")
+        lim = dict(norm=norm) if norm is not None else dict(vmin=vlim[0], vmax=vlim[1])
+        im = ax.imshow(np.abs(z) if norm is not None and quantity == "nut" else z, origin="lower", extent=box,
+                       cmap=cmap, interpolation="bilinear", aspect="equal", **lim)
         fig.colorbar(im, cax=cax)
         if streamlines:
             try:

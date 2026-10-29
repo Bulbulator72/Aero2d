@@ -1362,6 +1362,15 @@ class App(tk.Tk):
         ttk.Label(fr, text="Область").grid(row=i + 3, column=0, sticky="w")
         ttk.Combobox(fr, textvariable=v_reg, values=list(regs), state="readonly",
                      width=28).grid(row=i + 3, column=1, columnspan=2, sticky="w")
+        scales = {"логарифмическая — видны и слой у стенки, и слабый след, и вихри": "log",
+                  "линейная": "linear"}
+        v_sc = tk.StringVar(value=next(iter(scales)))
+        ttk.Label(fr, text="Шкала цвета").grid(row=i + 4, column=0, sticky="w")
+        cb_sc = ttk.Combobox(fr, textvariable=v_sc, values=list(scales), state="readonly", width=56)
+        cb_sc.grid(row=i + 4, column=1, columnspan=2, sticky="w")
+        Tooltip(cb_sc, "Завихренность у стенки в десятки–сотни раз больше, чем в следе и вихрях: в линейной "
+                       "шкале видна только тонкая полоса у профиля. Логарифмическая — для завихренности и ν̃.")
+        i += 1
         ttk.Checkbutton(fr, text="линии тока на кадрах (медленнее)", variable=v_sl).grid(
             row=i + 4, column=1, columnspan=2, sticky="w")
         ttk.Label(fr, text="Расчёт по времени — та же сетка и модель, что в поляре; на ЦП это минуты–десятки "
@@ -1389,13 +1398,14 @@ class App(tk.Tk):
                 k_from = int(np.where(np.isclose(p.alpha, float(v_from.get())))[0][0])
             w.destroy()
             self._run_animation(p, k, t_end, nsc, nsub, fe, v_start.get(), QUANTITIES[v_q.get()],
-                                regs[v_reg.get()], v_sl.get(), path, k_from)
+                                regs[v_reg.get()], v_sl.get(), path, k_from, scales[v_sc.get()])
         b = ttk.Frame(fr)
         b.grid(row=i + 6, column=0, columnspan=3, sticky="e", pady=(10, 0))
         ttk.Button(b, text="Рассчитать и сохранить GIF", command=go).pack(side="right")
         ttk.Button(b, text="Отмена", command=w.destroy).pack(side="right", padx=6)
 
-    def _run_animation(self, p, k, t_end, nsc, nsub, fe, start, qty, box, streamlines, path, k_from=None):
+    def _run_animation(self, p, k, t_end, nsc, nsub, fe, start, qty, box, streamlines, path, k_from=None,
+                       scale="log"):
         from .rans import RansControl
         self._anim_running = True
         self.stop_flag.clear()
@@ -1421,7 +1431,7 @@ class App(tk.Tk):
                 if run.get("alpha_from") is not None:
                     ttl = f"{nm}, α {run['alpha_from']:g}° → {run['alpha']:g}°"
                 n = make_gif(run["mesh"], run["elements"], run, path, quantity=qty, box=box,
-                             streamlines=streamlines, title=ttl,
+                             streamlines=streamlines, title=ttl, scale=scale,
                              progress=lambda i, n_: self.q.put(("progress", f"Сборка GIF: кадр {i}/{n_}",
                                                                 0.9 + 0.1 * i / max(n_, 1))) and False)
                 self._anim_last = run

@@ -399,6 +399,29 @@ class NodeInterp:
         out[~ok] = np.nan
         return out
 
+    def node_vorticity(self, un, vn):
+        """Завихренность в узлах по узловым скоростям: градиент линейного поля в
+        каждом треугольнике, затем среднее по треугольникам узла с весом площади.
+        Дифференцирование уже интерполированного поля давало постоянное значение
+        в каждом треугольнике — «мозаику» и шум вне слоя."""
+        P = self.nodes[self.tris]
+        x, y = P[..., 0], P[..., 1]
+        a2 = (x[:, 1] - x[:, 0]) * (y[:, 2] - y[:, 0]) - (x[:, 2] - x[:, 0]) * (y[:, 1] - y[:, 0])
+        bx = np.stack([y[:, 1] - y[:, 2], y[:, 2] - y[:, 0], y[:, 0] - y[:, 1]], 1) / a2[:, None]
+        by = np.stack([x[:, 2] - x[:, 1], x[:, 0] - x[:, 2], x[:, 1] - x[:, 0]], 1) / a2[:, None]
+        om = np.sum(bx * vn[self.tris], 1) - np.sum(by * un[self.tris], 1)
+        w = np.abs(a2)
+        num = np.bincount(self.tris.ravel(), np.repeat(om * w, 3), len(self.nodes))
+        den = np.bincount(self.tris.ravel(), np.repeat(w, 3), len(self.nodes))
+        return num / np.maximum(den, 1e-300)
+
+    def interp_nodes(self, nv, x, y):
+        """Линейная интерполяция узловых значений nv в точки (вне сетки — NaN)."""
+        ti, ok, bc = self.locate(x, y)
+        out = np.einsum("pj,pj->p", bc, nv[self.tris[np.where(ok, ti, 0)]])
+        out[~ok] = np.nan
+        return out
+
     def cell_at(self, x, y):
         """Номер ячейки, в которой лежит точка (−1 — вне сетки): для кусочно-постоянных величин."""
         ti, ok, _ = self.locate(x, y)
