@@ -359,6 +359,50 @@ def cell_quality(mesh: Mesh) -> dict:
     return dict(det=det, quality=np.clip(qual, -1.0, 1.0), angle=amin, vol_ratio=vol_ratio, nonortho=nonortho)
 
 
+# нормы (как обычно для ICEM CFD / Fluent): (хорошо, допустимо); «больше — лучше» для
+# det, quality, angle; «меньше — лучше» для vol_ratio, nonortho
+QUALITY_NORMS = {
+    "det": (0.3, 0.1, True),
+    "quality": (0.3, 0.15, True),
+    "angle": (18.0, 10.0, True),
+    "vol_ratio": (5.0, 20.0, False),
+    "nonortho": (60.0, 75.0, False),
+}
+
+
+def quality_summary(mesh: Mesh, cq: dict | None = None, singular=None) -> list:
+    """Сводка качества по показателям: худшее значение и где оно, норма, число ячеек
+    хуже нормы «хорошо», оценка "ok" / "warn" / "bad". singular — точки (x, y),
+    около которых худшая ячейка неизбежна (вершина веера у острой задней кромки)."""
+    cq = cq or cell_quality(mesh)
+    near = np.zeros(mesh.n_cells, bool)
+    for p in (singular if singular is not None else []):
+        near |= np.hypot(mesh.centroid[:, 0] - p[0], mesh.centroid[:, 1] - p[1]) < 2e-3
+
+    def grade(w, good, ok, higher):
+        if (w >= good) if higher else (w <= good):
+            return "ok"
+        return "warn" if ((w >= ok) if higher else (w <= ok)) else "bad"
+    out = []
+    for key, (good, ok, higher) in QUALITY_NORMS.items():
+        v = cq[key]
+        i = int(np.argmin(v) if higher else np.argmax(v))
+        w = float(v[i])
+        n_bad = int((v < good).sum() if higher else (v > good).sum())
+        status = grade(w, good, ok, higher)
+        rest = v[~near] if (~near).any() else v
+        status_rest = grade(float(rest.min() if higher else rest.max()), good, ok, higher)
+        xy = mesh.centroid[i]
+        note = "у вершины острой задней кромки" if near[i] else ""
+        sign = "≥" if higher else "≤"
+        unit = "°" if key in ("angle", "nonortho") else ""
+        out.append(dict(key=key, name=QUALITY_METRICS[key][0], worst=w, xy=(float(xy[0]), float(xy[1])),
+                        norm=f"{sign} {good:g}{unit}", n_bad=n_bad, status=status, status_rest=status_rest,
+                        note=note,
+                        hint=QUALITY_METRICS[key][1]))
+    return out
+
+
 def quality_report(mesh: Mesh, cq: dict | None = None) -> str:
     """Сводка как гистограмма Quality в ICEM: число ячеек по интервалам и худшие значения."""
     cq = cq or cell_quality(mesh)

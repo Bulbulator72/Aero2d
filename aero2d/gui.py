@@ -359,6 +359,10 @@ class App(tk.Tk):
         ttk.Label(tb_, text="  Cl = L′/(q∞·c), Cd = D′/(q∞·c), Cm = M′/(q∞·c²) — на единицу размаха "
                   "(S = c·1), c — опорная хорда (см. «Примечания»).", foreground="#555").pack(side="left")
         ttk.Button(tb_, text="Размерные силы…", command=self.forces_dialog).pack(side="right", padx=4, pady=2)
+        b_ = ttk.Button(tb_, text="Сохранить в CSV (Excel)…", command=self.save_csv)
+        b_.pack(side="right", padx=4, pady=2)
+        Tooltip(b_, "Все расчёты из таблицы: α, Cl, Cd, Cm, переход и т. д.; открывается в Excel. "
+                    "Графики — меню «Файл → Сохранить графики (PNG)»")
         # расчёт — строка-заголовок группы (свернуть/развернуть), под ней его углы атаки
         cols = ("alpha", "cl", "cd", "cdf", "cm", "ch", "xu", "xl", "ok")
         self.table = ttk.Treeview(tf, columns=cols, show="tree headings")
@@ -581,7 +585,8 @@ class App(tk.Tk):
                 self.table.column(c, width=int(w * k))
         # графики: надписи matplotlib крупнее вместе со шрифтом окна (dpi фигуры, размер в пикселях тот же)
         canv = [t.canvas for t in vars(self).values() if isinstance(t, PlotTab)]
-        canv += [c for c in (getattr(self, "mesh_canvas", None), getattr(self, "res_canvas", None)) if c]
+        canv += [c for c in (getattr(self, "mesh_canvas", None), getattr(self, "res_canvas", None),
+                             getattr(self, "mesh_hcanvas", None)) if c]
         for c in canv:
             fig, w = c.figure, c.get_tk_widget()
             fig._original_dpi = 100 * k              # Tk-бэкенд пересчитывает dpi от исходного
@@ -1609,7 +1614,38 @@ class App(tk.Tk):
         self.mesh_qm = tk.StringVar(value="нет (только сетка)")
         cq_ = ttk.Combobox(bar, textvariable=self.mesh_qm, values=list(self._qm_names), state="readonly", width=20)
         cq_.pack(side="left")
-        cq_.bind("<<ComboboxSelected>>", lambda _: self.draw_mesh())
+        cq_.bind("<<ComboboxSelected>>", lambda _: (self._sync_quality_row(), self.draw_mesh()))
+        # --- качество: итог, таблица показателей с нормами и гистограмма выбранного
+        qp = ttk.LabelFrame(right, text="Качество сетки", padding=(6, 2))
+        qp.pack(side="top", fill="x", padx=4, pady=(2, 4))
+        self.mesh_qsum = tk.StringVar(value="Сетка ещё не построена — «Построить и показать сетку» слева "
+                                            "или запустите расчёт RANS.")
+        self.mesh_qsum_lbl = ttk.Label(qp, textvariable=self.mesh_qsum, font="BoldFont")
+        self.mesh_qsum_lbl.grid(row=0, column=0, columnspan=2, sticky="w")
+        self.mesh_qsum2 = tk.StringVar(value="")
+        ttk.Label(qp, textvariable=self.mesh_qsum2, foreground="#555").grid(row=1, column=0, columnspan=2,
+                                                                          sticky="w")
+        cols = ("worst", "norm", "bad", "where")
+        self.mesh_qt = ttk.Treeview(qp, columns=cols, show="tree headings", height=5, selectmode="browse")
+        self.mesh_qt.heading("#0", text="Показатель")
+        self.mesh_qt.column("#0", width=180, stretch=False)
+        for c, t, w in zip(cols, ("Худшее", "Норма", "Хуже нормы", "Где худшая (x; y)"),
+                           (60, 56, 88, 136)):
+            self.mesh_qt.heading(c, text=t)
+            self.mesh_qt.column(c, width=w, anchor="w" if c == "where" else "e", stretch=(c == "where"))
+        for tag, col in (("ok", "#1e7b34"), ("warn", "#9a5b00"), ("bad", "#b03a2e")):
+            self.mesh_qt.tag_configure(tag, foreground=col)
+        self.mesh_qt.grid(row=2, column=0, sticky="nsew", pady=(2, 0))
+        self.mesh_qt.bind("<<TreeviewSelect>>", lambda _: self._on_quality_row())
+        self.mesh_qhint = tk.StringVar(value="Щёлкните строку — сетка раскрасится этим показателем.")
+        ttk.Label(qp, textvariable=self.mesh_qhint, foreground="#555", wraplength=560).grid(
+            row=3, column=0, sticky="w")
+        self.mesh_hfig = Figure(figsize=(2.6, 1.6), dpi=100, layout="constrained")
+        self.mesh_hcanvas = FigureCanvasTkAgg(self.mesh_hfig, master=qp)
+        self.mesh_hcanvas.get_tk_widget().grid(row=2, column=1, rowspan=2, sticky="nsew", padx=(8, 0))
+        qp.columnconfigure(0, weight=1)
+        self._mesh_qrows = {}
+        self._draw_quality_hist(None)
         self.mesh_fig = Figure(figsize=(7, 5), dpi=100, layout="constrained")
         self.mesh_canvas = FigureCanvasTkAgg(self.mesh_fig, master=right)
         NavigationToolbar2Tk(self.mesh_canvas, right).update()
@@ -1670,7 +1706,7 @@ class App(tk.Tk):
         threading.Thread(target=job, daemon=True).start()
 
     def _set_mesh(self, sig, m, re, chord):
-        from .rans_mesh import quality, cell_quality, quality_report
+        from .rans_mesh import quality, cell_quality, quality_summary
         self._mesh = (sig, m)
         q = quality(m)
         self._mesh_cq = cell_quality(m)
@@ -1678,16 +1714,103 @@ class App(tk.Tk):
         h1 = float(np.median(2 * m.wall_dist[wc]))
         cf = 0.026 * re ** (-1 / 7)
         yp = h1 / chord * re * np.sqrt(cf / 2)
+        # задние кромки — самые дальние по x узлы стенки каждого тела (вершины вееров)
+        wf = np.where(m.face_tag == 1)[0]
+        te = []
+        for b in np.unique(m.face_body[wf]):
+            nd = np.unique(m.face_nodes[wf[m.face_body[wf] == b]])
+            te.append(m.nodes[nd[np.argmax(m.nodes[nd, 0])]])
+        rows = quality_summary(m, self._mesh_cq, singular=te)
+        fmt = lambda r: (f"{r['worst']:.0f}" if r["key"] == "vol_ratio" else f"{r['worst']:.1f}°"
+                         if r["key"] in ("angle", "nonortho") else f"{r['worst']:.3f}")
+        mark = {"ok": "✓", "warn": "!", "bad": "✗"}
+        self.mesh_qt.delete(*self.mesh_qt.get_children())
+        self._mesh_qrows = {}
+        for r in rows:
+            where = f"{r['xy'][0]:.3f}; {r['xy'][1]:.3f}" + (" (ЗК)" if r["note"] else "")
+            iid = self.mesh_qt.insert("", "end", text=f"{mark[r['status']]}  {r['name']}", tags=(r["status"],),
+                                      values=(fmt(r), r["norm"], f"{r['n_bad']:,}".replace(",", " "), where))
+            self._mesh_qrows[iid] = r
+        worst = {"ok": 0, "warn": 1, "bad": 2}
+        st = max(worst[r["status_rest"]] for r in rows)
+        only_singular = any(r["status"] != r["status_rest"] for r in rows)
+        verdict = ["сетка годится", "есть замечания", "есть плохие ячейки"][st]
+        self.mesh_qsum.set(f"Итог: {verdict}")
+        self.mesh_qsum2.set(f"Ячеек {q['cells']:,} (четырёхугольников {q['quads']:,}), y⁺ ≈ {yp:.2f}"
+                            .replace(",", " ") + ("; вершины острых кромок (ЗК) в итог не входят"
+                                                  if only_singular else ""))
+        self.mesh_qsum_lbl.configure(foreground=["#1e7b34", "#9a5b00", "#b03a2e"][st])
         self.mesh_info.set(
-            f"Ячеек: {q['cells']:,} (четырёхугольников {q['quads']:,}); граней на стенках {q['wall_faces']}.\n"
-            .replace(",", " ") +
-            f"Высота первой ячейки ≈ {h1:.2e} c, оценка y⁺ ≈ {yp:.2f} (по Cf пластины).\n"
-            f"Наибольшее отношение объёмов соседних ячеек — {q['vol_ratio_max']:.0f}.\n"
-            "Эта сетка будет использована в расчёте RANS.\n\nКачество:\n" + quality_report(m, self._mesh_cq) +
+            f"Граней на стенках: {q['wall_faces']}. Высота первой ячейки ≈ {h1:.2e} c, оценка y⁺ ≈ {yp:.2f} "
+            "(по Cf пластины). Эта сетка будет использована в расчёте RANS." +
             ("\n⚠ y⁺ > 2: для модели SA без пристеночных функций слой у стенки грубоват." if yp > 2 else "") +
             ("\n⚠ Резкий скачок размеров соседних ячеек (> 300): возможен развал счёта — уменьшите "
              "«рост треугольников» или «ячейки у стенок и в щелях»." if q["vol_ratio_max"] > 300 else ""))
+        # сразу показать самый плохой показатель (без особых точек): где проблема — видно без щелчка
+        if st > 0:
+            iid = max(self._mesh_qrows, key=lambda k: worst[self._mesh_qrows[k]["status_rest"]])
+            self.mesh_qm.set(self._mesh_qrows[iid]["name"])
+        self._sync_quality_row()
         self.draw_mesh()
+
+    def _on_quality_row(self):
+        """Строка таблицы качества выбрана: раскраска сетки и гистограмма этого показателя."""
+        sel = self.mesh_qt.selection()
+        if not sel or sel[0] not in self._mesh_qrows:
+            return
+        r = self._mesh_qrows[sel[0]]
+        self.mesh_qhint.set(f"{r['name']}: {r['hint']}." + (" ЗК — вершина острой задней кромки: там худшая "
+                            "ячейка неизбежна (веер слоя сходится в точку)." if r["note"] else ""))
+        if self.mesh_qm.get() != r["name"]:
+            self.mesh_qm.set(r["name"])
+            self.draw_mesh()
+        self._draw_quality_hist(r["key"])
+
+    def _sync_quality_row(self):
+        """Показатель выбран в списке над рисунком — выделить его строку в таблице."""
+        for iid, r in self._mesh_qrows.items():
+            if r["name"] == self.mesh_qm.get():
+                if self.mesh_qt.selection() != (iid,):
+                    self.mesh_qt.selection_set(iid)
+                self._draw_quality_hist(r["key"])
+                return
+        self.mesh_qt.selection_remove(*self.mesh_qt.selection())
+        self._draw_quality_hist(None)
+
+    def _draw_quality_hist(self, key):
+        """Гистограмма показателя (как в ICEM): число ячеек по интервалам, граница нормы."""
+        from .rans_mesh import QUALITY_NORMS, QUALITY_METRICS
+        fig = self.mesh_hfig
+        fig.clear()
+        cq = getattr(self, "_mesh_cq", None)
+        ax = fig.add_subplot(111)
+        if key is None or cq is None:
+            ax.set_axis_off()
+            ax.text(0.5, 0.5, "выберите показатель\nв таблице", ha="center", va="center", color="#666",
+                    transform=ax.transAxes)
+            self.mesh_hcanvas.draw_idle()
+            return
+        v = cq[key]
+        good, ok, higher = QUALITY_NORMS[key]
+        if key in ("det", "quality"):
+            bins = np.linspace(0.0, 1.0, 11)
+        elif key == "vol_ratio":
+            bins = np.geomspace(1.0, max(10.0, float(v.max()) * 1.01), 12)
+            ax.set_xscale("log")
+        else:
+            bins = np.linspace(0.0, 90.0, 10)
+        h, e = np.histogram(np.clip(v, bins[0], bins[-1]), bins=bins)
+        c = e[:-1] if key != "vol_ratio" else np.sqrt(e[:-1] * e[1:])
+        good_bin = (c >= good) if higher else (c <= good)
+        nz = h > 0
+        ax.bar(e[:-1][nz], h[nz], width=np.diff(e)[nz], align="edge", log=True,
+               color=np.where(good_bin[nz], "#7fb88a", "#e0907f"), edgecolor="white", linewidth=0.5)
+        ax.set_xlim(e[0], e[-1])
+        ax.axvline(good, color="#333", lw=1, ls="--")
+        ax.set_title(QUALITY_METRICS[key][0], fontsize=8)
+        ax.tick_params(labelsize=7)
+        ax.set_ylabel("ячеек", fontsize=7)
+        self.mesh_hcanvas.draw_idle()
 
     def draw_mesh(self):
         if not self._mesh:
