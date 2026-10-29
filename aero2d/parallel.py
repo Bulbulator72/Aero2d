@@ -49,16 +49,11 @@ def resolve_workers(value) -> int:
     return int(min(max(1, n), cpu_count()))
 
 
-def split_alphas(alphas, n_chunks: int, min_len: int, interleave: bool = False):
-    """Индексы кусков отсортированных α (не короче min_len): непрерывных или, при
-    interleave, через один (каждый кусок — весь диапазон с шагом k·Δα; у каждого
-    есть точка у α = 0 — у механизации холодный старт при большом угле может
-    искаться десятки минут или не найтись)."""
+def split_alphas(alphas, n_chunks: int, min_len: int):
+    """Индексы непрерывных кусков отсортированных α (не короче min_len)."""
     order = np.argsort(alphas)
     n = len(order)
     k = int(max(1, min(n_chunks, n // max(1, min_len))))
-    if interleave:
-        return [order[j::k] for j in range(k) if len(order[j::k])]
     return [c for c in np.array_split(order, k) if len(c)]
 
 

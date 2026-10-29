@@ -278,19 +278,34 @@ def _run_parallel(kind, make_payload, alphas, re_list, workers, min_len, callbac
     alphas = np.asarray(alphas, float)
     nw = resolve_workers(workers)
     per_re = max(1, nw // len(re_list))
+    chunks = split_alphas(alphas, per_re, min_len)
+    # механизация: каждый кусок считается вместе с «разгоном» — углами от ближайшего
+    # к нулю до начала куска (их результаты отбрасываются). Холодный старт при
+    # большом угле с выпущенным закрылком может идти десятки минут или не найтись,
+    # а так у каждой точки тот же путь продолжения, что и в одном процессе, —
+    # результат не зависит от числа ядер
+    lead = [np.array([], int)] * len(chunks)
     if kind == "multi":
-        # механизация: углы через один, не больше 3 кусков (шаг продолжения ≤ 3Δα)
-        chunks = split_alphas(alphas, min(per_re, 3), min_len, interleave=True)
-    else:
-        chunks = split_alphas(alphas, per_re, min_len)
+        order = list(np.argsort(alphas, kind="stable"))
+        p0 = int(np.argmin(np.abs(alphas[order])))
+        lead = []
+        for idx in chunks:
+            pos = sorted(order.index(i) for i in idx)
+            if pos[-1] < p0:
+                lead.append(np.array(order[pos[-1] + 1:p0 + 1], int))
+            elif pos[0] > p0:
+                lead.append(np.array(order[p0:pos[0]], int))
+            else:
+                lead.append(np.array([], int))
     tasks = []
     for ir, re in enumerate(re_list):
         for ic, idx in enumerate(chunks):
-            tasks.append((kind, make_payload(re, alphas[idx]), (ir, ic)))
+            tasks.append((kind, make_payload(re, alphas[np.concatenate([idx, lead[ic]]).astype(int)]), (ir, ic)))
     total = len(alphas) * len(re_list)
     done = {"n": 0}
 
     def on_done(key, res):
+        res = res[:len(chunks[key[1]])]
         done["n"] += len(res)
         nconv = sum(bool(r.converged) for r in res)
         if callback:
@@ -302,6 +317,8 @@ def _run_parallel(kind, make_payload, alphas, re_list, workers, min_len, callbac
     pts = {"n": 0}
 
     def on_point(key, alpha, ok):
+        if not np.isclose(alphas[chunks[key[1]]], alpha).any():
+            return False                                 # точка «разгона» — не считается
         pts["n"] += 1
         if callback:
             re_txt = f", Re = {re_list[key[0]]:.3g}" if len(re_list) > 1 else ""
