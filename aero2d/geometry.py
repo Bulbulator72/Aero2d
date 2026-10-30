@@ -315,10 +315,16 @@ def repanel(af: Airfoil, n_side: int = 100, spacing: str = "cosine", keep_frame:
     x, y = x[keep], y[keep]
     s = np.concatenate([[0.0], np.cumsum(np.hypot(np.diff(x), np.diff(y)))])
     cuts = _corners(x, y, corner_angle) if corner_angle else np.array([], int)
-    # углы торца тупой задней кромки (у самых концов контура) не сохраняются: торец
-    # стал бы отдельными крошечными панелями рядом с длинными, и пограничный слой
-    # стартовал бы с него; сплайн через торец — как раньше (и как в XFOIL)
-    cuts = cuts[(s[cuts] > 0.02 * s[-1]) & (s[cuts] < 0.98 * s[-1])]
+    # углы торца тупой задней кромки (в 0,5 % хорды от концевых точек контура) не
+    # сохраняются: торец стал бы отдельными крошечными панелями рядом с длинными, и
+    # пограничный слой стартовал бы с него; сплайн через торец — как в XFOIL. Изломы
+    # дальше (кромка над нишей, углы ниши) сохраняются — иначе сплайн даёт через них петлю
+    near_end = 0.005 * max(float(np.ptp(x)), 1e-12)
+    d0 = np.hypot(x[cuts] - x[0], y[cuts] - y[0])
+    d1 = np.hypot(x[cuts] - x[-1], y[cuts] - y[-1])
+    a0, a1 = (d0 <= near_end) & (s[cuts] < 0.5 * s[-1]), (d1 <= near_end) & (s[cuts] > 0.5 * s[-1])
+    if a0.any() and a1.any():                   # торец: угол у начала И угол у конца контура
+        cuts = cuts[~(a0 | a1)]
     sp = _PiecewiseSpline(s, x, y, cuts)
     # передняя кромка — минимум x на сплайне
     sf = np.linspace(0, s[-1], 20001)
