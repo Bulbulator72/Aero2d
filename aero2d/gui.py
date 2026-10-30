@@ -1573,7 +1573,7 @@ class App(tk.Tk):
         self.t_mesh_frame = fr
         side = ttk.Frame(fr, padding=6)
         side.pack(side="left", fill="y")
-        ttk.Label(side, text="Сетка для RANS (gmsh)", font="BoldFont").grid(row=0, column=0, columnspan=2,
+        ttk.Label(side, text="Сетка для RANS", font="BoldFont").grid(row=0, column=0, columnspan=2,
                                                                                  sticky="w")
         self.mesh_vars = {}
         for r, (key, lbl, val, tip) in enumerate(self.MESH_FIELDS, start=1):
@@ -1720,7 +1720,10 @@ class App(tk.Tk):
         for b in np.unique(m.face_body[wf]):
             nd = np.unique(m.face_nodes[wf[m.face_body[wf] == b]])
             te.append(m.nodes[nd[np.argmax(m.nodes[nd, 0])]])
-        rows = quality_summary(m, self._mesh_cq, singular=te)
+        # особые точки (вершины вееров у острых кромок) — только у запасной сетки gmsh с веером;
+        # у С-блока слой продолжается по разрезу за кромкой, особых точек нет
+        fan = not str(getattr(m, "generator", "")).startswith("С-блок")
+        rows = quality_summary(m, self._mesh_cq, singular=te if fan else [])
         fmt = lambda r: (f"{r['worst']:.0f}" if r["key"] == "vol_ratio" else f"{r['worst']:.1f}°"
                          if r["key"] in ("angle", "nonortho") else f"{r['worst']:.3f}")
         mark = {"ok": "✓", "warn": "!", "bad": "✗"}
@@ -1741,6 +1744,7 @@ class App(tk.Tk):
                                                   if only_singular else ""))
         self.mesh_qsum_lbl.configure(foreground=["#1e7b34", "#9a5b00", "#b03a2e"][st])
         self.mesh_info.set(
+            f"Построение: {getattr(m, 'generator', 'gmsh')}.\n"
             f"Граней на стенках: {q['wall_faces']}. Высота первой ячейки ≈ {h1:.2e} c, оценка y⁺ ≈ {yp:.2f} "
             "(по Cf пластины). Эта сетка будет использована в расчёте RANS." +
             ("\n⚠ y⁺ > 2: для модели SA без пристеночных функций слой у стенки грубоват." if yp > 2 else "") +
@@ -1837,7 +1841,9 @@ class App(tk.Tk):
                     norm, cmap, cv = mpl_colors.LogNorm(1.0, max(10.0, float(v.max()))), "RdYlGn_r", v
                 else:
                     norm, cmap, cv = mpl_colors.Normalize(0.0, 90.0), "RdYlGn_r", v
-                pc = PolyCollection(polys, array=cv, cmap=cmap, norm=norm, edgecolor="#333", lw=0.1)
+                # рёбра — тёмные и толще в увеличенной области: переходы видны и под заливкой
+                pc = PolyCollection(polys, array=cv, cmap=cmap, norm=norm, edgecolor="#1a1a1a",
+                                    lw=(0.15 if box is None else 0.45))
                 ax.add_collection(pc)
                 if box is None:
                     fig.colorbar(pc, ax=ax, shrink=0.8, label=QUALITY_METRICS[key][0])
@@ -1847,7 +1853,8 @@ class App(tk.Tk):
                 if box is not None:
                     ax.legend(fontsize=7, loc="upper right")
             else:
-                ax.add_collection(PolyCollection(polys, facecolor="none", edgecolor="#333", lw=0.15))
+                ax.add_collection(PolyCollection(polys, facecolor="none", edgecolor="#333",
+                                                 lw=(0.15 if box is None else 0.4)))
             wf = m.face_tag == 1
             seg = m.nodes[m.face_nodes[wf]]
             for s_ in seg:

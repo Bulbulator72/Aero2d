@@ -70,7 +70,7 @@ class MeshOptions:
 
 def build_mesh(elements, chord=1.0, re=1e6, yplus=1.0, ratio=1.2, bl_thickness=None,
                far_radius=50.0, far_size=8.0, surf_ratio=1.0, wakes=None, wake_size=0.01,
-               slot_size=None, verbose=False, growth=0.25):
+               slot_size=None, verbose=False, growth=0.25, cblock=True):
     """elements — список Airfoil (обход: ЗК → верх → носок → низ → ЗК), в общей
     системе координат; Re — по хорде chord. Первый шаг у стенки — по оценке
     y⁺ = yplus для турбулентной пластины (Cf ≈ 0,026 Re^(−1/7)).
@@ -90,6 +90,18 @@ def build_mesh(elements, chord=1.0, re=1e6, yplus=1.0, ratio=1.2, bl_thickness=N
         # 0,01c: веер у острой задней кромки тем шире, чем толще слой, а последний ряд
         # слоя тем выше — при 0,02c у кромки перепад объёмов соседних ячеек был ~30
         bl_thickness = min(0.01 * chord, 0.3 * min_gap)
+    fallback = ""
+    if cblock:
+        # основной вариант — С-блоки (без веера в острой кромке, см. cblock.py)
+        from .cblock import build_cblock_mesh
+        try:
+            m = build_cblock_mesh(elements, chord, h0, ratio, bl_thickness, far_radius, far_size, wakes,
+                                  wake_size, 0.004 * chord if slot_size is None else slot_size, growth,
+                                  verbose=verbose)
+            m.generator = "С-блок у каждого элемента + треугольники"
+            return m
+        except Exception as e:                         # noqa: BLE001 — запасной вариант ниже
+            fallback = str(e) or type(e).__name__
     # interruptible=False: не ставить обработчик Ctrl+C — иначе gmsh падает,
     # когда сетка строится не в главном потоке (расчёт из окна программы)
     try:
@@ -234,7 +246,9 @@ def build_mesh(elements, chord=1.0, re=1e6, yplus=1.0, ratio=1.2, bl_thickness=N
                 far_edges.add(tuple(sorted(idx[ed.astype(int)])))
     finally:
         gmsh.finalize()
-    return _connectivity(nodes, cells, wall_edges, far_edges, elements)
+    m = _connectivity(nodes, cells, wall_edges, far_edges, elements)
+    m.generator = "слой gmsh с веером у кромки" + (f" (С-блок не построился: {fallback})" if fallback else "")
+    return m
 
 
 def _connectivity(nodes, cells, wall_edges, far_edges, elements):
