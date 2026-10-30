@@ -67,11 +67,15 @@ def dimensional_forces(p: "Polar", rho: float, v: float, c_m: float, b_m: float 
     return out
 
 
-def make_airfoil(source: str, value: str, n_side: int = 100, smooth: bool = False) -> Airfoil:
+def make_airfoil(source: str, value: str, n_side: int = 100, smooth: bool = False,
+                 keep_te: bool = False) -> Airfoil:
     """source = 'naca' (value — 4 цифры) или 'file' (value — путь). smooth —
-    сгладить контур (для измеренных координат)."""
+    сгладить контур (для измеренных координат). keep_te — не замыкать тупую заднюю
+    кромку (торец сохраняется: для сетки RANS; панельный и вязкий методы считают с
+    замкнутой кромкой, как XFOIL)."""
     if source == "lib":
-        return close_trailing_edge(load_airfoil(value, n_side))
+        af = load_airfoil(value, n_side, te_merge=1e-5 if keep_te else 2e-3)
+        return af if keep_te else close_trailing_edge(af)
     if source == "naca" and "-" in value:
         from .geometry import naca_sym
         try:
@@ -86,8 +90,8 @@ def make_airfoil(source: str, value: str, n_side: int = 100, smooth: bool = Fals
         if int(code[2:]) == 0:
             raise ValueError("Толщина профиля не может быть нулевой")
         return naca4(code, n_side)
-    af = load_airfoil(value, n_side, smooth=smooth)
-    return close_trailing_edge(af)
+    af = load_airfoil(value, n_side, smooth=smooth, te_merge=1e-5 if keep_te else 2e-3)
+    return af if keep_te else close_trailing_edge(af)
 
 
 def library():

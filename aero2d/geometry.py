@@ -302,7 +302,7 @@ class _PiecewiseSpline:
 
 
 def repanel(af: Airfoil, n_side: int = 100, spacing: str = "cosine", keep_frame: bool = False,
-            corner_angle: float = 30.0) -> Airfoil:
+            corner_angle: float = 30.0, te_merge: float = 2e-3) -> Airfoil:
     """Перераспределяет точки контура: сплайн по длине дуги, n_side точек на
     сторону. spacing="cosine" — сгущение к обеим кромкам; "viscous" — сильное
     сгущение к передней кромке и умеренное к задней (панели у задней кромки
@@ -364,7 +364,7 @@ def repanel(af: Airfoil, n_side: int = 100, spacing: str = "cosine", keep_frame:
     else:
         out = normalize(out)
     gap = np.hypot(out.x[0] - out.x[-1], out.y[0] - out.y[-1])
-    if gap <= 2e-3 * max(float(np.ptp(out.x)), 1e-12):
+    if gap <= te_merge * max(float(np.ptp(out.x)), 1e-12):
         # почти замкнутый контур — концы сводятся в одну точку
         out.x[0] = out.x[-1] = 0.5 * (out.x[0] + out.x[-1])
         out.y[0] = out.y[-1] = 0.5 * (out.y[0] + out.y[-1])
@@ -405,7 +405,7 @@ def smooth_airfoil(af: Airfoil, strength: float = 1.0) -> Airfoil:
     return Airfoil(xx, yy, af.name)
 
 
-def load_airfoil(path: str, n_side: int = 100, smooth: bool = False) -> Airfoil:
+def load_airfoil(path: str, n_side: int = 100, smooth: bool = False, te_merge: float = 2e-3) -> Airfoil:
     """Чтение файла координат (Selig или Lednicer, с заголовком или без),
     нормировка и перепанелизация."""
     rows, name = [], None
@@ -429,4 +429,4 @@ def load_airfoil(path: str, n_side: int = 100, smooth: bool = False) -> Airfoil:
         raise ValueError("В файле слишком мало точек контура")
     af = Airfoil(pts[:, 0], pts[:, 1], name or "airfoil")
     af = smooth_airfoil(af) if smooth else normalize(af)
-    return repanel(af, n_side)
+    return repanel(af, n_side, te_merge=te_merge)

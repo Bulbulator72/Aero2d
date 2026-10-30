@@ -673,6 +673,10 @@ class App(tk.Tk):
         for fr_ in (getattr(self, "t_mesh_frame", None), getattr(self, "t_res_frame", None)):
             if fr_ is not None:
                 self.nb.tab(fr_, state=("normal" if m == "rans" else "hidden"))
+        # у RANS тупая задняя кромка не замыкается — контур на «Профиле» другой
+        if getattr(self, "_last_method", None) not in (None, m) and "rans" in (m, self._last_method):
+            self.preview_airfoil()
+        self._last_method = m
 
     def _cref(self, default):
         """Опорная хорда из поля окна («авто» — default)."""
@@ -697,7 +701,8 @@ class App(tk.Tk):
             from .geometry import repanel
             els = load_multi(self.mfile.get())
             # не меньше точек, чем в файле (мелкие детали — ниша, кромки — не теряются)
-            return [repanel(e, max(80, len(e.x) // 2 + 1), keep_frame=True) for e in els]
+            te = 1e-5 if self.method.get() == "rans" else 2e-3        # RANS: торцы кромок сохраняются
+            return [repanel(e, max(80, len(e.x) // 2 + 1), keep_frame=True, te_merge=te) for e in els]
         af = self.get_airfoil()
         self._control = None
         fl = self.hl_cfg["flap"]
@@ -715,12 +720,14 @@ class App(tk.Tk):
         return af
 
     def get_airfoil(self):
+        # RANS: тупая задняя кромка сохраняется как есть (торец — стенка сетки)
+        keep = self.method.get() == "rans"
         if self.src.get() == "lib":
-            return core.make_airfoil("lib", self._lib[self.lib_name.get()])
+            return core.make_airfoil("lib", self._lib[self.lib_name.get()], keep_te=keep)
         if self.src.get() == "file":
             if not self.file.get():
                 raise ValueError("Выберите файл координат")
-            return core.make_airfoil("file", self.file.get(), smooth=self.smooth.get())
+            return core.make_airfoil("file", self.file.get(), smooth=self.smooth.get(), keep_te=keep)
         return core.make_airfoil("naca", self.naca.get())
 
     def preview_airfoil(self):
