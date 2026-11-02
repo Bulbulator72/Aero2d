@@ -1500,16 +1500,28 @@ def mesh_for(elements, alpha, re, chord=1.0, fine=False, opts=None):
     if o.wake_refine:
         wk = []
         for a_ in (o.wake_alphas or (0.0,)):
+            a = np.radians(float(a_))
             if multi:
+                # линии тока невязкого решения (след переднего элемента огибает закрылок)
                 wk += wake_lines(els, float(a_), re, chord, length=o.wake_length) or []
-            else:
-                # один профиль: прямая от задней кромки по направлению потока
-                e = els[0]
-                i = int(np.argmax(e.x))
-                t_ = np.linspace(0.0, o.wake_length * chord, 25)
-                a = np.radians(float(a_))
-                wk.append((e.x[i] + t_ * np.cos(a), e.y[i] + t_ * np.sin(a)))   # поток (cos α, sin α)
-        kw.update(wakes=wk or None, wake_size=(0.006 if fine else o.wake_size))
+            # от задней кромки самого заднего элемента — прямая по потоку (cos α, sin α):
+            # сектор сгущения есть и там, где невязкая линия оборвалась (у передних элементов
+            # следы огибают задние — их дают линии тока)
+            t_ = np.linspace(0.0, o.wake_length * chord, 2)
+            e = max(els, key=lambda e_: float(np.max(e_.x)))
+            i = int(np.argmax(e.x))
+            wk.append((e.x[i] + t_ * np.cos(a), e.y[i] + t_ * np.sin(a)))
+        # поле размера считает расстояние до ТОЧЕК линий: точки — не реже 0,02c, иначе
+        # между редкими точками (у линий тока шаг растёт вниз по потоку) сгущения нет
+        step = 0.02 * chord
+        dense = []
+        for wx, wy in wk:
+            wx, wy = np.asarray(wx, float), np.asarray(wy, float)
+            sl = np.r_[0.0, np.cumsum(np.hypot(np.diff(wx), np.diff(wy)))]
+            m_ = max(2, int(np.ceil(sl[-1] / step)) + 1)
+            tt = np.linspace(0.0, sl[-1], m_)
+            dense.append((np.interp(tt, sl, wx), np.interp(tt, sl, wy)))
+        kw.update(wakes=dense or None, wake_size=(0.006 if fine else o.wake_size))
     return build_mesh(els, chord=chord, re=re, **kw)
 
 
