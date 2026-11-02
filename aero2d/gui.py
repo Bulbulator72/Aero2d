@@ -79,7 +79,8 @@ class App(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title("aero2d — аэродинамика профилей")
+        from . import __version__
+        self.title(f"aero2d — аэродинамика профилей · версия {__version__}")
         self.geometry("1280x880")
         self.minsize(1000, 650)
         self._init_fonts()

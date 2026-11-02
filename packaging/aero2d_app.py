@@ -22,7 +22,9 @@ def selftest(path):
             fh.write("\n".join(lines) + "\n")
 
     ok = True
-    log(f"aero2d selftest, Python {sys.version.split()[0]}, {sys.platform}, frozen={getattr(sys, 'frozen', False)}")
+    import aero2d
+    log(f"aero2d {aero2d.__version__} selftest, Python {sys.version.split()[0]}, {sys.platform}, "
+        f"frozen={getattr(sys, 'frozen', False)}")
     steps = []
 
     def step(name):
