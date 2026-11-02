@@ -62,8 +62,11 @@ class MeshOptions:
     growth: float = 0.25
     wake_refine: bool = True
     wake_size: float = 0.008
-    wake_length: float = 0.6
-    wake_alphas: tuple = (0.0, 6.0, 12.0)
+    wake_length: float = 1.2
+    # широкий след: линии при α от −4° до 20° через 2° сливаются в сплошной сектор
+    # сгущения — след любого угла поляры идёт по мелкой сетке (раньше 0°, 6°, 12° и 0,6c:
+    # при α > 5° след уходил на крупные треугольники, сходимость застревала)
+    wake_alphas: tuple = tuple(float(a) for a in range(-4, 21, 2))
     far_radius: float = 50.0
     far_size: float = 8.0
 

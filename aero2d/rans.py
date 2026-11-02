@@ -1508,7 +1508,7 @@ def mesh_for(elements, alpha, re, chord=1.0, fine=False, opts=None):
                 i = int(np.argmax(e.x))
                 t_ = np.linspace(0.0, o.wake_length * chord, 25)
                 a = np.radians(float(a_))
-                wk.append((e.x[i] + t_ * np.cos(a), e.y[i] - t_ * np.sin(a)))
+                wk.append((e.x[i] + t_ * np.cos(a), e.y[i] + t_ * np.sin(a)))   # поток (cos α, sin α)
         kw.update(wakes=wk or None, wake_size=(0.006 if fine else o.wake_size))
     return build_mesh(els, chord=chord, re=re, **kw)
 
