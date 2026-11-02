@@ -207,6 +207,7 @@ def _c_block(x, y, h0, ratio, t, smin, wake_len, obstacles=(), clearance=0.0, wa
     wall (рёбра стенки, пары узлов), outline (замкнутый контур блока, индексы узлов),
     out_size (размер треугольников у каждой точки outline)."""
     x, y = np.asarray(x, float), np.asarray(y, float)
+    x_in, y_in = x.copy(), y.copy()
     if np.hypot(x[0] - x[-1], y[0] - y[-1]) < 1e-12:
         x, y = x[:-1], y[:-1]
     area = 0.5 * np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y)
@@ -216,7 +217,7 @@ def _c_block(x, y, h0, ratio, t, smin, wake_len, obstacles=(), clearance=0.0, wa
     # тупая задняя кромка — полоса за торцом; торец тоньше 0,02 % хорды (численный след
     # построения контура) — как острая кромка
     if Pb is not None and np.hypot(*(Pb[0] - Pb[-1])) > 2e-4 * float(np.ptp(x)):
-        return _c_block_blunt(Pb, h0, ratio, t, smin, wake_len, obstacles, wake_growth, smooth)
+        return _c_block_blunt(Pb, h0, ratio, t, smin, wake_len, obstacles, wake_growth, smooth, te_min)
     # --- толщина слоя t (по самой узкой щели), число слоёв n у всех столбцов одно
     n = int(np.ceil(np.log(1 + t * (ratio - 1) / h0) / np.log(ratio)))
     t_min = 1.5 * h0 * n
@@ -244,6 +245,8 @@ def _c_block(x, y, h0, ratio, t, smin, wake_len, obstacles=(), clearance=0.0, wa
         # не крупнее её (иначе к широким верхним ячейкам примыкают мелкие треугольники)
         mid = 0.5 * (P0 + np.roll(P0, -1, axis=0))
         cap = np.minimum(cap, np.maximum(0.4 * _seg_dist(mid, obst), 0.1 * smin))
+    if te_min:                                   # шаг у кромки задан (короткий разрез в щели)
+        cap[0], cap[-1] = min(cap[0], te_min), min(cap[-1], te_min)
     sx, sy = _subdivide(x, y, cap)
     S = np.column_stack([sx, sy])
     M = len(S)
@@ -280,8 +283,15 @@ def _c_block(x, y, h0, ratio, t, smin, wake_len, obstacles=(), clearance=0.0, wa
     # почти квадратные — к торцу блока примыкают треугольники того же размера); соседние
     # шаги различаются не больше чем в wake_growth раз, длина разреза — под это
     h_end = T_te / n
-    L = min(L, max(wake_len, (w0 - h_end) / (1 - 1 / wake_growth) + 4 * h_end))
-    if L < 3 * max(w0, h_end):
+    need = (w0 - h_end) / (1 - 1 / wake_growth) + 4 * h_end
+    if L < need and te_min is None:
+        # разрез укорочен соседним телом: шаг у кромки мельче — чтобы вдоль разреза шаг сходился
+        # к конечному плавно, а не «сжимался» (скачок ширины столбцов у самой кромки)
+        w_fit = h_end + max(L - 4 * h_end, 0.0) * (1 - 1 / wake_growth)
+        return _c_block(x_in, y_in, h0, ratio, t, smin, wake_len, obstacles, clearance, wake_growth, smooth,
+                        te_min=max(w_fit, h_end))
+    L = min(L, max(wake_len, need))
+    if L < 3 * max(min(w0, L / 3), h_end):
         raise BlockError("нет места для разреза за кромкой")
     d, s_ = [], w0
     while not d or d[-1] < L:
@@ -390,7 +400,7 @@ def _layers_z(h1, T, n):
                     h1[:, None] * (qm[:, None] ** j[None] - 1) / np.where(np.abs(q - 1) < 1e-12, 1, q - 1)[:, None])
 
 
-def _c_block_blunt(Pb, h0, ratio, t, smin, wake_len, obstacles=(), wake_growth=1.15, smooth=10):
+def _c_block_blunt(Pb, h0, ratio, t, smin, wake_len, obstacles=(), wake_growth=1.15, smooth=10, te_min=None):
     """С-блок для тупой задней кромки: разрезы от верхнего и нижнего углов торца по
     потоку, С-блок «верхний разрез → контур → нижний разрез» и структурированная полоса
     между разрезами за торцом (торец — стенка). Ряды полосы сгущаются к разрезам так же,
@@ -404,12 +414,15 @@ def _c_block_blunt(Pb, h0, ratio, t, smin, wake_len, obstacles=(), wake_growth=1
         T = np.atleast_1d(T)
         return h0 * np.array([_ratio_for(h0, Ti, n) for Ti in T]) ** (n - 1)
     ht = float(h_top(t)[0])
-    P = _coarsen_start(Pb, 1.2 * ht)
-    P = _coarsen_start(P[::-1], 1.2 * ht)[::-1]
+    h_te = te_min if te_min else 1.2 * ht
+    P = _coarsen_start(Pb, h_te)
+    P = _coarsen_start(P[::-1], h_te)[::-1]
     cap = np.full(len(P) - 1, float(np.clip(4.0 * ht, 0.4 * smin, smin)))
     if obst is not None:
         mid = 0.5 * (P[1:] + P[:-1])
         cap = np.minimum(cap, np.maximum(0.4 * _seg_dist(mid, obst), 0.1 * smin))
+    if te_min:
+        cap[0], cap[-1] = min(cap[0], te_min), min(cap[-1], te_min)
     sx, sy = _subdivide(P[:, 0], P[:, 1], cap, closed=False)
     S = np.column_stack([sx, sy])
     M = len(S)
@@ -446,8 +459,13 @@ def _c_block_blunt(Pb, h0, ratio, t, smin, wake_len, obstacles=(), wake_growth=1
         bad = np.where(cl < 1.6 * T_te)[0]
         if len(bad):
             L = dd[bad[0]] * 0.8
-    L = min(L, max(wake_len, (w0 - h_cut) / (1 - 1 / wake_growth) + 4 * h_cut))
-    if L < 3 * max(w0, h_cut):
+    need = (w0 - h_cut) / (1 - 1 / wake_growth) + 4 * h_cut
+    if L < need and te_min is None:            # короткий разрез в щели — мельче шаг у торца
+        w_fit = h_cut + max(L - 4 * h_cut, 0.0) * (1 - 1 / wake_growth)
+        return _c_block_blunt(Pb, h0, ratio, t, smin, wake_len, obstacles, wake_growth, smooth,
+                              te_min=max(w_fit, h_cut))
+    L = min(L, max(wake_len, need))
+    if L < 3 * max(min(w0, L / 3), h_cut):
         raise BlockError("нет места для разреза за торцом")
     d, s_ = [], w0
     while not d or d[-1] < L:
