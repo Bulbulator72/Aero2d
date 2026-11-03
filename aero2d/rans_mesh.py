@@ -73,11 +73,12 @@ class MeshOptions:
 
 def build_mesh(elements, chord=1.0, re=1e6, yplus=1.0, ratio=1.2, bl_thickness=None,
                far_radius=50.0, far_size=8.0, surf_ratio=1.0, wakes=None, wake_size=0.01,
-               slot_size=None, verbose=False, growth=0.25, cblock=True):
+               slot_size=None, verbose=False, growth=0.25, cblock=True, wake_block=1.0):
     """elements — список Airfoil (обход: ЗК → верх → носок → низ → ЗК), в общей
     системе координат; Re — по хорде chord. Первый шаг у стенки — по оценке
     y⁺ = yplus для турбулентной пластины (Cf ≈ 0,026 Re^(−1/7)).
-    wakes — список ломаных (x, y) линий следа для сгущения."""
+    wakes — список ломаных (x, y) линий следа для сгущения; wake_block — длина блока
+    четырёхугольников вдоль следа, хорд (0 — без него: короткий разрез у кромки)."""
     import gmsh
     cf = 0.026 * re ** (-1 / 7)
     h0 = yplus * chord / (re * np.sqrt(cf / 2))
@@ -100,7 +101,7 @@ def build_mesh(elements, chord=1.0, re=1e6, yplus=1.0, ratio=1.2, bl_thickness=N
         try:
             m = build_cblock_mesh(elements, chord, h0, ratio, bl_thickness, far_radius, far_size, wakes,
                                   wake_size, 0.004 * chord if slot_size is None else slot_size, growth,
-                                  verbose=verbose)
+                                  wake_len=wake_block, verbose=verbose)
             m.generator = "С-блок у каждого элемента + треугольники"
             return m
         except Exception as e:                         # noqa: BLE001 — запасной вариант ниже

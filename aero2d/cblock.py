@@ -194,7 +194,8 @@ def c_block(x, y, h0, ratio, t, smin, wake_len, obstacles=(), wake_size=0.008, f
     if 0.5 * np.sum(xx * np.roll(yy, -1) - np.roll(xx, -1) * yy) < 0:
         xx, yy = np.r_[xx[:1], xx[1:][::-1]], np.r_[yy[:1], yy[1:][::-1]]
     Pb = _find_base(xx, yy)
-    if Pb is not None and np.hypot(*(Pb[0] - Pb[-1])) > 2e-4 * float(np.ptp(xx)):
+    if wake_len <= 0 or (Pb is not None and np.hypot(*(Pb[0] - Pb[-1])) > 2e-4 * float(np.ptp(xx))):
+        # wake_len ≤ 0 — без блока следа (сгущение по следу выключено): короткий разрез
         # тупая кромка: разрезы от обоих углов торца и полоса за торцом (как блок за торцом в
         # PyAero) — O-обход углов торца с 5–17 точками на торце выворачивался
         from . import _cblock_slot
@@ -411,12 +412,12 @@ def _c_block(x, y, h0, ratio, t, smin, wake_len, obstacles=(), wake_size=0.008, 
     _check(nodes, quads, "у стенки и в следе")
     wall = [(base[K + i], base[K + i + 1]) for i in range(M)]
     outline = list(idx[n]) + list(idx[n - 1:0:-1, -1]) + [idx[0, -1]] + list(idx[1:n, 0])
-    out_size = _matched_sizes(nodes, quads, outline)
+    out_size = _matched_sizes(nodes, quads, outline, mean=True)
     return dict(nodes=nodes, quads=quads, wall=wall, outline=outline, out_size=out_size,
                 layers=n, wake_len=L_try, blunt=blunt)
 
 
-def _matched_sizes(nodes, quads, outline):
+def _matched_sizes(nodes, quads, outline, mean=False):
     """Размер треугольников у каждой точки контура блока — по площади прилегающих к контуру
     ячеек блока: треугольник площадью ≈ 0,433·s² той же площади (Volume change ≈ 1 на стыке)."""
     P = nodes[quads]
@@ -436,6 +437,13 @@ def _matched_sizes(nodes, quads, outline):
     s_ = 0.5 * (s_ + np.roll(s_, 1))
     Pq = nodes[outline]
     el = np.hypot(*(np.roll(Pq, -1, axis=0) - Pq).T)
+    # среднее геометрическое размера «по площади» и длины ребра контура: у плоских ячеек
+    # верхнего ряда размер по площади заметно меньше ребра — треугольник на таком ребре
+    # вытянут (Quality ≈ 0,43); по среднему — Quality ≥ 0,59 при Volume change ≤ 5
+    # (mean=True — для длинного блока следа; у коротких блоков в щелях — по площади: там
+    # важнее Volume change на стыке с мелкими ячейками щели)
+    if mean:
+        s_ = np.sqrt(s_ * 0.5 * (el + np.roll(el, 1)))
     return np.minimum(s_, 1.3 * np.maximum(el, np.roll(el, 1)))
 
 
@@ -464,6 +472,7 @@ def _crosses(A, B):
 
 def build_cblock_mesh(elements, chord, h0, ratio, t, far_radius, far_size, wakes, wake_size, smin, growth,
                       wake_len=1.0, flow_alpha=6.0, verbose=False):
+    # wake_len — длина блока следа в хордах (0 — без блока следа, только короткий разрез)
     """Сетка: С-блоки у элементов + треугольники gmsh снаружи (см. описание модуля)."""
     import gmsh
     from .rans_mesh import _connectivity
@@ -563,6 +572,7 @@ def build_cblock_mesh(elements, chord, h0, ratio, t, far_radius, far_size, wakes
         gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 1)
         gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
         gmsh.option.setNumber("Mesh.Algorithm", 6)
+        gmsh.option.setNumber("Mesh.Smoothing", 10)      # меньше треугольников с углом < 30°
         gmsh.option.setNumber("Mesh.MeshSizeMax", s_far)
         gmsh.model.mesh.generate(2)
         ntags, ncoord, _ = gmsh.model.mesh.getNodes()
