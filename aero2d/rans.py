@@ -37,6 +37,10 @@ CB1, SIG, CB2, KAP = 0.1355, 2.0 / 3.0, 0.622, 0.41
 AFT_SIGN, AFT_C1, AFT_C2, AFT_C3, AFT_SIGY, CT3 = 1.0, 100.0, 0.06, 50.0, 1.0, 1.2
 CW1 = CB1 / KAP**2 + (1 + CB2) / SIG
 CW2, CW3, CV1, CV2, CV3, CN1 = 0.3, 2.0, 7.1, 0.7, 0.9, 16.0
+# k-ω SST (Menter 2003, NASA TMR «SST-2003»): набор 1 — у стенки, набор 2 — вдали (k-ε)
+SST_SK1, SST_SW1, SST_B1, SST_G1 = 0.85, 0.5, 0.075, 5.0 / 9.0
+SST_SK2, SST_SW2, SST_B2, SST_G2 = 1.0, 0.856, 0.0828, 0.44
+SST_BS, SST_A1 = 0.09, 0.31
 
 
 @dataclass
@@ -171,6 +175,11 @@ class RansSolver:
         self.rc_smooth = 2             # SA-RC: проходов сглаживания r̃
         self.turb_model = "sa"         # "sa" — SA-neg; "sa-rc" — с поправкой на кривизну линий тока
         self.ncrit = 9.0               # критический N-фактор (как Ñкрит в XFOIL)
+        # k-ω SST: неизвестные ρk̂ (k̂ = k/k_ref, k_ref = 1e−5·V∞²) и ρω̃ (ω̃ = ln(ω/ω_ref),
+        # ω_ref = V∞/c — логарифм: ω у стенки больше, чем вдали, на 7–8 порядков, и всегда > 0);
+        # набегающий поток — как на NASA TMR: k∞ = 9·10⁻⁹ a∞², ω∞ = 10⁻⁶ ρ∞a∞²/μ∞ (μt/μ ≈ 0,009)
+        self.sst_k_inf = 9e-9
+        self.sst_omega_inf_coef = 1e-6
         self.chi_inf_tr = 0.1          # ν̃/ν набегающего потока при расчёте с переходом (NASA TMR)
         self.aft_cfl_max = 300.0       # предел CFL при расчёте с переходом
         self.aft_version = "2019b"     # калибровка AFT: "2019b" (новая) или "2017b"
@@ -293,9 +302,28 @@ class RansSolver:
         return self.turb_model.endswith("aft")
 
     @property
+    def sst(self):
+        """Модель k-ω SST (2 уравнения: ρk̂, ρω̃)."""
+        return self.turb_model == "sst"
+
+    @property
     def nv(self):
-        """Число переменных в ячейке: 5 (SA) или 7 (SA + переход AFT: ρñ, ργ̃)."""
-        return 7 if self.transition else 5
+        """Число переменных в ячейке: 5 (SA), 6 (k-ω SST: ρk̂, ρω̃) или 7 (SA + переход AFT: ρñ, ργ̃)."""
+        return 6 if self.sst else (7 if self.transition else 5)
+
+    @property
+    def k_ref(self):
+        return 1e-5 * self.mach ** 2
+
+    @property
+    def om_ref(self):
+        return self.mach / self.chord
+
+    def sst_inf(self):
+        """k̂∞, ω̃∞ набегающего потока."""
+        k = self.sst_k_inf / self.k_ref if self.turbulent else 1e-12
+        om = self.sst_omega_inf_coef / self.mu_inf
+        return k, float(np.log(om / self.om_ref))
 
     def prim(self, Q):
         """Q (n,nv): ρ, ρu, ρv, ρE, ρχ[, ρñ, ργ̃] → w: ρ, u, v, p, χ[, ñ, γ̃]."""
@@ -313,8 +341,10 @@ class RansSolver:
 
     def freestream(self, alpha):
         a = np.radians(alpha)
-        base = [1.0, self.mach * np.cos(a), self.mach * np.sin(a), 1.0 / GAM,
-                self.chi_inf_tr if self.transition else self.chi_inf]
+        base = [1.0, self.mach * np.cos(a), self.mach * np.sin(a), 1.0 / GAM]
+        if self.sst:
+            return np.array(base + list(self.sst_inf()))
+        base.append(self.chi_inf_tr if self.transition else self.chi_inf)
         return np.array(base + ([0.0, 0.0] if self.transition else []))
 
     def mu_lam(self, T):
@@ -377,13 +407,18 @@ class RansSolver:
         fn = jnp.where(chi >= 0, 1.0, (CN1 + X**3) / (CN1 - X**3))
         return mu, mut, X, fv1, fn
 
-    def visc_flux(self, wf, gu, gv, gT, gc, n, gx=None):
+    def visc_flux(self, wf, gu, gv, gT, gc, n, gx=None, sst=None):
         """Вязкий поток через грань: wf — значения на грани, g* — градиенты (n,2);
-        gx — градиенты ñ, γ̃ (n,2,2) при расчёте с переходом."""
+        gx — градиенты ñ, γ̃ (n,2,2) при расчёте с переходом, у k-ω SST — градиент ω̃ (n,1,2);
+        sst — (μt, σk, σω) на грани для k-ω SST (gc — градиент k̂)."""
         jnp = self.jnp
         rho, u, v, p, chi = (wf[:, k] for k in range(5))
         T = GAM * p / rho
-        mu, mut, X, fv1, fn = self.sa_terms(rho, chi, T)
+        if sst is not None:
+            mu = self.mu_lam(T)
+            mut, sk, sw = sst
+        else:
+            mu, mut, X, fv1, fn = self.sa_terms(rho, chi, T)
         me = mu + mut
         div = gu[:, 0] + gv[:, 1]
         txx = me * (2 * gu[:, 0] - 2.0 / 3.0 * div)
@@ -394,6 +429,10 @@ class RansSolver:
         fy = txy * nx + tyy * ny
         k = (mu / PR + mut / PRT) / (GAM - 1)
         fe = u * fx + v * fy + k * (gT[:, 0] * nx + gT[:, 1] * ny)
+        if sst is not None:
+            fk_ = (mu + sk * mut) * (gc[:, 0] * nx + gc[:, 1] * ny)
+            fw_ = (mu + sw * mut) * (gx[:, 0, 0] * nx + gx[:, 0, 1] * ny)
+            return jnp.stack([jnp.zeros_like(fx), fx, fy, fe, fk_, fw_], 1)
         fs = (mu + rho * chi * self.nu_inf * fn) / SIG * (gc[:, 0] * nx + gc[:, 1] * ny)
         out = jnp.stack([jnp.zeros_like(fx), fx, fy, fe, fs], 1)
         if wf.shape[1] > 5:
@@ -514,6 +553,52 @@ class RansSolver:
         Sg = AFT_C1 * rho * S * Fon * (1 - eg) - AFT_C2 * rho * Om * Ft * (AFT_C3 * eg - 1)
         return jnp.stack([Sn, Sg], 1)
 
+    def sst_cell(self, w, g, wd):
+        """k-ω SST в ячейках: μt, F1 и источники уравнений ρk̂, ρω̃ на единицу объёма (nc,2).
+        Уравнение для ω̃ = ln(ω/ω_ref) получено делением уравнения для ω на ω:
+          ∂(ρω̃)/∂t + ∇·(ρuω̃) = ∇·(Γω∇ω̃) + Γω|∇ω̃|² + γρP/(μt ω) − βρω + 2(1−F1)ρσω2 ∇k·∇ω̃/ω."""
+        jnp = self.jnp
+        rho, p = w[:, 0], w[:, 3]
+        T = GAM * p / rho
+        mu = self.mu_lam(T)
+        nu = mu / rho
+        kr, wr = self.k_ref, self.om_ref
+        k = jnp.maximum(w[:, 4], 0.0) * kr
+        wt = w[:, 5]
+        om = wr * jnp.exp(wt)
+        s11, s22, s12 = g[:, 1, 0], g[:, 2, 1], 0.5 * (g[:, 1, 1] + g[:, 2, 0])
+        S2 = 2 * (s11 ** 2 + s22 ** 2 + 2 * s12 ** 2)
+        S = jnp.sqrt(S2 + 1e-30)
+        gk = g[:, 4] * kr
+        gw = g[:, 5]
+        kw = jnp.sum(gk * gw, 1)                                   # ∇k·∇ω̃ = ∇k·∇ω/ω
+        sk_ = jnp.sqrt(k)
+        a_ = sk_ / (SST_BS * om * wd)
+        b_ = 500.0 * nu / (wd ** 2 * om)
+        cd = jnp.maximum(2 * rho * SST_SW2 * kw, 1e-20)
+        arg1 = jnp.minimum(jnp.maximum(a_, b_), 4 * rho * SST_SW2 * k / (cd * wd ** 2))
+        F1 = jnp.tanh(arg1 ** 4)
+        arg2 = jnp.maximum(2 * a_, b_)
+        F2 = jnp.tanh(arg2 ** 2)
+        mut = rho * SST_A1 * k / jnp.maximum(SST_A1 * om, S * F2)
+        bl = lambda c1, c2: F1 * c1 + (1 - F1) * c2
+        beta, gam, sw = bl(SST_B1, SST_B2), bl(SST_G1, SST_G2), bl(SST_SW1, SST_SW2)
+        P = jnp.minimum(mut * S2, 10 * SST_BS * rho * om * k)
+        Sk = (P - SST_BS * rho * om * k) / kr
+        Pw = gam * rho * jnp.minimum(S2, 10 * SST_BS * om * k * rho / jnp.maximum(mut, 1e-30 * mu)) / om
+        Gw = mu + sw * mut
+        Sw = (Pw - beta * rho * om + Gw * jnp.sum(gw * gw, 1)
+              + 2 * (1 - F1) * rho * SST_SW2 * kw / om)
+        return mut, F1, jnp.stack([Sk, Sw], 1)
+
+    def sst_wall_omega(self, wc, dn=None):
+        """ω̃ на стенке: ω = 60ν/(β1·Δy1²) (Menter), Δy1 = 2·(расстояние центра ячейки до стенки)."""
+        jnp = self.jnp
+        T = GAM * wc[:, 3] / wc[:, 0]
+        nu = self.mu_lam(T) / wc[:, 0]
+        dn = self.J["dn_w"] if dn is None else dn
+        return jnp.log(60.0 * nu / (SST_B1 * (2 * dn) ** 2) / self.om_ref)
+
     def ft2(self, w):
         """Связь перехода с SA: f_t2 = c_t3 (1 − exp γ̃) (γ̃ ≤ 0)."""
         return CT3 * (1 - self.jnp.exp(self.jnp.minimum(w[:, 6], 0.0)))
@@ -535,6 +620,8 @@ class RansSolver:
         jnp = self.jnp
         wc = w[self.J["cw"]]
         z = jnp.zeros_like(wc[:, 0])
+        if w.shape[1] == 6:                      # k-ω SST: k = 0, ω — по Menter
+            return jnp.stack([wc[:, 0], z, z, wc[:, 3], z, self.sst_wall_omega(wc)], 1)
         # на стенке: прилипание, ν̃ = 0; ñ, γ̃ — нулевая нормальная производная
         return jnp.concatenate([jnp.stack([wc[:, 0], z, z, wc[:, 3], z], 1), wc[:, 5:]], 1)
 
@@ -615,8 +702,15 @@ class RansSolver:
         nv = w.shape[1]
         gx = None
         if nv > 5:
-            gx = jnp.stack([fgrad(w[iL, k], w[iR, k], gvv[iL, k], gvv[iR, k]) for k in (5, 6)], 1)
-        Fv = self.visc_flux(wf, gu, gv, gTf, gc, J["n_i"], gx)
+            gx = jnp.stack([fgrad(w[iL, k], w[iR, k], gvv[iL, k], gvv[iR, k]) for k in range(5, nv)], 1)
+        sstf = sst_c = None
+        if nv == 6:                               # k-ω SST: μt и σ на гранях — средние по ячейкам
+            sst_c = self.sst_cell(w, gr if self.sa_raw_grad else g, J["wd"])
+            mut_c, F1_c = sst_c[0], sst_c[1]
+            F1f = 0.5 * (F1_c[iL] + F1_c[iR])
+            sstf = (0.5 * (mut_c[iL] + mut_c[iR]), F1f * SST_SK1 + (1 - F1f) * SST_SK2,
+                    F1f * SST_SW1 + (1 - F1f) * SST_SW2)
+        Fv = self.visc_flux(wf, gu, gv, gTf, gc, J["n_i"], gx, sstf)
         F = (Fc - Fv) * J["A_i"][:, None]
         Rs = jnp.zeros((self.nc, nv)).at[iL].add(F).at[iR].add(-F)
         # стенка
@@ -635,12 +729,16 @@ class RansSolver:
         gu_w = wgrad(z, ww[:, 1], gvv[cw, 1])
         gv_w = wgrad(z, ww[:, 2], gvv[cw, 2])
         gc_w = wgrad(z, ww[:, 4], gvv[cw, 4])
-        wfw = jnp.concatenate([jnp.stack([ww[:, 0], z, z, ww[:, 3], z], 1), ww[:, 5:]], 1)
+        wfw = wv                                                    # значения на стенке
         gT_w = gT[cw] - jnp.sum(gT[cw] * n, 1)[:, None] * n      # теплоизолированная
-        gx_w = None
-        if nv > 5:                                                  # ñ, γ̃: ∂/∂n = 0
+        gx_w = sst_w = None
+        if nv == 6:                                                 # k-ω SST: ω̃ задано на стенке
+            gx_w = wgrad(wv[:, 5], ww[:, 5], gvv[cw, 5])[:, None, :]
+            F1w = sst_c[1][cw]
+            sst_w = (z, F1w * SST_SK1 + (1 - F1w) * SST_SK2, F1w * SST_SW1 + (1 - F1w) * SST_SW2)
+        elif nv > 5:                                                # ñ, γ̃: ∂/∂n = 0
             gx_w = gvv[cw, 5:] - jnp.sum(gvv[cw, 5:] * n[:, None, :], 2)[:, :, None] * n[:, None, :]
-        Fvw = self.visc_flux(wfw, gu_w, gv_w, gT_w, gc_w, n, gx_w)
+        Fvw = self.visc_flux(wfw, gu_w, gv_w, gT_w, gc_w, n, gx_w, sst_w)
         Fw = (Fcw - Fvw) * J["A_w"][:, None]
         Rs = Rs.at[cw].add(Fw)
         # внешняя граница
@@ -654,7 +752,7 @@ class RansSolver:
         if not self.turbulent:                 # ламинарный расчёт: ρχ ≡ 0
             return Rs.at[:, 4:].set(Q[:, 4:] * J["vol"][:, None])
         gs_ = gr if self.sa_raw_grad else g
-        S = self.sources(w, gs_, gr)
+        S = sst_c[2] if sst_c is not None else self.sources(w, gs_, gr)
         Rs = Rs.at[:, 4:].add(-S * J["vol"][:, None])
         return Rs
 
@@ -662,6 +760,8 @@ class RansSolver:
         """Источники уравнений турбулентности (nc, nv−4): SA[, ñ, γ̃]."""
         jnp = self.jnp
         J = self.J
+        if w.shape[1] == 6:
+            return self.sst_cell(w, g, J["wd"])[2]
         if f1 is None and self.turb_model == "sa-rc":
             f1 = self.fr1(w, graw)
         if w.shape[1] == 5:
@@ -684,8 +784,11 @@ class RansSolver:
         dmax, dmin = wmax - w, wmin - w
         h = jnp.sqrt(J["vol"])
         # характерный масштаб переменных для ε
-        scale = jnp.asarray([1.0, self.mach, self.mach, 1.0 / GAM, max(self.chi_inf, 1.0)]
-                            + ([max(self.ncrit, 1.0), 5.0] if w.shape[1] > 5 else []))
+        if w.shape[1] == 6:
+            scale = jnp.asarray([1.0, self.mach, self.mach, 1.0 / GAM, max(self.sst_inf()[0], 1.0), 5.0])
+        else:
+            scale = jnp.asarray([1.0, self.mach, self.mach, 1.0 / GAM, max(self.chi_inf, 1.0)]
+                                + ([max(self.ncrit, 1.0), 5.0] if w.shape[1] > 5 else []))
         eps2 = ((self.limiter_k * h) ** 3)[:, None] * scale[None, :] ** 2
 
         def psi(d2, i):
@@ -716,11 +819,16 @@ class RansSolver:
             e = d / dist
             TL, TR = GAM * wL[3] / wL[0], GAM * wR[3] / wR[0]
             g2 = lambda a, b: ((b - a) / dist * e)[None]
-            gx = None
-            if wL.shape[0] > 5:
+            gx = sst = None
+            wf = 0.5 * (wL + wR)
+            if wL.shape[0] == 6:                 # SST: μt ≈ ρk/ω, σ — средние наборов 1 и 2
+                gx = g2(wL[5], wR[5])[None]
+                mt = wf[0] * jnp.maximum(wf[4], 0.0) * self.k_ref / (self.om_ref * jnp.exp(wf[5]))
+                sst = (mt[None], jnp.full((1,), 0.9), jnp.full((1,), 0.7))
+            elif wL.shape[0] > 5:
                 gx = jnp.stack([g2(wL[5], wR[5])[0], g2(wL[6], wR[6])[0]], 0)[None]
-            Fv = self.visc_flux(0.5 * (wL + wR)[None], g2(wL[1], wR[1]), g2(wL[2], wR[2]), g2(TL, TR),
-                                g2(wL[4], wR[4]), n[None], gx)[0]
+            Fv = self.visc_flux(wf[None], g2(wL[1], wR[1]), g2(wL[2], wR[2]), g2(TL, TR),
+                                g2(wL[4], wR[4]), n[None], gx, sst)[0]
             return Fc - Fv
 
         def face_wall(qi, n, dn):
@@ -729,6 +837,13 @@ class RansSolver:
             nv = wi.shape[0]
             Fc = jnp.stack([0.0 * p, p * n[0], p * n[1]] + [0.0 * p] * (nv - 3))
             gw = lambda phi: (-phi / dn * n)[None]
+            if nv == 6:                          # SST: ω̃ задано на стенке
+                ow = self.sst_wall_omega(wi[None], dn[None])[0]
+                wf = jnp.stack([wi[0], 0.0 * p, 0.0 * p, p, 0.0 * p, ow])
+                gx = ((ow - wi[5]) / dn * n)[None, None]
+                Fv = self.visc_flux(wf[None], gw(wi[1]), gw(wi[2]), jnp.zeros((1, 2)), gw(wi[4]), n[None],
+                                    gx, (jnp.zeros(1), jnp.full((1,), SST_SK1), jnp.full((1,), SST_SW1)))[0]
+                return Fc - Fv
             wf = jnp.concatenate([jnp.stack([wi[0], 0.0 * p, 0.0 * p, p, 0.0 * p]), wi[5:]])
             Fv = self.visc_flux(wf[None], gw(wi[1]), gw(wi[2]), jnp.zeros((1, 2)), gw(wi[4]), n[None])[0]
             return Fc - Fv
@@ -748,7 +863,11 @@ class RansSolver:
 
         f1 = self.fr1(w, g) if self.turb_model == "sa-rc" else jnp.ones(self.nc)
         nv = Q.shape[1]
-        if nv == 5:
+        if nv == 6:
+            def src6(q, gi, wd):
+                return self.sst_cell(self.prim(q[None]), gi[None], wd[None])[2][0]
+            js = jax.vmap(jax.jacfwd(src6))(Q, g, J["wd"])                   # (nc,2,6)
+        elif nv == 5:
             def src(q, gi, wd, f):
                 return self.sa_source(self.prim(q[None]), gi[None], wd[None], f[None])[0]
             js = jax.vmap(jax.grad(src))(Q, g, J["wd"], f1)[:, None, :]       # (nc,1,5)
@@ -866,7 +985,10 @@ class RansSolver:
         np.add.at(lam, self.cw, a[self.cw] * self.A_w)
         T = GAM * w[:, 3] / w[:, 0]
         mu = self.mu_inf * T**1.5 * (1 + SUTH) / (T + SUTH)
-        nut = np.maximum(w[:, 4], 0) * self.nu_inf
+        if w.shape[1] == 6:                       # SST: νt = k/ω
+            nut = np.maximum(w[:, 4], 0) * self.k_ref / (self.om_ref * np.exp(np.minimum(w[:, 5], 60.0)))
+        else:
+            nut = np.maximum(w[:, 4], 0) * self.nu_inf
         lv = np.zeros(self.nc)
         sv = self.A_i**2
         np.add.at(lv, self.iL, sv)
@@ -946,11 +1068,7 @@ class RansSolver:
             w0 = np.tile(winf, (self.nc, 1)); w0[:, 1:3] *= f
             Q = np.asarray(self.cons(jnp.asarray(w0)))
         else:
-            Q = np.array(Q0, float)
-            if Q.shape[1] > self.nv:                     # состояние с переходом → без
-                Q = Q[:, :self.nv].copy()
-            elif Q.shape[1] < self.nv:                   # тёплый старт SA → с переходом: ñ = 0, γ̃ = 0
-                Q = np.concatenate([Q, np.zeros((len(Q), self.nv - Q.shape[1]))], 1)
+            Q = self._convert_state(np.array(Q0, float), winf)
             if alpha0 is not None and abs(float(alpha) - float(alpha0)) > 1e-12:
                 Q = self._rotate_state(Q, float(alpha) - float(alpha0))
         nv = self.nv
@@ -1237,11 +1355,14 @@ class RansSolver:
                 # (поячеечно; уравнения жёсткие, полный шаг Ньютона «перелетает»)
                 rq = Q[:, 0] + dq[:, 0]
                 rq = np.where(rq > 0, rq, Q[:, 0])
-                for k_, lim_ in ((5, 1.0), (6, 1.5), (4, None)):
+                # k-ω SST: ω̃ = ln ω — не больше чем на 1 (ω в e раз), k̂ — на 50 % (не меньше k̂∞)
+                lims = ((5, 1.0), (4, None)) if nv == 6 else ((5, 1.0), (6, 1.5), (4, None))
+                floor = self.sst_inf()[0] if nv == 6 else 1.0
+                for k_, lim_ in lims:
                     old = Q[:, k_] / Q[:, 0]
                     new = (Q[:, k_] + dq[:, k_]) / rq
-                    if lim_ is None:                       # χ: не больше чем ×1,5 (+1) за шаг
-                        lim_ = np.maximum(0.5 * np.abs(old), 1.0)
+                    if lim_ is None:                       # χ (k̂): не больше чем ×1,5 (+1) за шаг
+                        lim_ = np.maximum(0.5 * np.abs(old), floor)
                     new = old + np.clip(new - old, -lim_, lim_)
                     dq[:, k_] = new * rq - Q[:, k_]
             # ограничение шага: ρ и p не меньше 20 % от текущих
@@ -1298,6 +1419,22 @@ class RansSolver:
                           [h[0] for h in hist], fr["elements"], Q, status, H)
 
 
+    def _convert_state(self, Q, winf):
+        """Начальное поле другой модели турбулентности → переменные этой модели.
+        SA (5) ↔ SA+AFT (7): ñ = 0, γ̃ = 0 / отбросить; SA ↔ k-ω SST (6): течение (ρ, ρu, ρv,
+        ρE) сохраняется, переменные турбулентности — набегающего потока."""
+        nv = self.nv
+        if Q.shape[1] == nv:
+            return Q
+        if Q.shape[1] == 6 or nv == 6:
+            out = np.empty((len(Q), nv))
+            out[:, :4] = Q[:, :4]
+            out[:, 4:] = Q[:, :1] * np.asarray(winf[4:])[None, :]
+            return out
+        if Q.shape[1] > nv:                              # состояние с переходом → без
+            return Q[:, :nv].copy()
+        return np.concatenate([Q, np.zeros((len(Q), nv - Q.shape[1]))], 1)   # SA → с переходом
+
     # ------------------------------------------------------------------
     # нестационарный расчёт (двойной шаг по времени)
     # ------------------------------------------------------------------
@@ -1333,9 +1470,7 @@ class RansSolver:
             w0[:, 1:3] = 0.0
             Q0 = np.asarray(self.cons(jnp.asarray(w0)))
             ramp = ramp or 0.5
-        Q = np.array(Q0, float)[:, :nv]
-        if Q.shape[1] < nv:
-            Q = np.concatenate([Q, np.zeros((len(Q), nv - Q.shape[1]))], 1)
+        Q = self._convert_state(np.array(Q0, float), winf)
         F_ = self._fns()
         resf, jvpf = F_["res2f"], F_["jvp2f"]
         if not hasattr(self, "_bilu") or self._bilu.fill != int(self.prec_fill) or self._bilu.k != nv:
