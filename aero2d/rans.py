@@ -234,6 +234,10 @@ class RansSolver:
         self.cfl_limit = 1e6           # наибольший CFL
         self.first_order = 30          # итераций первым порядком при старте с нуля
         self.rollback_factor = 100.0   # невязка выросла во столько раз от наименьшей — откат
+        # False — без автоматической защиты: ни отката к лучшему состоянию при росте невязки, ни
+        # отмены неудачного шага (откат остаётся только при NaN — иначе расчёт не продолжить —
+        # и по кнопке «Откат к лучшему»)
+        self.rollback_auto = True
         self.rollback_first_order = 15 # после отката из-за NaN — итераций первым порядком (при
                                        # росте невязки — нет: первый порядок уводит от уже
                                        # сошедшегося решения второго порядка)
@@ -1221,8 +1225,8 @@ class RansSolver:
                 best.update(rn=np.inf, order=order)
             # у тёплого старта невязка сначала мала и растёт, пока поле подстраивается
             # под новый угол, — это не развал (первые 8 итераций не проверяются)
-            blowup = (not np.isfinite(rn)) or (rn > self.rollback_factor * best["rn"] and it - best["it"] >= 3
-                                               and not (warm and it <= 8))
+            blowup = (not np.isfinite(rn)) or (self.rollback_auto and rn > self.rollback_factor * best["rn"]
+                                               and it - best["it"] >= 3 and not (warm and it <= 8))
             if (blowup or manual) and best["Q"] is not None:
                 n_back += int(not manual)
                 why = "вручную" if manual else ("NaN" if not np.isfinite(rn) else
@@ -1246,7 +1250,7 @@ class RansSolver:
                 continue
             # отмена неудачного шага: невязка выросла в step_reject раз — вернуть поле,
             # уменьшить CFL и повторить (без отката к «лучшему» и без первого порядка)
-            if (prev is not None and prev[2] == order and n_rej < self.max_rejects
+            if (self.rollback_auto and prev is not None and prev[2] == order and n_rej < self.max_rejects
                     and (not np.isfinite(rn) or rn > self.step_reject * prev[1])
                     and not (warm and it <= 8) and not manual):
                 n_rej += 1

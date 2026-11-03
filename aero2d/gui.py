@@ -1896,117 +1896,185 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------ невязки RANS
     def _build_res_tab(self, nb):
+        """Вкладка «Невязки»: полоса настроек (критерий / шаг CFL / защита от развала, сворачивается),
+        панель действий во время расчёта, строка состояния и графики."""
         fr = ttk.Frame(nb)
         nb.add(fr, text="Невязки")
         self.t_res_frame = fr
-        bar = ttk.Frame(fr, padding=(4, 4))
-        bar.pack(side="top", fill="x")
-        ttk.Label(bar, text="Переход к следующему углу: невязка ниже 10^−").pack(side="left")
+        num_w = 7
+
+        def pair(parent, r, c, text, var, width=num_w, tip=None):
+            ttk.Label(parent, text=text).grid(row=r, column=c, sticky="w", padx=(0, 4), pady=1)
+            e = ttk.Entry(parent, textvariable=var, width=width)
+            e.grid(row=r, column=c + 1, sticky="w", padx=(0, 10), pady=1)
+            if tip:
+                Tooltip(e, tip)
+            return e
+
+        # --- полоса настроек: три группы рядом
+        self.res_settings = ttk.Frame(fr, padding=(4, 4, 4, 0))
+        self.res_settings.pack(side="top", fill="x")
+        st = self.res_settings
+        for c_ in range(3):
+            st.columnconfigure(c_, weight=1, uniform="grp")
+
+        g1 = ttk.LabelFrame(st, text="Критерий перехода к следующему углу", padding=(6, 2))
+        g1.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
         self.cv_orders = tk.StringVar(value="4.5")
-        ttk.Entry(bar, textvariable=self.cv_orders, width=4).pack(side="left")
-        ttk.Label(bar, text=" от невязки однородного потока,").pack(side="left")
         self.cv_hold = tk.StringVar(value="20")
-        ttk.Entry(bar, textvariable=self.cv_hold, width=4).pack(side="left", padx=(4, 0))
-        ttk.Label(bar, text=" итераций подряд;").pack(side="left")
-        bar = ttk.Frame(fr, padding=(4, 0))
-        bar.pack(side="top", fill="x")
-        ttk.Label(bar, text="за эти итерации Cl меняется меньше чем на").pack(side="left")
         self.cv_cl = tk.StringVar(value="0.02")
-        ttk.Entry(bar, textvariable=self.cv_cl, width=5).pack(side="left")
-        ttk.Label(bar, text=" %, Cd — меньше чем на").pack(side="left")
         self.cv_cd = tk.StringVar(value="0.00002")
-        ttk.Entry(bar, textvariable=self.cv_cd, width=8).pack(side="left")
-        bar2 = ttk.Frame(fr, padding=(4, 0))
-        bar2.pack(side="top", fill="x")
+        pair(g1, 0, 0, "невязка упала на, порядков", self.cv_orders, 5,
+             "Невязка ниже 10^−N от невязки однородного потока.")
+        pair(g1, 1, 0, "держится итераций подряд", self.cv_hold, 5)
+        pair(g1, 2, 0, "Cl меняется меньше, %", self.cv_cl, 8)
+        pair(g1, 3, 0, "Cd меняется меньше на", self.cv_cd, 8)
         self.cv_stall = tk.BooleanVar(value=True)
-        ttk.Checkbutton(bar2, text="принимать и при «застрявшей» невязке (на порядок выше заданной, Cl и Cd стоят "
-                        "≥ 30 итераций)", variable=self.cv_stall).pack(side="left")
-        ttk.Button(bar2, text="⏭ Принять угол, следующий", command=self.skip_angle).pack(side="right")
-        # шаг по псевдовремени и защита от развала
-        bar4 = ttk.Frame(fr, padding=(4, 2))
-        bar4.pack(side="top", fill="x")
-        ttk.Label(bar4, text="Шаг: режим").pack(side="left")
+        cs_ = ttk.Checkbutton(g1, text="принимать «застрявшую» невязку", variable=self.cv_stall)
+        cs_.grid(row=4, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        Tooltip(cs_, "Невязка на порядок выше заданной, но Cl и Cd не меняются ≥ 30 итераций — угол "
+                     "считается сошедшимся.")
+
+        g2 = ttk.LabelFrame(st, text="Шаг по псевдовремени (CFL)", padding=(6, 2))
+        g2.grid(row=0, column=1, sticky="nsew", padx=4)
+        ttk.Label(g2, text="режим").grid(row=0, column=0, sticky="w", padx=(0, 4))
         self.cfl_preset = tk.StringVar(value="обычный")
         self.cfl_mode_v = "grow"
-        cp_ = ttk.Combobox(bar4, textvariable=self.cfl_preset, values=list(self.CFL_PRESETS) + ["свой"],
-                           state="readonly", width=22)
-        cp_.pack(side="left")
+        cp_ = ttk.Combobox(g2, textvariable=self.cfl_preset, values=list(self.CFL_PRESETS) + ["свой"],
+                           state="readonly", width=15)
+        cp_.grid(row=0, column=1, columnspan=2, sticky="we", pady=1)
         cp_.bind("<<ComboboxSelected>>", lambda _: self._apply_cfl_preset())
         self.cfl_vars = {}
-        bar5 = ttk.Frame(fr, padding=(4, 0))
-        bar5.pack(side="top", fill="x")
-        for key, lbl, val, w in (("cfl_start", " CFL нач.", "5", 5), ("cfl_limit", " наиб.", "1e6", 6),
-                                 ("cfl_growth", " рост ×", "1.25", 5), ("first_order", " 1-й порядок, итер.", "30", 4),
-                                 ("rollback_factor", "Откат к лучшему состоянию, если невязка выросла в", "100", 5)):
-            bar_ = bar5 if key == "rollback_factor" else bar4
-            ttk.Label(bar_, text=lbl).pack(side="left")
+        ttk.Label(g2, text="CFL нач. / наиб.").grid(row=1, column=0, sticky="w", padx=(0, 4))
+        for key, lbl, val, r, c in (("cfl_start", None, "5", 1, 1), ("cfl_limit", None, "1e6", 1, 2),
+                                    ("cfl_growth", "рост ×", "1.25", 2, 0),
+                                    ("first_order", "1-й порядок, итер.", "30", 3, 0)):
             v = tk.StringVar(value=val)
-            e_ = ttk.Entry(bar_, textvariable=v, width=w)
-            e_.pack(side="left")
+            if lbl is None:
+                e_ = ttk.Entry(g2, textvariable=v, width=6)
+                e_.grid(row=r, column=c, sticky="w", padx=(0, 4), pady=1)
+            else:
+                e_ = pair(g2, r, c, lbl, v, 6)
             e_.bind("<KeyRelease>", lambda _: self.cfl_preset.set("свой"))
             self.cfl_vars[key] = v
-        ttk.Label(bar5, text=" раз;  ограничитель:").pack(side="left")
-        # CFL по формуле (режим «по формуле»)
-        bar6 = ttk.Frame(fr, padding=(4, 0))
-        bar6.pack(side="top", fill="x")
-        ttk.Label(bar6, text="CFL по формуле:").pack(side="left")
-        self.cfl_formula = tk.StringVar(value="min(5*1.2**n, 1000)")
-        self.e_cfl_formula = ttk.Entry(bar6, textvariable=self.cfl_formula, width=40)
-        self.e_cfl_formula.pack(side="left", padx=4)
-        Tooltip(self.e_cfl_formula, "Действует в режиме шага «по формуле». Переменные: n — номер итерации на "
-                                    "угле (1, 2, 3, …), orders — на сколько порядков упала невязка, res — невязка / "
-                                    "начальная, dres — невязка / невязка прошлой итерации, cfl — текущий CFL. "
-                                    "Функции: min, max, exp, log, log10, sqrt, abs, pow, tanh, floor, ceil, "
-                                    "где(условие, a, b). Степень — ** или ^. Примеры: min(5*1.2**n, 500); "
-                                    "где(n < 50, 10, 200); min(5*10**orders, 1e4). «наиб.» ограничивает CFL сверху.")
-        ttk.Label(bar6, text="готовые:").pack(side="left")
-        self.cfl_example = tk.StringVar(value="")
-        cbx = ttk.Combobox(bar6, textvariable=self.cfl_example, values=list(self.CFL_FORMULAS),
-                           state="readonly", width=34)
-        cbx.pack(side="left", padx=4)
-        cbx.bind("<<ComboboxSelected>>", lambda _: self._apply_cfl_example())
-        Tooltip(cbx, "Формулы наращивания CFL из распространённых решателей (неявная схема, локальный шаг "
-                     "Δt = CFL·Ω/(Λc + Λv) по Blazek). Выбор подставляет формулу и включает режим «по формуле».")
-        bar7 = ttk.Frame(fr, padding=(4, 0))
-        bar7.pack(side="top", fill="x")
-        ttk.Label(bar7, text="CFL уравнений k, ω (турбулентность) = CFL ×").pack(side="left")
+        ttk.Label(g2, text="CFL k, ω = CFL ×").grid(row=4, column=0, sticky="w", padx=(0, 4))
         self.cfl_turb = tk.StringVar(value="авто")
-        ct_ = ttk.Combobox(bar7, textvariable=self.cfl_turb, values=["авто", "1", "0.5", "0.2", "0.1", "0.05"],
+        ct_ = ttk.Combobox(g2, textvariable=self.cfl_turb, values=["авто", "1", "0.5", "0.2", "0.1", "0.05"],
                            width=6)
-        ct_.pack(side="left")
+        ct_.grid(row=4, column=1, columnspan=2, sticky="w", pady=1)
         Tooltip(ct_, "Отдельный (меньший) шаг для уравнений турбулентности — как schedule_cflturb в FUN3D "
                      "(там CFL турбулентности на порядок меньше основного) и CFL_REDUCTION_TURB в SU2. "
                      "«авто»: 1 для SA, 0.1 для k-ω SST.")
+
+        g3 = ttk.LabelFrame(st, text="Защита от развала", padding=(6, 2))
+        g3.grid(row=0, column=2, sticky="nsew", padx=(4, 0))
+        self.rb_auto = tk.BooleanVar(value=True)
+        cb_ = ttk.Checkbutton(g3, text="автоматический откат и отмена шага", variable=self.rb_auto,
+                              command=self._sync_rollback)
+        cb_.grid(row=0, column=0, columnspan=2, sticky="w", pady=1)
+        Tooltip(cb_, "Включено: если невязка выросла в N раз от наименьшей — откат к лучшему состоянию "
+                     "(CFL ×0,1); если выросла за шаг больше чем в 3 раза — шаг отменяется. Выключено: расчёт "
+                     "идёт без вмешательства (при NaN откат всё равно будет — иначе расчёт не продолжить); "
+                     "кнопка «Откат к лучшему» работает всегда.")
+        v = tk.StringVar(value="100")
+        self.cfl_vars["rollback_factor"] = v
+        self.e_rb = pair(g3, 1, 0, "откат при росте невязки, раз", v, 6,
+                         "Откат к лучшему состоянию, если невязка выросла во столько раз от наименьшей.")
+        self.e_rb.bind("<KeyRelease>", lambda _: self.cfl_preset.set("свой"))
+        ttk.Label(g3, text="ограничитель Венкатакришнана").grid(row=2, column=0, columnspan=2, sticky="w",
+                                                              pady=(4, 0))
+        self.lim_zone = tk.StringVar(value="у задних кромок")
+        ttk.Combobox(g3, textvariable=self.lim_zone, values=list(self.LIMITER_ZONES), state="readonly",
+                     width=20).grid(row=3, column=0, columnspan=2, sticky="w", pady=1)
+
+        # формула CFL — только в режиме «по формуле»
+        self.res_formula = ttk.LabelFrame(st, text="CFL по формуле", padding=(6, 2))
+        rf = self.res_formula
+        rf.columnconfigure(1, weight=1)
+        ttk.Label(rf, text="CFL(n) =").grid(row=0, column=0, sticky="w", padx=(0, 4))
+        self.cfl_formula = tk.StringVar(value="min(5*1.2**n, 1000)")
+        self.e_cfl_formula = ttk.Entry(rf, textvariable=self.cfl_formula, width=40)
+        self.e_cfl_formula.grid(row=0, column=1, sticky="we", pady=1)
+        Tooltip(self.e_cfl_formula, "Переменные: n — номер итерации на угле (1, 2, 3, …), orders — на сколько "
+                                    "порядков упала невязка, res — невязка / начальная, dres — невязка / невязка "
+                                    "прошлой итерации, cfl — текущий CFL. Функции: min, max, exp, log, log10, "
+                                    "sqrt, abs, pow, tanh, floor, ceil, где(условие, a, b). Степень — ** или ^. "
+                                    "«наиб.» ограничивает CFL сверху.")
+        ttk.Label(rf, text="  готовые:").grid(row=0, column=2, sticky="w")
+        self.cfl_example = tk.StringVar(value="")
+        cbx = ttk.Combobox(rf, textvariable=self.cfl_example, values=list(self.CFL_FORMULAS),
+                           state="readonly", width=36)
+        cbx.grid(row=0, column=3, sticky="w", padx=(4, 0), pady=1)
+        cbx.bind("<<ComboboxSelected>>", lambda _: self._apply_cfl_example())
+        Tooltip(cbx, "Формулы наращивания CFL из распространённых решателей (неявная схема, локальный шаг "
+                     "Δt = CFL·Ω/(Λc + Λv) по Blazek). Выбор подставляет формулу.")
         self.cfl_formula_hint = tk.StringVar(value="")
-        ttk.Label(bar7, textvariable=self.cfl_formula_hint, foreground="#555").pack(side="left", padx=6)
+        ttk.Label(rf, textvariable=self.cfl_formula_hint, foreground="#555").grid(
+            row=1, column=0, columnspan=4, sticky="w")
         self.cfl_formula.trace_add("write", lambda *_: self._check_cfl_formula())
         self._check_cfl_formula()
-        self.lim_zone = tk.StringVar(value="у задних кромок")
-        ttk.Combobox(bar5, textvariable=self.lim_zone, values=list(self.LIMITER_ZONES), state="readonly",
-                     width=16).pack(side="left")
-        ttk.Button(bar5, text="↶ Откат к лучшему", command=self.rollback_now).pack(side="right")
-        ttk.Button(bar5, text="CFL ×0,5", command=self.halve_cfl).pack(side="right", padx=4)
-        bar3 = ttk.Frame(fr, padding=(4, 2))
-        bar3.pack(side="top", fill="x")
-        ttk.Label(bar3, text="Показать: ").pack(side="left")
+
+        # --- панель: что показать + действия во время расчёта
+        bar = ttk.Frame(fr, padding=(4, 4, 4, 0))
+        bar.pack(side="top", fill="x")
+        self.btn_res_set = ttk.Button(bar, text="▲ Скрыть настройки", width=19, command=self._toggle_res_settings)
+        self.btn_res_set.pack(side="left")
+        ttk.Label(bar, text="  Показать").pack(side="left")
         self.res_src = tk.StringVar(value="текущий расчёт")
-        self.cb_res_src = ttk.Combobox(bar3, textvariable=self.res_src, values=["текущий расчёт"],
-                                       state="readonly", width=36)
-        self.cb_res_src.pack(side="left")
+        self.cb_res_src = ttk.Combobox(bar, textvariable=self.res_src, values=["текущий расчёт"],
+                                       state="readonly", width=30)
+        self.cb_res_src.pack(side="left", padx=4)
         self.cb_res_src.bind("<<ComboboxSelected>>", lambda _: (self.res_angle.set("все углы"), self.plot_res()))
-        ttk.Label(bar3, text="   угол: ").pack(side="left")
+        ttk.Label(bar, text="угол").pack(side="left")
         self.res_angle = tk.StringVar(value="все углы")
-        self.cb_res_angle = ttk.Combobox(bar3, textvariable=self.res_angle, values=["все углы"],
-                                         state="readonly", width=10)
-        self.cb_res_angle.pack(side="left")
+        self.cb_res_angle = ttk.Combobox(bar, textvariable=self.res_angle, values=["все углы"],
+                                         state="readonly", width=9)
+        self.cb_res_angle.pack(side="left", padx=4)
         self.cb_res_angle.bind("<<ComboboxSelected>>", lambda _: self.plot_res())
-        ttk.Button(bar3, text="Досчитать несошедшиеся углы", command=self.continue_rans).pack(side="right")
+        ttk.Button(bar, text="Досчитать несошедшиеся", command=self.continue_rans).pack(side="right")
+        act = ttk.Frame(fr, padding=(4, 3, 4, 0))
+        act.pack(side="top", fill="x")
+        ttk.Label(act, text="Во время расчёта:", foreground="#555").pack(side="left")
+        b1 = ttk.Button(act, text="⏭ Принять угол", command=self.skip_angle)
+        b1.pack(side="left", padx=(6, 0))
+        Tooltip(b1, "Считать текущий угол сошедшимся и перейти к следующему.")
+        b2 = ttk.Button(act, text="CFL ×0,5", command=self.halve_cfl)
+        b2.pack(side="left", padx=4)
+        b3 = ttk.Button(act, text="↶ Откат к лучшему", command=self.rollback_now)
+        b3.pack(side="left")
+        Tooltip(b3, "Вернуться к состоянию с наименьшей невязкой на этом угле (CFL ×0,1).")
+        self.res_state = tk.StringVar(value="")
+        st_l = ttk.Label(fr, textvariable=self.res_state, foreground="#1a4f8a", padding=(6, 2))
+        st_l.pack(side="top", fill="x")
+        st_l.bind("<Configure>", lambda e: st_l.configure(wraplength=max(200, e.width - 12)))
+
         self.res_fig = Figure(figsize=(7, 5), dpi=100, layout="constrained")
         self.res_canvas = FigureCanvasTkAgg(self.res_fig, master=fr)
         NavigationToolbar2Tk(self.res_canvas, fr).update()
         self.res_canvas.get_tk_widget().pack(fill="both", expand=True)
         self._live = None
         self._res_drawn = 0.0
+        self._sync_formula_frame()
+
+    def _toggle_res_settings(self):
+        if self.res_settings.winfo_manager():
+            self.res_settings.pack_forget()
+            self.btn_res_set.configure(text="▼ Показать настройки")
+        else:
+            self.res_settings.pack(side="top", fill="x", before=self.btn_res_set.master)
+            self.btn_res_set.configure(text="▲ Скрыть настройки")
+
+    def _sync_formula_frame(self):
+        """Строка формулы CFL — только в режиме «по формуле»."""
+        if not hasattr(self, "res_formula"):
+            return
+        if getattr(self, "cfl_mode_v", "") == "formula":
+            self.res_formula.grid(row=1, column=0, columnspan=3, sticky="we", pady=(4, 0))
+        else:
+            self.res_formula.grid_remove()
+
+    def _sync_rollback(self):
+        self.e_rb.configure(state="normal" if self.rb_auto.get() else "disabled")
 
     TURB_MODELS = {"SA (Спаларт–Аллмарас)": "sa",
                    "SA-RC (поправка на кривизну)": "sa-rc",
@@ -2022,7 +2090,7 @@ class App(tk.Tk):
                                                     first_order="30", rollback_factor="100", mode="fixed"),
                    "осторожный": dict(cfl_start="2", cfl_limit="1e4", cfl_growth="1.1", first_order="60",
                                       rollback_factor="20", mode="grow"),
-                   "по формуле (CFL(n) ниже)": dict(mode="formula")}
+                   "по формуле": dict(mode="formula")}
 
     # готовые формулы CFL (режим «по формуле») — по источникам: FUN3D (schedule_cfl, линейный рост),
     # NASA WIND (cfl1, cflfac каждые inccfl итераций), SER Mulder–van Leer, SU2 v7 (FactorUp/Down)
@@ -2039,7 +2107,7 @@ class App(tk.Tk):
         f = self.CFL_FORMULAS.get(self.cfl_example.get())
         if f:
             self.cfl_formula.set(f)
-            self.cfl_preset.set("по формуле (CFL(n) ниже)")
+            self.cfl_preset.set("по формуле")
             self._apply_cfl_preset()
 
     def _apply_cfl_preset(self):
@@ -2051,6 +2119,7 @@ class App(tk.Tk):
                 else:
                     self.cfl_vars[k].set(v)
         self._check_cfl_formula()
+        self._sync_formula_frame()
 
     def _check_cfl_formula(self):
         """Проверка формулы CFL при вводе: CFL при n = 0, 10, 50, 200 — или ошибка."""
@@ -2073,8 +2142,6 @@ class App(tk.Tk):
                         for n_ in (1, 10, 50, 200)]
                 txt = "CFL, n = 1/10/50/200: "
             txt += " / ".join(f"{v:.3g}" for v in vals) + " (≤ «наиб.»)"
-            if getattr(self, "cfl_mode_v", "") != "formula":
-                txt += "  (включите режим «по формуле»)"
             self.cfl_formula_hint.set(txt)
         except ValueError as e:
             self.cfl_formula_hint.set("⚠ " + str(e))
@@ -2093,6 +2160,7 @@ class App(tk.Tk):
             raise ValueError("Невязки: CFL нач. > 0 и ≤ наибольшего, рост ≥ 1, откат при росте > 1")
         o["first_order"] = int(o["first_order"])
         o["cfl_mode"] = getattr(self, "cfl_mode_v", "grow")
+        o["rollback_auto"] = bool(self.rb_auto.get())
         if o["cfl_mode"] == "formula":
             from .rans import cfl_formula
             cfl_formula(self.cfl_formula.get(), n=0, orders=0.0, res=1.0, dres=1.0, cfl=o["cfl_start"])   # ValueError
@@ -2152,12 +2220,13 @@ class App(tk.Tk):
         return dict(angles={}, rref=1.0, last=None, events=[])
 
     @staticmethod
-    def _res_add(D, a, it, res, rn, cl, cd):
-        A = D["angles"].setdefault(float(a), dict(it=[], res=[], rn=[], cl=[], cd=[]))
+    def _res_add(D, a, it, res, rn, cl, cd, cfl=None):
+        A = D["angles"].setdefault(float(a), dict(it=[], res=[], rn=[], cl=[], cd=[], cfl=[]))
         if A["it"] and it <= A["it"][-1]:          # угол пересчитывается заново
             for v in A.values():
                 v.clear()
         A["it"].append(it); A["res"].append(res); A["rn"].append(rn); A["cl"].append(cl); A["cd"].append(cd)
+        A["cfl"].append(np.nan if cfl is None else float(cfl))
         D["last"] = (float(a), it, cl, cd)
 
     def _on_iter(self, d):
@@ -2168,7 +2237,7 @@ class App(tk.Tk):
             L["events"].append((float(d["alpha"]), int(d["it"]), d["event"]))
             self.status.set(f"α = {d['alpha']:g}°, итерация {d['it']}: {d['event']}")
             return
-        self._res_add(L, d["alpha"], d["it"], d["res"], d["rn"], d["cl"], d["cd"])
+        self._res_add(L, d["alpha"], d["it"], d["res"], d["rn"], d["cl"], d["cd"], d.get("cfl"))
         L["rref"] = max(L["rref"], d["rref"])
         if d.get("r_fs"):
             L.setdefault("r_fs", {})[float(d["alpha"])] = float(d["r_fs"])
@@ -2188,7 +2257,9 @@ class App(tk.Tk):
                     if H is None or not len(H["it"]):
                         continue
                     for j in range(len(H["it"])):
-                        self._res_add(D, a, int(H["it"][j]), H["res"][j], H["rn"][j], H["cl"][j], H["cd"][j])
+                        cf_ = H.get("cfl") or []
+                        self._res_add(D, a, int(H["it"][j]), H["res"][j], H["rn"][j], H["cl"][j], H["cd"][j],
+                                      cf_[j] if j < len(cf_) else None)
                     D["rref"] = max(D["rref"], H.get("rref", 1.0))
                     if H.get("r_fs"):
                         D.setdefault("r_fs", {})[float(a)] = float(H["r_fs"])
@@ -2198,6 +2269,7 @@ class App(tk.Tk):
 
     def plot_res(self):
         import time as _t
+        import matplotlib as mpl
         self._res_drawn = _t.time()
         fig = self.res_fig
         fig.clear()
@@ -2207,6 +2279,7 @@ class App(tk.Tk):
             ax.text(0.5, 0.5, "Ход невязок появится во время расчёта RANS", ha="center", va="center",
                     transform=ax.transAxes, color="#555")
             ax.set_axis_off()
+            self.res_state.set("")
             self.res_canvas.draw_idle()
             return
         angs = sorted(D["angles"])
@@ -2223,65 +2296,88 @@ class App(tk.Tk):
         names = ["неразрывность", "импульс x", "импульс y", "энергия", "турбулентность ν̃", "переход ñ", "перемежаемость γ"]
         if any(np.array(D["angles"][a_]["res"]).shape[1] == 6 for a_ in angs):      # k-ω SST
             names = names[:4] + ["турбулентность k", "диссипация ω"]
-        import matplotlib as mpl
-        cmap = mpl.colormaps["turbo"]
         show = angs if sel == "все углы" else [float(sel)]
         neq = max(np.array(D["angles"][a]["res"]).shape[1] for a in show)
-        # невязки по уравнениям — каждая на своём графике (у каждого уравнения свой масштаб)
-        nc_ = 3 if neq <= 5 else 4
-        gs = fig.add_gridspec(3, nc_, height_ratios=[1, 1, 0.9], hspace=0.45, wspace=0.3)
-        axs = [fig.add_subplot(gs[r_, c_]) for r_ in range(2) for c_ in range(nc_)]
-        ax2 = fig.add_subplot(gs[2, :])
-        for k, a in enumerate(show):
+        cmap = mpl.colormaps["viridis"]
+        cols = {a: (cmap(0.05 + 0.85 * k / max(1, len(show) - 1)) if len(show) > 1 else "#1f5fa8")
+                for k, a in enumerate(show)}
+
+        def style(ax_, small=False):
+            ax_.grid(alpha=0.25, which="major")
+            ax_.tick_params(labelsize=7 if small else 8)
+            for sp_ in ("top", "right"):
+                ax_.spines[sp_].set_visible(False)
+
+        # раскладка: сверху — сумма (главный график) и справа Cl, CFL; снизу — уравнения
+        gs = fig.add_gridspec(2, 1, height_ratios=[1.6, 1.0])
+        top = gs[0].subgridspec(2, 3, wspace=0.08, hspace=0.12)
+        ax1 = fig.add_subplot(top[:, :2])
+        ax_cl = fig.add_subplot(top[0, 2])
+        ax_cf = fig.add_subplot(top[1, 2], sharex=ax_cl)
+        bot = gs[1].subgridspec(1, neq)
+        axs = [fig.add_subplot(bot[0, j]) for j in range(neq)]
+        for a in show:
             A = D["angles"][a]
             R = np.array(A["res"])
-            col = cmap(0.1 + 0.8 * k / max(1, len(show) - 1)) if len(show) > 1 else "#1f77b4"
-            for j in range(R.shape[1]):
-                axs[j].semilogy(A["it"], R[:, j], "-", color=col, lw=1.0, label=f"α = {a:g}°" if j == 0 else None)
-            axs[neq].semilogy(A["it"], A["rn"], "-", color=col, lw=1.0)
-            ax2.plot(A["it"], A["cl"], "-", color=col, lw=1.2)
+            col = cols[a]
+            ax1.semilogy(A["it"], A["rn"], "-", color=col, lw=1.6, label=f"α = {a:g}°")
             if orders is not None and a in rfs:
-                axs[neq].axhline(10.0 ** (-orders) * rfs[a], color=col, ls="--", lw=0.9)
-        for j in range(neq):
-            axs[j].set_title(names[j], fontsize=8)
-        axs[neq].set_title("сумма" + (f"; пунктир — порог 10^−{orders:g}" if orders is not None else ""), fontsize=8)
-        for ax_ in axs[neq + 1:]:
-            ax_.set_axis_off()
-        for ax_ in axs[:neq + 1]:
-            ax_.grid(alpha=0.3, which="both")
-            ax_.tick_params(labelsize=7)
-        if len(show) > 1:
-            axs[0].legend(fontsize=6, ncol=2, loc="upper right")
-        cls = [A["cl"][len(A["cl"]) // 3:] for a, A in D["angles"].items() if a in show and A["cl"]]
+                ax1.axhline(10.0 ** (-orders) * rfs[a], color=col, ls="--", lw=0.9, alpha=0.8)
+            for j in range(R.shape[1]):
+                axs[j].semilogy(A["it"], R[:, j], "-", color=col, lw=0.9)
+            ax_cl.plot(A["it"], A["cl"], "-", color=col, lw=1.2)
+            cf_ = np.asarray(A.get("cfl", []), float)
+            if cf_.size and np.isfinite(cf_).any():
+                ax_cf.semilogy(A["it"], cf_, "-", color=col, lw=1.0)
+        ax1.set_title("Невязка (сумма по уравнениям)" +
+                      (f" — пунктир: порог 10^−{orders:g} от невязки потока" if orders is not None else ""),
+                      fontsize=9, loc="left")
+        ax1.set_xlabel("итерация Ньютона на угле", fontsize=8)
+        evs = [e for e in D.get("events", []) if sel == "все углы" or abs(e[0] - float(sel)) < 1e-9]
+        for k_, (a_, it_, txt) in enumerate(evs):
+            ax1.axvline(it_, color="#d9480f", lw=0.9, ls="-.", alpha=0.8,
+                        label="откат / отмена шага / ручное действие" if k_ == 0 else None)
+        style(ax1)
+        if len(show) <= 12 or evs:
+            ax1.legend(fontsize=7, ncol=2 if len(show) > 6 else 1, loc="upper right", framealpha=0.85)
+        # Cl (и Cd для одного угла), CFL
+        cls = [D["angles"][a]["cl"][len(D["angles"][a]["cl"]) // 3:] for a in show if D["angles"][a]["cl"]]
         allc = np.concatenate([np.asarray(c_, float) for c_ in cls if len(c_)]) if cls else np.array([])
         if allc.size:
             lo, hi = np.nanmin(allc), np.nanmax(allc)
-            ax2.set_ylim(lo - 0.1 * (hi - lo) - 0.01, hi + 0.1 * (hi - lo) + 0.01)
-        ax2.set_ylabel("Cl")
-        ax1 = axs[neq]
-        evs = [e for e in D.get("events", []) if sel == "все углы" or abs(e[0] - float(sel)) < 1e-9]
-        for k_, (a_, it_, txt) in enumerate(evs):
-            ax1.axvline(it_, color="#ff7f0e", lw=0.9, ls="-.", label="откат / ручное действие" if k_ == 0 else None)
-        if evs:
-            ax1.text(0.01, 0.02, f"последнее: α = {evs[-1][0]:g}°, итер. {evs[-1][1]}: {evs[-1][2]}",
-                     transform=ax1.transAxes, fontsize=7, color="#b35900")
-        if evs:
-            ax1.legend(fontsize=6, loc="upper right")
-        if sel != "все углы":                      # один угол — ещё Cd на второй оси
+            ax_cl.set_ylim(lo - 0.1 * (hi - lo) - 0.01, hi + 0.1 * (hi - lo) + 0.01)
+        ax_cl.set_title("Cl" + (" и Cd" if sel != "все углы" else ""), fontsize=9, loc="left")
+        if sel != "все углы":
             A = D["angles"][float(sel)]
-            ax3 = ax2.twinx()
-            ax3.plot(A["it"], A["cd"], "-", color="#d62728", lw=1.0)
-            ax3.set_ylabel("Cd", color="#d62728")
+            ax3 = ax_cl.twinx()
+            ax3.plot(A["it"], A["cd"], "-", color="#c92a2a", lw=1.0)
+            ax3.tick_params(labelsize=7, colors="#c92a2a")
             v_ = A["cd"][len(A["cd"]) // 3:]
             if len(v_):
                 lo, hi = float(np.nanmin(v_)), float(np.nanmax(v_))
                 ax3.set_ylim(lo - 0.1 * (hi - lo) - 1e-4, hi + 0.1 * (hi - lo) + 1e-4)
-        ax2.grid(alpha=0.3)
-        ax2.set_xlabel("итерация Ньютона на угле")
+        style(ax_cl, True)
+        ax_cl.tick_params(labelbottom=False)
+        ax_cf.set_title("CFL", fontsize=9, loc="left")
+        style(ax_cf, True)
+        ax_cf.set_xlabel("итерация", fontsize=8)
+        for j in range(neq):
+            axs[j].set_title(names[j] if j < len(names) else f"уравнение {j + 1}", fontsize=8, loc="left")
+            style(axs[j], True)
+        # строка состояния: где расчёт и сколько осталось до критерия
+        msg = ""
         if D["last"]:
             a, it, cl, cd = D["last"]
-            fig.suptitle(f"Невязки по уравнениям (ср. кв. по ячейкам). Последнее: α = {a:g}°, итерация {it}: "
-                         f"Cl = {cl:.4f}, Cd = {cd:.5f}", fontsize=9)
+            A = D["angles"].get(float(a))
+            msg = f"α = {a:g}°, итерация {it}:  Cl = {cl:.4f}, Cd = {cd:.5f}"
+            if A and A["rn"] and float(a) in rfs and orders is not None:
+                got = float(np.log10(max(rfs[float(a)], 1e-300) / max(A["rn"][-1], 1e-300)))
+                msg += f"   ·   невязка упала на {got:.1f} из {orders:g} порядков"
+            if A and A.get("cfl") and np.isfinite(A["cfl"][-1]):
+                msg += f"   ·   CFL {A['cfl'][-1]:.3g}"
+            if evs:
+                msg += f"   ·   последнее событие: α = {evs[-1][0]:g}°, итер. {evs[-1][1]} — {evs[-1][2]}"
+        self.res_state.set(msg)
         self.res_canvas.draw_idle()
 
     def _rans_polar_for_continue(self):
