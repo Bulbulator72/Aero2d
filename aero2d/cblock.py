@@ -1,5 +1,10 @@
 """Сетка RANS с С-блоком у каждого элемента (как С-сетка в ICEM CFD).
 
+Острая кромка со свободным следом: блок продолжается вдоль линии следа на ~1 хорду
+(как С-сетка Mavriplis / NASA): к концу разреза ячейки квадратные. Кромка в щели (разрез
+упирается в соседний элемент) и тупая кромка — короткий разрез и полоса за торцом
+(_cblock_slot). Размер треугольников на границе блока — по площади прилегающих ячеек.
+
 Около стенки — структурированный блок четырёхугольников: путь «низ разреза за
 задней кромкой → контур профиля → верх разреза», слои выдавливаются по
 сглаженным нормалям (каждый слой — от предыдущего). У острой задней кромки
@@ -77,7 +82,6 @@ def _coarsen_te(x, y, h):
         if len(ids) < 3:
             (out_up if side == 1 else out_lo).append(None)
             continue
-        last = ids[-1]
         m = max(1, int(round(acc / h)))
         pts = P[ids]
         sl = np.r_[0.0, np.cumsum(np.hypot(*np.diff(pts, axis=0).T))]
@@ -180,14 +184,34 @@ def _ratio_for(h1, t, n):
     return 0.5 * (lo + hi)
 
 
-def c_block(x, y, h0, ratio, t, smin, wake_len, obstacles=(), clearance=0.0, wake_growth=1.15,
+def c_block(x, y, h0, ratio, t, smin, wake_len, obstacles=(), wake_size=0.008, flow_dir=(1.0, 0.0),
             smooth=None):
     """См. _c_block; smooth=None — сглаживание нормалей подбирается: самое слабое, при
-    котором блок не выворачивается (у острой кромки над разрезом — вогнутый угол)."""
+    котором блок не выворачивается (у кромки над разрезом — вогнутый угол)."""
+    xx, yy = np.asarray(x, float), np.asarray(y, float)
+    if np.hypot(xx[0] - xx[-1], yy[0] - yy[-1]) < 1e-12:
+        xx, yy = xx[:-1], yy[:-1]
+    if 0.5 * np.sum(xx * np.roll(yy, -1) - np.roll(xx, -1) * yy) < 0:
+        xx, yy = np.r_[xx[:1], xx[1:][::-1]], np.r_[yy[:1], yy[1:][::-1]]
+    Pb = _find_base(xx, yy)
+    if Pb is not None and np.hypot(*(Pb[0] - Pb[-1])) > 2e-4 * float(np.ptp(xx)):
+        # тупая кромка: разрезы от обоих углов торца и полоса за торцом (как блок за торцом в
+        # PyAero) — O-обход углов торца с 5–17 точками на торце выворачивался
+        from . import _cblock_slot
+        b = _cblock_slot.c_block(x, y, h0, ratio, t, smin, 1.5 * t, obstacles)
+        b["out_size"] = _matched_sizes(b["nodes"], b["quads"], b["outline"])
+        return b
     err = None
     for sm in ((smooth,) if smooth is not None else (10, 30, 60, 120, 250)):
         try:
-            b = _c_block(x, y, h0, ratio, t, smin, wake_len, obstacles, clearance, wake_growth, sm)
+            b = _c_block(x, y, h0, ratio, t, smin, wake_len, obstacles, wake_size, flow_dir, sm)
+            if b.get("short"):
+                # кромка в щели: длинный блок следа не помещается — короткий разрез (как у
+                # NASA: след переднего элемента над закрылком разрешается сеткой вокруг закрылка)
+                from . import _cblock_slot
+                b = _cblock_slot.c_block(x, y, h0, ratio, t, smin, 1.5 * t, obstacles)
+                b["out_size"] = _matched_sizes(b["nodes"], b["quads"], b["outline"])
+                return b
             b["smooth"] = sm
             return b
         except BlockError as e:
@@ -197,169 +221,19 @@ def c_block(x, y, h0, ratio, t, smin, wake_len, obstacles=(), clearance=0.0, wak
     raise err
 
 
-def _c_block(x, y, h0, ratio, t, smin, wake_len, obstacles=(), clearance=0.0, wake_growth=1.15,
-             smooth=3, te_min=None):
-    """Структурированный С-блок вокруг одного элемента.
-
-    x, y — замкнутый контур, первая точка — задняя кромка (без повтора в конце).
-    obstacles — отрезки (m,2,2) других тел: разрез укорачивается, чтобы до них
-    оставалось не меньше clearance. Возвращает dict: nodes (n,2), quads (k,4),
-    wall (рёбра стенки, пары узлов), outline (замкнутый контур блока, индексы узлов),
-    out_size (размер треугольников у каждой точки outline)."""
-    x, y = np.asarray(x, float), np.asarray(y, float)
-    x_in, y_in = x.copy(), y.copy()
-    if np.hypot(x[0] - x[-1], y[0] - y[-1]) < 1e-12:
-        x, y = x[:-1], y[:-1]
-    area = 0.5 * np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y)
-    if area < 0:                                   # против часовой: снаружи — справа по обходу
-        x, y = np.r_[x[:1], x[1:][::-1]], np.r_[y[:1], y[1:][::-1]]
-    Pb = _find_base(x, y)
-    # тупая задняя кромка — полоса за торцом; торец тоньше 0,02 % хорды (численный след
-    # построения контура) — как острая кромка
-    if Pb is not None and np.hypot(*(Pb[0] - Pb[-1])) > 2e-4 * float(np.ptp(x)):
-        return _c_block_blunt(Pb, h0, ratio, t, smin, wake_len, obstacles, wake_growth, smooth, te_min)
-    # --- толщина слоя t (по самой узкой щели), число слоёв n у всех столбцов одно
-    n = int(np.ceil(np.log(1 + t * (ratio - 1) / h0) / np.log(ratio)))
-    t_min = 1.5 * h0 * n
-    obst = np.asarray(obstacles) if len(obstacles) else None
-
-    def thickness(P):
-        # одна толщина на весь блок (t уже ограничена самой узкой щелью): переменная
-        # толщина давала свои перепады на стыках толстых и тонких участков
-        return np.full(len(P), max(t, t_min))
-
-    def h_top(T):
-        T = np.atleast_1d(T)
-        qq = np.array([_ratio_for(h0, Ti, n) for Ti in T])
-        return h0 * qq ** (n - 1)
-    P0 = np.column_stack([x, y])
-    T0 = thickness(P0)
-    x, y = _coarsen_te(x, y, te_min if te_min else 1.2 * float(h_top(T0[0])[0]))
-    P0 = np.column_stack([x, y])
-    T0 = thickness(P0)
-    # шаг вдоль поверхности не больше 2,5 высоты верхнего ряда (ячейки у границы блока
-    # близки к квадратным — иначе к их широкому верху примыкают треугольники крупнее)
-    cap = np.clip(4.0 * h_top(np.minimum(T0, np.roll(T0, -1))), 0.4 * smin, smin)
-    if obst is not None:
-        # в щели между блоками на треугольники остаётся полоса ≈ 0,4 зазора — шаг блока
-        # не крупнее её (иначе к широким верхним ячейкам примыкают мелкие треугольники)
-        mid = 0.5 * (P0 + np.roll(P0, -1, axis=0))
-        cap = np.minimum(cap, np.maximum(0.4 * _seg_dist(mid, obst), 0.1 * smin))
-    if te_min:                                   # шаг у кромки задан (короткий разрез в щели)
-        cap[0], cap[-1] = min(cap[0], te_min), min(cap[-1], te_min)
-    sx, sy = _subdivide(x, y, cap)
-    S = np.column_stack([sx, sy])
-    M = len(S)
-    TS = thickness(S)
-    # где шаг вдоль поверхности мелкий (носок, кромка), слой тоньше: верхний ряд не выше
-    # 1,5 шага — иначе узкие высокие ячейки у границы блока и крошечные треугольники над ними;
-    # толщины соседних столбцов различаются не больше чем в 1,2 раза
-    wS = np.hypot(*np.diff(np.vstack([S, S[:1]]), axis=0).T)
-    wS = np.minimum(wS, np.roll(wS, 1))
-    Tg = np.geomspace(t_min, max(t, t_min), 60)
-    Hg = h_top(Tg)
-    TS = np.minimum(TS, np.interp(1.5 * wS, Hg, Tg, left=t_min, right=t))
-    for _ in range(len(S)):
-        T2 = np.minimum(TS, 1.2 * np.minimum(np.roll(TS, 1), np.roll(TS, -1)))
-        if np.allclose(T2, TS):
-            break
-        TS = T2
-    # --- разрез за задней кромкой
-    t1, t2 = S[1] - S[0], S[-1] - S[0]
-    u = -(t1 / np.linalg.norm(t1) + t2 / np.linalg.norm(t2))
-    if np.linalg.norm(u) < 1e-9:
-        raise BlockError("задняя кромка не острая")
-    u /= np.linalg.norm(u)
-    w0 = 0.5 * (np.linalg.norm(t1) + np.linalg.norm(t2))
-    T_te = float(TS[0])
-    L = 30 * T_te                                # не длиннее; ниже — по соседним телам
-    if obst is not None:
-        dd = np.linspace(0.0, L, 200)[1:]
-        cl = _seg_dist(S[0] + dd[:, None] * u, obst)
-        bad = np.where(cl < 1.6 * T_te)[0]       # свой слой + слой соседа (≤ 0,3 зазора) + запас
-        if len(bad):
-            L = dd[bad[0]] * 0.8
-    # шаг вдоль разреза: от шага контура у кромки к высоте ряда в конце разреза (там ячейки
-    # почти квадратные — к торцу блока примыкают треугольники того же размера); соседние
-    # шаги различаются не больше чем в wake_growth раз, длина разреза — под это
-    h_end = T_te / n
-    need = (w0 - h_end) / (1 - 1 / wake_growth) + 4 * h_end
-    if L < need and te_min is None:
-        # разрез укорочен соседним телом: шаг у кромки мельче — чтобы вдоль разреза шаг сходился
-        # к конечному плавно, а не «сжимался» (скачок ширины столбцов у самой кромки)
-        w_fit = h_end + max(L - 4 * h_end, 0.0) * (1 - 1 / wake_growth)
-        return _c_block(x_in, y_in, h0, ratio, t, smin, wake_len, obstacles, clearance, wake_growth, smooth,
-                        te_min=max(w_fit, h_end))
-    L = min(L, max(wake_len, need))
-    if L < 3 * max(min(w0, L / 3), h_end):
-        raise BlockError("нет места для разреза за кромкой")
-    d, s_ = [], w0
-    while not d or d[-1] < L:
-        d.append((d[-1] if d else 0.0) + s_)
-        s_ = max(s_ / wake_growth, h_end) if s_ > h_end else min(s_ * wake_growth, h_end)
-    d = np.array(d) * (L / d[-1])
-    W = S[0] + d[:, None] * u
-    K = len(W)
-    # --- путь: верх разреза (от конца к кромке), контур, кромка ещё раз, низ разреза
-    path = np.vstack([W[::-1], S, S[:1], W])
-    base = np.r_[np.arange(K)[::-1] + M, np.arange(M), 0, np.arange(K) + M]   # узлы слоя 0
-    dist = np.r_[d[::-1], np.zeros(M + 1), d]                                 # расстояние по разрезу
-    Np = len(path)
-    # --- слои: одинаковое число n у всех столбцов, высота первой ячейки на разрезе растёт
-    h1 = h0 * (h_end / h0) ** np.clip(dist / L, 0.0, 1.0)
-    Tp = np.r_[np.full(K, T_te), TS, TS[:1], np.full(K, T_te)]
-    q = np.array([_ratio_for(h, Ti, n) for h, Ti in zip(h1, Tp)])
+def _layers_z(h1, T, n):
+    """Высоты узлов столбцов: n слоёв, первый h1, сумма T (геометрическая прогрессия)."""
+    q = np.array([_ratio_for(h, Ti, n) for h, Ti in zip(h1, T)])
     j = np.arange(n + 1)
-    z = np.where(np.abs(q - 1)[:, None] < 1e-12, h1[:, None] * j[None],
-                 h1[:, None] * (q[:, None] ** j[None] - 1) / np.where(np.abs(q - 1) < 1e-12, 1, q - 1)[:, None])
-    # --- выдавливание слоёв по сглаженным нормалям
-    layers = [path.copy()]
-    for k in range(1, n + 1):
-        P = layers[-1]
-        tg = np.empty_like(P)
-        tg[1:-1] = P[2:] - P[:-2]
-        tg[0], tg[-1] = P[1] - P[0], P[-1] - P[-2]
-        nr = np.column_stack([tg[:, 1], -tg[:, 0]])
-        nr /= np.maximum(np.linalg.norm(nr, axis=1), 1e-300)[:, None]
-        for _ in range(smooth):
-            sm = nr.copy()
-            sm[1:-1] = nr[:-2] + 2 * nr[1:-1] + nr[2:]
-            nr = sm / np.maximum(np.linalg.norm(sm, axis=1), 1e-300)[:, None]
-        layers.append(P + nr * (z[:, k] - z[:, k - 1])[:, None])
-    # --- узлы и ячейки
-    nb = M + K
-    nodes = np.vstack([S, W] + [Lr for Lr in layers[1:]])
-    idx = np.empty((n + 1, Np), int)
-    idx[0] = base
-    for k in range(1, n + 1):
-        idx[k] = nb + (k - 1) * Np + np.arange(Np)
-    quads = np.stack([idx[:-1, :-1], idx[:-1, 1:], idx[1:, 1:], idx[1:, :-1]], axis=-1).reshape(-1, 4)
-    # проверка: все четырёхугольники выпуклые и одной ориентации
-    P = nodes[quads]
-    e1 = np.roll(P, -1, axis=1) - P
-    e0 = P - np.roll(P, 1, axis=1)
-    cr = e0[..., 0] * e1[..., 1] - e0[..., 1] * e1[..., 0]
-    sgn = np.sign(np.median(cr))
-    if not np.all(cr * sgn > 0):
-        badq = np.where(np.any(cr * sgn <= 0, axis=1))[0]
-        c = P[badq].mean(1)
-        lay = badq // (Np - 1)
-        raise BlockError(f"блок вывернулся: {len(badq)} ячеек, например у ({c[0, 0]:.4f}; {c[0, 1]:.4f}), "
-                         f"слои {lay.min()}–{lay.max()}")
-    wall = [(base[K + i], base[K + i + 1]) for i in range(M)]       # контур, включая S_{M-1} → S_0
-    outline = list(idx[n]) + list(idx[n - 1:0:-1, -1]) + [idx[0, -1]] + list(idx[1:n, 0])
-    # размер треугольников у границы блока: шаг вдоль крайнего ряда, но не меньше его высоты
-    top = layers[-1]
-    ds = np.hypot(*np.diff(top, axis=0).T)
-    w_top = np.r_[ds[0], np.maximum(ds[:-1], ds[1:]), ds[-1]]
-    h_top = z[:, n] - z[:, n - 1]
-    size_top = np.maximum(w_top, 1.2 * h_top)
-    hh = np.diff(z, axis=1)
-    size_end_lo = [hh[-1, k] for k in range(n - 1, 0, -1)] + [hh[-1, 0]]
-    size_end_up = [hh[0, k] for k in range(1, n)]
-    out_size = list(size_top) + size_end_lo + size_end_up
-    return dict(nodes=nodes, quads=quads, wall=wall, outline=outline, out_size=np.array(out_size),
-                layers=n, wake_len=L)
+    qm = np.where(np.abs(q - 1) < 1e-12, 2.0, q)
+    return np.where(np.abs(q - 1)[:, None] < 1e-12, h1[:, None] * j[None],
+                    h1[:, None] * (qm[:, None] ** j[None] - 1) / (qm - 1)[:, None])
+
+
+def _thick_for_top(h1, top, n):
+    """Толщина n слоёв с первым h1 и последним top."""
+    q = (np.maximum(top, h1) / h1) ** (1.0 / max(n - 1, 1))
+    return np.where(np.abs(q - 1) < 1e-9, n * h1, h1 * (q ** n - 1) / np.where(np.abs(q - 1) < 1e-9, 1, q - 1))
 
 
 def _march(path, z, smooth):
@@ -392,145 +266,204 @@ def _check(nodes, quads, what):
         raise BlockError(f"блок вывернулся ({what}): {bad.sum()} ячеек, например у ({c[0, 0]:.4f}; {c[0, 1]:.4f})")
 
 
-def _layers_z(h1, T, n):
-    q = np.array([_ratio_for(h, Ti, n) for h, Ti in zip(h1, T)])
-    j = np.arange(n + 1)
-    qm = np.where(np.abs(q - 1) < 1e-12, 1.0, q)
-    return np.where(np.abs(q - 1)[:, None] < 1e-12, h1[:, None] * j[None],
-                    h1[:, None] * (qm[:, None] ** j[None] - 1) / np.where(np.abs(q - 1) < 1e-12, 1, q - 1)[:, None])
+def _c_block(x, y, h0, ratio, t, smin, wake_len, obstacles=(), wake_size=0.008, flow_dir=(1.0, 0.0),
+             smooth=10, wake_growth=1.12, te_w=None):
+    """С-блок четырёхугольников вокруг одного элемента и вдоль его следа (как С-сетка с
+    разрезом в ICEM / гиперболическая С-сетка Mavriplis): путь «верх разреза → контур →
+    низ разреза», слои — по сглаженным нормалям. Разрез — линия следа от острой задней
+    кромки: сначала по биссектрисе кромки, затем по направлению потока flow_dir; длина до
+    wake_len, но разрез укорачивается, если блок подходит к другим элементам. Вдоль следа
+    шаг растёт не быстрее wake_growth до wake_size, первая ячейка — от высоты у стенки до
+    шага следа: к концу разреза ячейки квадратные, и треугольники примыкают без скачка.
 
-
-def _c_block_blunt(Pb, h0, ratio, t, smin, wake_len, obstacles=(), wake_growth=1.15, smooth=10, te_min=None):
-    """С-блок для тупой задней кромки: разрезы от верхнего и нижнего углов торца по
-    потоку, С-блок «верхний разрез → контур → нижний разрез» и структурированная полоса
-    между разрезами за торцом (торец — стенка). Ряды полосы сгущаются к разрезам так же,
-    как первые ячейки С-блока по ту сторону разреза."""
+    x, y — замкнутый контур, первая точка — задняя кромка (без повтора в конце).
+    Возвращает dict: nodes, quads, wall (рёбра стенки), outline (контур блока, индексы
+    узлов), out_size (размер треугольников у точек outline)."""
+    x, y = np.asarray(x, float), np.asarray(y, float)
+    if np.hypot(x[0] - x[-1], y[0] - y[-1]) < 1e-12:
+        x, y = x[:-1], y[:-1]
+    area = 0.5 * np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y)
+    if area < 0:                                   # против часовой: снаружи — справа по обходу
+        x, y = np.r_[x[:1], x[1:][::-1]], np.r_[y[:1], y[1:][::-1]]
+    c_el = float(np.ptp(x))
     n = int(np.ceil(np.log(1 + t * (ratio - 1) / h0) / np.log(ratio)))
     t_min = 1.5 * h0 * n
     t = max(t, t_min)
     obst = np.asarray(obstacles) if len(obstacles) else None
-
-    def h_top(T):
-        T = np.atleast_1d(T)
-        return h0 * np.array([_ratio_for(h0, Ti, n) for Ti in T]) ** (n - 1)
-    ht = float(h_top(t)[0])
-    h_te = te_min if te_min else 1.2 * ht
-    P = _coarsen_start(Pb, h_te)
-    P = _coarsen_start(P[::-1], h_te)[::-1]
-    cap = np.full(len(P) - 1, float(np.clip(4.0 * ht, 0.4 * smin, smin)))
+    ht = float(h0 * _ratio_for(h0, t, n) ** (n - 1))           # верхний ряд у стенки
+    blunt = False                                  # тупые кромки — в c_block (_cblock_slot)
+    x, y = _coarsen_te(x, y, te_w or 1.2 * ht)
+    loop = np.column_stack([x, y])
+    fixed = np.zeros(len(loop), bool)
+    t1, t2 = loop[1] - loop[0], loop[-1] - loop[0]
+    u = -(t1 / np.linalg.norm(t1) + t2 / np.linalg.norm(t2))
+    w_te = 0.5 * (np.linalg.norm(t1) + np.linalg.norm(t2))
+    if np.linalg.norm(u) < 1e-9:
+        raise BlockError("не определить направление разреза за кромкой")
+    u /= np.linalg.norm(u)
+    seg = np.hypot(*np.diff(np.vstack([loop, loop[:1]]), axis=0).T)
+    cap = np.full(len(loop), float(np.clip(4.0 * ht, 0.4 * smin, smin)))
     if obst is not None:
-        mid = 0.5 * (P[1:] + P[:-1])
+        # в щели на треугольники остаётся полоса ≈ 0,4 зазора — шаг блока не крупнее её
+        mid = 0.5 * (loop + np.roll(loop, -1, axis=0))
         cap = np.minimum(cap, np.maximum(0.4 * _seg_dist(mid, obst), 0.1 * smin))
-    if te_min:
-        cap[0], cap[-1] = min(cap[0], te_min), min(cap[-1], te_min)
-    sx, sy = _subdivide(P[:, 0], P[:, 1], cap, closed=False)
+    if te_w:
+        cap[0], cap[-1] = min(cap[0], te_w), min(cap[-1], te_w)
+    cap = np.where(fixed, np.maximum(seg, 1e-12), cap)
+    sx, sy = _subdivide(loop[:, 0], loop[:, 1], cap)
     S = np.column_stack([sx, sy])
     M = len(S)
-    Pu, Pl = S[0], S[-1]
-    tb = float(np.hypot(*(Pu - Pl)))
-    nh = max(1, int(np.ceil(np.log(1 + 0.5 * tb * (ratio - 1) / h0) / np.log(ratio))))
-    mb = 2 * nh
-    # толщина: тоньше, где шаг вдоль поверхности мелкий (верхний ряд не выше 1,5 шага), и у
-    # торца — такая, чтобы в конце разреза ряды С-блока совпали с рядами полосы (tb/mb)
-    seg = np.hypot(*np.diff(S, axis=0).T)
-    wS = np.minimum(np.r_[seg[0], seg], np.r_[seg, seg[-1]])
+    # толщина у стенки: тоньше, где шаг вдоль поверхности мелкий (верхний ряд ≤ 1,5 шага)
+    wS = np.hypot(*np.diff(np.vstack([S, S[:1]]), axis=0).T)
+    wS = np.minimum(wS, np.roll(wS, 1))
     Tg = np.geomspace(t_min, t, 60)
-    TS = np.interp(1.5 * wS, h_top(Tg), Tg, left=t_min, right=t)
-    T_end = float(np.clip(n * tb / mb, t_min, t))
-    TS[0], TS[-1] = min(TS[0], T_end), min(TS[-1], T_end)
+    Hg = np.array([h0 * _ratio_for(h0, Ti, n) ** (n - 1) for Ti in Tg])
+    TS = np.interp(1.5 * wS, Hg, Tg, left=t_min, right=t)
     for _ in range(M):
-        nb_ = np.minimum(np.r_[TS[0], TS[:-1]], np.r_[TS[1:], TS[-1]])
-        T2 = np.minimum(TS, 1.2 * nb_)
+        T2 = np.minimum(TS, 1.2 * np.minimum(np.roll(TS, 1), np.roll(TS, -1)))
         if np.allclose(T2, TS):
             break
         TS = T2
-    tu, tl = S[0] - S[1], S[-1] - S[-2]
-    u = tu / np.linalg.norm(tu) + tl / np.linalg.norm(tl)
-    if np.linalg.norm(u) < 1e-9:
-        raise BlockError("не определить направление разреза за торцом")
-    u /= np.linalg.norm(u)
-    w0 = 0.5 * (np.linalg.norm(tu) + np.linalg.norm(tl))
-    T_te = float(min(TS[0], TS[-1]))
-    h_cut = min(T_te / n, tb / mb)
-    L = 30 * T_te
-    if obst is not None:
-        dd = np.linspace(0.0, L, 200)[1:]
-        cl = np.minimum(_seg_dist(Pu + dd[:, None] * u, obst), _seg_dist(Pl + dd[:, None] * u, obst))
-        bad = np.where(cl < 1.6 * T_te)[0]
-        if len(bad):
-            L = dd[bad[0]] * 0.8
-    need = (w0 - h_cut) / (1 - 1 / wake_growth) + 4 * h_cut
-    if L < need and te_min is None:            # короткий разрез в щели — мельче шаг у торца
-        w_fit = h_cut + max(L - 4 * h_cut, 0.0) * (1 - 1 / wake_growth)
-        return _c_block_blunt(Pb, h0, ratio, t, smin, wake_len, obstacles, wake_growth, smooth,
-                              te_min=max(w_fit, h_cut))
-    L = min(L, max(wake_len, need))
-    if L < 3 * max(min(w0, L / 3), h_cut):
-        raise BlockError("нет места для разреза за торцом")
-    d, s_ = [], w0
-    while not d or d[-1] < L:
-        d.append((d[-1] if d else 0.0) + s_)
-        s_ = max(s_ / wake_growth, h_cut) if s_ > h_cut else min(s_ * wake_growth, h_cut)
-    d = np.array(d) * (L / d[-1])
-    K = len(d)
-    Wu, Wl = Pu + d[:, None] * u, Pl + d[:, None] * u
-    # --- С-блок
-    path = np.vstack([Wu[::-1], S, Wl])
-    Np = len(path)
-    base = np.r_[(M + np.arange(K))[::-1], np.arange(M), M + K + np.arange(K)]
-    dist = np.r_[d[::-1], np.zeros(M), d]
-    h1 = h0 * (h_cut / h0) ** np.clip(dist / L, 0.0, 1.0)
-    Tp = np.r_[np.full(K, TS[0]), TS, np.full(K, TS[-1])]
-    z = _layers_z(h1, Tp, n)
-    layers = _march(path, z, smooth)
-    # --- полоса за торцом: столбцы k = 0 (торец) … K, ряды j = 0 (верхний разрез) … mb
-    dk = np.r_[0.0, d]
-    h1s = h0 * (h_cut / h0) ** np.clip(dk / L, 0.0, 1.0)
-    zs = _layers_z(h1s, np.full(K + 1, 0.5 * tb), nh)                 # (K+1, nh+1) от разреза
-    A = np.vstack([Pu[None], Wu])
-    B = np.vstack([Pl[None], Wl])
-    e = (B - A) / tb
-    strip = []
-    for j in range(1, mb):
-        strip.append(A + e * zs[:, j:j + 1] if j <= nh else B - e * zs[:, mb - j:mb - j + 1])
-    strip = np.stack(strip, 1)                                         # (K+1, mb-1, 2)
-    off_s = M + 2 * K
-    off_c = off_s + (K + 1) * (mb - 1)
+    T0 = float(TS[0])
+    h_top0 = float(h0 * _ratio_for(h0, T0, n) ** (n - 1))
+    # --- линия следа: биссектриса кромки, затем — направление потока
+    f = np.asarray(flow_dir, float)
+    f /= np.linalg.norm(f)
+    turn = 0.25 * c_el                                   # длина плавного поворота линии следа
 
-    def G(k, j):
-        if j == 0:
-            return 0 if k == 0 else M + k - 1
-        if j == mb:
-            return M - 1 if k == 0 else M + K + k - 1
-        return off_s + k * (mb - 1) + (j - 1)
-    sq = np.array([[G(k, j), G(k + 1, j), G(k + 1, j + 1), G(k, j + 1)] for k in range(K) for j in range(mb)])
+    def centerline(L, step):
+        k = max(2, int(np.ceil(L / step)))
+        pts, p, d = [S[0]], S[0].copy(), 0.0
+        for _ in range(k):
+            b = min(d / turn, 1.0)
+            b = b * b * (3 - 2 * b)
+            dv = (1 - b) * u + b * f
+            p = p + dv / np.linalg.norm(dv) * (L / k)
+            d += L / k
+            pts.append(p)
+        P_ = np.array(pts)
+        sl = np.r_[0.0, np.cumsum(np.hypot(*np.diff(P_, axis=0).T))]
+        return P_, sl
+
+    # длина разреза: до места, где блок (толщиной T0) подошёл бы к соседнему телу
+    P_c, sl = centerline(float(wake_len), min(w_te, 0.002 * c_el))
+    clr = _seg_dist(P_c, obst) if obst is not None else np.full(len(P_c), np.inf)
+    # до соседнего тела: свой блок + его блок (≤ T0) + полоса треугольников ⇒ ≥ 3·T0
+    bad = np.where(clr < 3.0 * T0)[0]
+    L_try = float(wake_len) if not len(bad) else 0.8 * float(sl[bad[0]])
+    clr_l = lambda dd: np.interp(dd, sl, clr)
+    # к концу разреза — квадратные ячейки шага s_e: не крупнее wake_size, ~0,1 длины и
+    # места до соседа; блок не тоньше, чем у стенки (T0)
+    # и блок следа (≈ n·s_e) не толще 0,3 радиуса поворота линии следа — иначе на вогнутой
+    # стороне изгиба слои сжимаются
+    s_e = float(max(min(wake_size, max(w_te, 0.1 * L_try), float(np.min(clr_l(np.linspace(0, L_try, 50)))) / (3.0 * n),
+                        0.3 * turn / n), T0 / n))
+    need = (max(w_te, s_e) - min(w_te, s_e)) / (1 - 1 / wake_growth) + 4 * s_e
+    if L_try < need and te_w is None and w_te > s_e:
+        # короткий разрез (щель): шаг у кромки мельче, чтобы вдоль разреза он рос плавно
+        w_fit = s_e + max(L_try - 4 * s_e, 0.0) * (1 - 1 / wake_growth)
+        return dict(short=max(w_fit, s_e))
+    if L_try < 3 * max(min(w_te, s_e), h0):
+        raise BlockError("нет места для разреза за кромкой")
+    d, s_ = [], w_te
+    while not d or d[-1] < L_try:
+        d.append((d[-1] if d else 0.0) + s_)
+        s_ = min(s_ * wake_growth, s_e) if s_ < s_e else max(s_ / wake_growth, s_e)
+    d = np.array(d) * (L_try / d[-1])
+    sk = np.diff(np.r_[0.0, d])
+    xi = d / L_try
+    # первая ячейка растёт от h0 к s_e не быстрее 1,8 на столбец (на коротком разрезе в щели
+    # прежний рост «по доле длины» давал скачки высоты соседних столбцов в разы)
+    h1w = np.minimum(h0 * (s_e / h0) ** xi, h0 * 1.8 ** (np.arange(len(d)) + 1))
+    top = np.maximum(sk, h_top0 * (1 - xi) + s_e * xi)
+    Tw = np.maximum(_thick_for_top(h1w, top, n), T0 * (1 - xi))
+    Tw = np.minimum(Tw, np.maximum(clr_l(d) / 3.0, T0))
+    W = np.column_stack([np.interp(d, sl, P_c[:, 0]), np.interp(d, sl, P_c[:, 1])])
+    K = len(W)
+    # --- путь: верх разреза (от конца к кромке), контур, кромка ещё раз, низ разреза
+    path = np.vstack([W[::-1], S, S[:1], W])
+    base = np.r_[np.arange(K)[::-1] + M, np.arange(M), 0, np.arange(K) + M]
+    Np = len(path)
+    h1 = np.r_[h1w[::-1], np.full(M + 1, h0), h1w]
+    Tp = np.r_[Tw[::-1], TS, TS[:1], Tw]
+    # верхний ряд каждого столбца следа не выше его ширины (иначе у контура блока узкие высокие
+    # ячейки, и треугольники на их коротких рёбрах в разы мельче), толщины соседних столбцов
+    # различаются не больше чем в 1,2 раза — без ступенек на стыке стенки и следа
+    wp = np.hypot(*np.diff(path, axis=0).T)
+    wcol = np.minimum(np.r_[wp[0], wp], np.r_[wp, wp[-1]])
+    Tcap = np.maximum(_thick_for_top(h1, 1.0 * wcol, n), 1.05 * n * h1)
+    in_wake = np.r_[np.ones(K, bool), np.zeros(M + 1, bool), np.ones(K, bool)]
+    Tp = np.where(in_wake, np.minimum(Tp, Tcap), Tp)          # у стенки толщина — по TS
+    for _ in range(Np):
+        T2 = np.minimum(Tp, 1.2 * np.minimum(np.r_[Tp[0], Tp[:-1]], np.r_[Tp[1:], Tp[-1]]))
+        if np.allclose(T2, Tp):
+            break
+        Tp = T2
+    z = _layers_z(h1, np.maximum(Tp, 1.05 * n * h1), n)
+    layers = _march(path, z, smooth)
+    nb = M + K
+    nodes = np.vstack([S, W] + layers[1:])
     idx = np.empty((n + 1, Np), int)
     idx[0] = base
     for k in range(1, n + 1):
-        idx[k] = off_c + (k - 1) * Np + np.arange(Np)
-    cq = np.stack([idx[:-1, :-1], idx[:-1, 1:], idx[1:, 1:], idx[1:, :-1]], axis=-1).reshape(-1, 4)
-    nodes = np.vstack([S, Wu, Wl, strip.reshape(-1, 2)] + layers[1:])
-    _check(nodes, cq, "у стенки")
-    _check(nodes, sq, "за торцом")
-    wall = [(i, i + 1) for i in range(M - 1)] + [(G(0, j), G(0, j + 1)) for j in range(mb)]
-    end_strip = [G(K, j) for j in range(mb - 1, 0, -1)]
-    outline = list(idx[n]) + list(idx[n - 1:0:-1, -1]) + [idx[0, -1]] + end_strip + [idx[0, 0]] + list(idx[1:n, 0])
-    top = layers[-1]
-    ds_ = np.hypot(*np.diff(top, axis=0).T)
-    w_top = np.r_[ds_[0], np.maximum(ds_[:-1], ds_[1:]), ds_[-1]]
-    hh = np.diff(z, axis=1)
-    size_top = np.maximum(w_top, 1.2 * hh[:, -1])
-    end_pts = nodes[[idx[0, -1]] + end_strip + [idx[0, 0]]]
-    es = np.hypot(*np.diff(end_pts, axis=0).T)
-    size_strip = list(np.maximum(es[:-1], es[1:]))
-    out_size = (list(size_top) + [hh[-1, k] for k in range(n - 1, 0, -1)] + [max(hh[-1, 0], es[0])]
-                + size_strip + [max(hh[0, 0], es[-1])] + [hh[0, k] for k in range(1, n)])
-    return dict(nodes=nodes, quads=np.vstack([cq, sq]), wall=wall, outline=outline,
-                out_size=np.array(out_size), layers=n, wake_len=L, blunt=tb)
+        idx[k] = nb + (k - 1) * Np + np.arange(Np)
+    quads = np.stack([idx[:-1, :-1], idx[:-1, 1:], idx[1:, 1:], idx[1:, :-1]], axis=-1).reshape(-1, 4)
+    _check(nodes, quads, "у стенки и в следе")
+    wall = [(base[K + i], base[K + i + 1]) for i in range(M)]
+    outline = list(idx[n]) + list(idx[n - 1:0:-1, -1]) + [idx[0, -1]] + list(idx[1:n, 0])
+    out_size = _matched_sizes(nodes, quads, outline)
+    return dict(nodes=nodes, quads=quads, wall=wall, outline=outline, out_size=out_size,
+                layers=n, wake_len=L_try, blunt=blunt)
+
+
+def _matched_sizes(nodes, quads, outline):
+    """Размер треугольников у каждой точки контура блока — по площади прилегающих к контуру
+    ячеек блока: треугольник площадью ≈ 0,433·s² той же площади (Volume change ≈ 1 на стыке)."""
+    P = nodes[quads]
+    area = 0.5 * np.abs(np.sum(P[:, :, 0] * np.roll(P[:, :, 1], -1, 1) - np.roll(P[:, :, 0], -1, 1) * P[:, :, 1], 1))
+    edge_cell = {}
+    for c, q in enumerate(quads):
+        for a, b in zip(q, np.roll(q, -1)):
+            edge_cell[(min(a, b), max(a, b))] = c
+    no = len(outline)
+    ea = np.zeros(no)
+    for k in range(no):
+        a, b = outline[k], outline[(k + 1) % no]
+        c = edge_cell.get((min(a, b), max(a, b)))
+        ea[k] = area[c] if c is not None else np.nan
+    ea = np.where(np.isfinite(ea), ea, np.nanmedian(ea))
+    s_ = np.sqrt(ea / 0.433)
+    s_ = 0.5 * (s_ + np.roll(s_, 1))
+    Pq = nodes[outline]
+    el = np.hypot(*(np.roll(Pq, -1, axis=0) - Pq).T)
+    return np.minimum(s_, 1.3 * np.maximum(el, np.roll(el, 1)))
+
+
+def _crosses(A, B):
+    """Пересекаются ли замкнутые ломаные A и B (или одна внутри другой)."""
+    from matplotlib.path import Path
+    if Path(B).contains_points(A[:1])[0] or Path(A).contains_points(B[:1])[0]:
+        return True
+    a0, a1 = A, np.roll(A, -1, axis=0)
+    b0, b1 = B, np.roll(B, -1, axis=0)
+    lo = np.minimum(a0, a1); hi = np.maximum(a0, a1)
+    blo = np.minimum(b0, b1); bhi = np.maximum(b0, b1)
+    ii, jj = np.nonzero((lo[:, None, 0] <= bhi[None, :, 0]) & (hi[:, None, 0] >= blo[None, :, 0])
+                        & (lo[:, None, 1] <= bhi[None, :, 1]) & (hi[:, None, 1] >= blo[None, :, 1]))
+    if not len(ii):
+        return False
+    p, r = a0[ii], a1[ii] - a0[ii]
+    q, s_ = b0[jj], b1[jj] - b0[jj]
+    cr = lambda u, v: u[:, 0] * v[:, 1] - u[:, 1] * v[:, 0]
+    den = cr(r, s_)
+    ok = np.abs(den) > 1e-300
+    tt = np.where(ok, cr(q - p, s_) / np.where(ok, den, 1), -1)
+    uu = np.where(ok, cr(q - p, r) / np.where(ok, den, 1), -1)
+    return bool(np.any(ok & (tt > 1e-9) & (tt < 1 - 1e-9) & (uu > 1e-9) & (uu < 1 - 1e-9)))
 
 
 def build_cblock_mesh(elements, chord, h0, ratio, t, far_radius, far_size, wakes, wake_size, smin, growth,
-                      cut_len=1.5, verbose=False):
+                      wake_len=1.0, flow_alpha=6.0, verbose=False):
     """Сетка: С-блоки у элементов + треугольники gmsh снаружи (см. описание модуля)."""
     import gmsh
     from .rans_mesh import _connectivity
@@ -538,17 +471,28 @@ def build_cblock_mesh(elements, chord, h0, ratio, t, far_radius, far_size, wakes
     for e in elements:
         x, y = np.asarray(e.x, float), np.asarray(e.y, float)
         polys.append(np.stack([np.column_stack([x, y]), np.column_stack([np.roll(x, -1), np.roll(y, -1)])], 1))
-    blocks = []
-    for i, e in enumerate(elements):
-        obst = np.concatenate([p for k, p in enumerate(polys) if k != i]) if len(elements) > 1 else []
-        blocks.append(c_block(e.x, e.y, h0, ratio, t, smin, cut_len * t, obst))
-    # контуры блоков не должны пересекаться
-    outl = [b["nodes"][b["outline"]] for b in blocks]
-    for i in range(len(outl)):
-        for k in range(i + 1, len(outl)):
-            segs = np.stack([outl[k], np.roll(outl[k], -1, axis=0)], 1)
-            if _seg_dist(outl[i], segs).min() < 1e-6 * chord:
-                raise BlockError("блоки соседних элементов касаются друг друга")
+    fd = (np.cos(np.radians(flow_alpha)), np.sin(np.radians(flow_alpha)))
+    scale = [1.0] * len(elements)
+    for attempt in range(6):
+        blocks = []
+        for i, e in enumerate(elements):
+            obst = np.concatenate([p for k, p in enumerate(polys) if k != i]) if len(elements) > 1 else []
+            blocks.append(c_block(e.x, e.y, h0, ratio, t, smin, scale[i] * wake_len * chord, obst,
+                                  wake_size * chord, fd))
+        # контуры блоков не должны пересекаться: блок следа, задевший соседа, — короче
+        outl = [b["nodes"][b["outline"]] for b in blocks]
+        clash = set()
+        for i in range(len(outl)):
+            for k in range(i + 1, len(outl)):
+                segs = np.stack([outl[k], np.roll(outl[k], -1, axis=0)], 1)
+                if _seg_dist(outl[i], segs).min() < 0.05 * t + 1e-6 * chord or _crosses(outl[i], outl[k]):
+                    clash |= {i, k}
+        if not clash:
+            break
+        for i in clash:
+            scale[i] *= 0.6
+    else:
+        raise BlockError("блоки соседних элементов касаются друг друга")
     try:
         gmsh.initialize(interruptible=False)
     except TypeError:
@@ -592,7 +536,8 @@ def build_cblock_mesh(elements, chord, h0, ratio, t, far_radius, far_size, wakes
         allp = [ps for b in out_pts for ps in b]
         sz = np.array([s for _, s in allp])
         lev = np.floor(np.log(np.maximum(sz, 1e-12) / smin) / np.log(1.4))
-        lev = np.minimum(lev, 0)
+        # уровни и крупнее smin: торец длинного блока следа — ячейки шага следа (иначе там
+        # треугольники мельче четырёхугольников в разы)
         for L_ in np.unique(lev):
             sel = [p for (p, _), l_ in zip(allp, lev) if l_ == L_]
             fp = gmsh.model.mesh.field.add("Distance")
