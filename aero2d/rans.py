@@ -573,7 +573,7 @@ class RansSolver:
         gk = g[:, 4] * kr
         gw = g[:, 5]
         kw = jnp.sum(gk * gw, 1)                                   # ∇k·∇ω̃ = ∇k·∇ω/ω
-        sk_ = jnp.sqrt(k)
+        sk_ = jnp.sqrt(k + 1e-30 * kr)             # +ε: производная √k в k = 0 конечна (якобиан)
         a_ = sk_ / (SST_BS * om * wd)
         b_ = 500.0 * nu / (wd ** 2 * om)
         cd = jnp.maximum(2 * rho * SST_SW2 * kw, 1e-20)
