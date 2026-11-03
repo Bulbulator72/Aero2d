@@ -19,7 +19,10 @@ QUANTITIES = {
     "Скорость |V|/V∞": "speed",
     "Давление Cp": "cp",
     "Число Маха": "mach",
-    "Турбулентная вязкость ν̃/ν∞": "nut",
+    "Вихревая вязкость μt/μ∞": "mut",
+    "Переменная SA ν̃/ν∞ (SA)": "nut",
+    "Энергия турбулентности k/V∞² (SST)": "k",
+    "Удельная диссипация ω·c/V∞ (SST)": "omega",
 }
 
 
@@ -29,8 +32,9 @@ def _grid(box, n):
     return np.meshgrid(np.linspace(x0, x1, n), np.linspace(y0, y1, ny))
 
 
-def frame_fields(mesh, Q, mach, X, Y, tri=None):
-    """Поля кадра на сетке X, Y: u, v (в долях V∞), Cp, M, ν̃/ν∞, ω·c/V∞.
+def frame_fields(mesh, Q, mach, X, Y, tri=None, re=1e6, chord=1.0):
+    """Поля кадра на сетке X, Y: u, v (в долях V∞), Cp, M, ν̃/ν∞ (SA), μt/μ∞,
+    k/V∞² и ω·c/V∞ (SST), завихренность ω·c/V∞ (vorticity).
     tri — rans_mesh.NodeInterp этой сетки (интерполяция по самой расчётной сетке,
     с прилипанием на стенке; строится один раз на все кадры)."""
     from .rans_mesh import NodeInterp
@@ -40,15 +44,22 @@ def frame_fields(mesh, Q, mach, X, Y, tri=None):
     rho = Q[:, 0]
     u, v = Q[:, 1] / rho, Q[:, 2] / rho
     p = (GAM - 1) * (Q[:, 3] - 0.5 * rho * (u ** 2 + v ** 2))
+    from .field import turb_values
+    tv = turb_values(Q, mach, re, chord)
+    sst = "omega_ln" in tv
     vals = np.column_stack([u / mach, v / mach, (p - 1 / GAM) / (0.5 * mach ** 2),
-                            np.sqrt(u ** 2 + v ** 2) / np.sqrt(GAM * p / rho), Q[:, 4] / rho])
-    f = tri(vals, X.ravel(), Y.ravel(), wall={0: 0.0, 1: 0.0, 3: 0.0, 4: 0.0}).reshape(X.shape + (5,))
+                            np.sqrt(u ** 2 + v ** 2) / np.sqrt(GAM * p / rho),
+                            tv["k"] if sst else Q[:, 4] / rho, tv["mut"], tv["omega_ln"] if sst else 0 * rho])
+    f = tri(vals, X.ravel(), Y.ravel(), wall={0: 0.0, 1: 0.0, 3: 0.0, 4: 0.0, 5: 0.0}).reshape(X.shape + (7,))
     U, V = f[..., 0], f[..., 1]
     # завихренность — по самой сетке (узловое среднее градиентов), затем интерполяция
     Nv = tri.W @ vals[:, :2]
     Nv[tri.wall] = 0.0
     om = tri.interp_nodes(tri.node_vorticity(Nv[:, 0], Nv[:, 1]), X.ravel(), Y.ravel()).reshape(X.shape)
-    return dict(u=U, v=V, cp=f[..., 2], mach=f[..., 3], nut=f[..., 4], speed=np.hypot(U, V), vorticity=om)
+    nan = np.full(X.shape, np.nan)
+    return dict(u=U, v=V, cp=f[..., 2], mach=f[..., 3], speed=np.hypot(U, V), vorticity=om, mut=f[..., 5],
+                nut=nan if sst else f[..., 4], k=f[..., 4] if sst else nan,
+                omega=np.exp(f[..., 6]) if sst else nan)
 
 
 def make_gif(mesh, elements, run, path, quantity="vorticity", box=(-0.5, 2.5, -0.9, 0.9), n=320,
@@ -77,7 +88,10 @@ def make_gif(mesh, elements, run, path, quantity="vorticity", box=(-0.5, 2.5, -0
     walls = wall_loops(mesh)
     fields = []
     for k, (t, Q) in enumerate(frames):
-        f = frame_fields(mesh, Q, mach, X, Y, tri)
+        f = frame_fields(mesh, Q, mach, X, Y, tri, re=run.get("re", 1e6), chord=run.get("chord") or 1.0)
+        if not np.isfinite(f[quantity]).any():
+            raise ValueError("величина «%s» есть только в другой модели турбулентности"
+                             % {v: k for k, v in QUANTITIES.items()}.get(quantity, quantity))
         z = np.where(inside, np.nan, f[quantity])
         fields.append((t, z, f))
         if progress and progress(k, 2 * len(frames)):
@@ -97,16 +111,19 @@ def make_gif(mesh, elements, run, path, quantity="vorticity", box=(-0.5, 2.5, -0
         else:
             vlim = (float(np.percentile(allz, 0.5)), float(np.percentile(allz, 99.5)))
     norm = None
-    if scale == "log" and quantity in ("vorticity", "nut"):
+    if quantity == "omega":
+        scale = "log"                                   # ω меняется на много порядков
+    if scale == "log" and quantity in ("vorticity", "nut", "mut", "k", "omega"):
         from matplotlib.colors import LogNorm, SymLogNorm
         allw = np.concatenate([np.ravel(z[np.isfinite(z)]) for _, z, _ in fields])
         top = float(np.percentile(np.abs(allw), 99.8)) or 1.0
         if quantity == "vorticity":
             norm = SymLogNorm(linthresh=top * 3e-3, vmin=-top, vmax=top, base=10)
         else:
-            norm = LogNorm(vmin=max(top * 1e-4, 1e-3), vmax=top)
+            lo = float(np.nanpercentile(np.abs(allw[allw != 0]), 0.5)) if (allw != 0).any() else top * 1e-4
+            norm = LogNorm(vmin=max(top * 1e-4, lo, 1e-12), vmax=top)
     cmap = {"vorticity": "RdBu_r", "cp": "RdBu_r", "speed": "viridis", "mach": "viridis",
-            "nut": "magma"}.get(quantity, "viridis")
+            "nut": "magma", "mut": "magma", "k": "magma", "omega": "magma"}.get(quantity, "viridis")
     label = {v: k for k, v in QUANTITIES.items()}.get(quantity, quantity)
     t_all = np.asarray(run["t"])
     cl_all = np.asarray(run["cl"])
@@ -117,7 +134,7 @@ def make_gif(mesh, elements, run, path, quantity="vorticity", box=(-0.5, 2.5, -0
         ax = fig.add_axes([0.10, 0.30, 0.77, 0.62])
         cax = fig.add_axes([0.89, 0.30, 0.02, 0.62])
         lim = dict(norm=norm) if norm is not None else dict(vmin=vlim[0], vmax=vlim[1])
-        im = ax.imshow(np.abs(z) if norm is not None and quantity == "nut" else z, origin="lower", extent=box,
+        im = ax.imshow(np.abs(z) if norm is not None and quantity != "vorticity" else z, origin="lower", extent=box,
                        cmap=cmap, interpolation="bilinear", aspect="equal", **lim)
         fig.colorbar(im, cax=cax)
         if streamlines:

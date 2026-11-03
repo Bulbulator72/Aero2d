@@ -332,10 +332,14 @@ class App(tk.Tk):
         self.fl_qty = tk.StringVar(value="Давление Cp")
         cq = ttk.Combobox(bar, textvariable=self.fl_qty,
                           values=["Давление Cp", "Скорость |V|/V∞", "Число Маха (RANS)",
-                                  "Турбулентная вязкость ν̃/ν∞ (RANS)", "Невязка по ячейкам (RANS)",
+                                  "Вихревая вязкость μt/μ∞ (RANS)", "Переменная SA ν̃/ν∞ (RANS, SA)",
+                                  "Энергия турбулентности k/V∞² (RANS, SST)",
+                                  "Удельная диссипация ω·c/V∞ (RANS, SST)", "Невязка по ячейкам (RANS)",
                                   "Нет (только линии тока)"],
-                          state="readonly", width=24)
+                          state="readonly", width=34)
         cq.pack(side="left")
+        Tooltip(cq, "μt/μ∞ — для обеих моделей турбулентности (SA: ρν̃·fv1, SST: ρk/ω). "
+                    "ν̃ — только SA; k и ω — только k-ω SST. ω показана в логарифмической шкале.")
         cq.bind("<<ComboboxSelected>>", lambda _: self._redraw_field())
         ttk.Label(bar, text="   область: ").pack(side="left")
         from .field import REGIONS
@@ -1382,7 +1386,7 @@ class App(tk.Tk):
         cb_sc = ttk.Combobox(fr, textvariable=v_sc, values=list(scales), state="readonly", width=56)
         cb_sc.grid(row=i + 4, column=1, columnspan=2, sticky="w")
         Tooltip(cb_sc, "Завихренность у стенки в десятки–сотни раз больше, чем в следе и вихрях: в линейной "
-                       "шкале видна только тонкая полоса у профиля. Логарифмическая — для завихренности и ν̃.")
+                       "шкале видна только тонкая полоса у профиля. Логарифмическая — для завихренности и турбулентных величин (ω — всегда логарифмическая).")
         i += 1
         ttk.Checkbutton(fr, text="линии тока на кадрах (медленнее)", variable=v_sl).grid(
             row=i + 4, column=1, columnspan=2, sticky="w")
@@ -1512,14 +1516,23 @@ class App(tk.Tk):
                 cmap, name = "inferno", "lg невязки в ячейке (последняя итерация)"
                 hi = np.nanmax(z)
                 levels = np.linspace(hi - 6, hi + 1e-9, 41)
-        elif qty.startswith("Число Маха") or qty.startswith("Турбулентная"):
-            key = "mach_local" if qty.startswith("Число") else "nut"
+        elif qty.startswith(("Число Маха", "Вихревая", "Переменная SA", "Энергия турб", "Удельная дисс")):
+            key, cmap, name = {"Число": ("mach_local", "viridis", "M"),
+                               "Вихре": ("mut", "magma", "μt / μ∞"),
+                               "Перем": ("nut", "magma", "ν̃/ν∞ (переменная SA)"),
+                               "Энерг": ("k_turb", "magma", "k / V∞²"),
+                               "Удель": ("omega", "magma", "ω·c / V∞ (лог. шкала)")}[qty[:5]]
             if key not in f:
-                self.status.set("Эта величина есть только в расчёте RANS.")
-                z, name = None, "линии тока"
+                z = None
+                name = ("линии тока (k и ω есть только в модели k-ω SST)" if key in ("k_turb", "omega") and "mut" in f
+                        else "линии тока (ν̃ есть только в модели SA)" if key == "nut" and "mut" in f
+                        else "линии тока (эта величина есть только в расчёте RANS)")
+            elif key == "omega":
+                z = np.log10(np.maximum(f[key], 1e-30))
+                levels = np.linspace(np.nanpercentile(z, 0.5), np.nanpercentile(z, 99.5) + 1e-9, 41)
+                name = "lg(ω·c / V∞)"
             else:
                 z = f[key]
-                cmap, name = ("viridis", "M") if key == "mach_local" else ("magma", "ν̃/ν∞ (переменная SA)")
                 levels = np.linspace(np.nanmin(z), np.nanpercentile(z, 99.7) + 1e-9, 41)
         else:
             z, name = None, "линии тока"

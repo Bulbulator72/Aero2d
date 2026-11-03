@@ -731,7 +731,7 @@ def run_rans_unsteady(ctx: dict, k: int, t_end: float = 4.0, steps_per_chord: in
     run = s.solve_unsteady(alpha, Q0, t_end, steps_per_chord=steps_per_chord, sub_iter=sub_iter,
                            frame_every=frame_every, callback=cb, control=control,
                            ramp=(ramp if start == "start" else 0.0))
-    run.update(mesh=ctx["mesh"], elements=elements, start=start,
+    run.update(mesh=ctx["mesh"], elements=elements, start=start, re=ctx["re"], chord=ctx["chord"],
                alpha_from=(float(ctx["alpha"][k_from]) if start == "pitch" else None))
     return run
 
