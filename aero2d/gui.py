@@ -889,6 +889,7 @@ class App(tk.Tk):
             self._live = self._new_res()
             self.res_src.set("текущий расчёт")
             self._rans_ctl = RansControl(monitor=lambda d: self.q.put(("iter", d)))
+            self._reset_pause()
         if isinstance(af, list) and method != "rans":
             if method == "euler":
                 messagebox.showinfo("Механизация", "Для многоэлементного профиля доступны вязкий, RANS и "
@@ -1012,6 +1013,7 @@ class App(tk.Tk):
 
     def _finish(self):
         self.btn_run.configure(state="normal")
+        self._reset_pause()
         self.btn_stop.configure(state="disabled")
         self.btn_skip.configure(state="disabled")
         if self._live is not None and self.res_src.get() == "текущий расчёт":
@@ -2043,6 +2045,25 @@ class App(tk.Tk):
         b3 = ttk.Button(act, text="↶ Откат к лучшему", command=self.rollback_now)
         b3.pack(side="left")
         Tooltip(b3, "Вернуться к состоянию с наименьшей невязкой на этом угле (CFL ×0,1).")
+        ttk.Separator(act, orient="vertical").pack(side="left", fill="y", padx=8)
+        self.btn_pause = ttk.Button(act, text="⏸ Пауза", width=13, command=self.toggle_pause)
+        self.btn_pause.pack(side="left")
+        Tooltip(self.btn_pause, "Приостановить расчёт после текущей итерации (как во Fluent): можно спокойно "
+                                "посмотреть графики и задать CFL, затем «Продолжить».")
+        ttk.Label(act, text="  CFL =").pack(side="left")
+        self.cfl_manual = tk.StringVar(value="")
+        e_cm = ttk.Entry(act, textvariable=self.cfl_manual, width=8)
+        e_cm.pack(side="left", padx=(2, 2))
+        e_cm.bind("<Return>", lambda _: self.apply_cfl())
+        ttk.Button(act, text="Применить", command=self.apply_cfl).pack(side="left")
+        self.cfl_manual_hold = tk.BooleanVar(value=True)
+        ch_ = ttk.Checkbutton(act, text="держать", variable=self.cfl_manual_hold)
+        ch_.pack(side="left", padx=(4, 0))
+        Tooltip(e_cm, "Новое число CFL — со следующей итерации, во всех процессах расчёта. "
+                      "Enter — применить.")
+        Tooltip(ch_, "Включено: CFL остаётся заданным до конца расчёта (как Courant number во Fluent; кнопка "
+                     "«CFL ×0,5» и откаты его уменьшают). Выключено: дальше CFL меняется по режиму шага, "
+                     "начиная с заданного значения.")
         self.res_state = tk.StringVar(value="")
         st_l = ttk.Label(fr, textvariable=self.res_state, foreground="#1a4f8a", padding=(6, 2))
         st_l.pack(side="top", fill="x")
@@ -2209,6 +2230,43 @@ class App(tk.Tk):
             raise ValueError("Невязки: порядков > 0, итераций ≥ 1")
         return c
 
+    def _ctl_running(self):
+        ctl = getattr(self, "_rans_ctl", None)
+        return ctl if (ctl is not None and self.worker and self.worker.is_alive()) else None
+
+    def toggle_pause(self):
+        ctl = self._ctl_running()
+        if ctl is None:
+            self.status.set("Пауза — только во время расчёта RANS.")
+            return
+        ctl.pause = not ctl.pause
+        self.btn_pause.configure(text="▶ Продолжить" if ctl.pause else "⏸ Пауза")
+        self.status.set("Пауза: расчёт остановится после текущей итерации. Можно задать CFL и нажать "
+                        "«Продолжить»." if ctl.pause else "Расчёт продолжается.")
+
+    def _reset_pause(self):
+        if hasattr(self, "btn_pause"):
+            self.btn_pause.configure(text="⏸ Пауза")
+
+    def apply_cfl(self):
+        try:
+            v = float(self.cfl_manual.get().replace(",", ".").strip())
+            if not v > 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("CFL", "CFL — положительное число, например 50 или 1e3.")
+            return
+        ctl = self._ctl_running()
+        if ctl is None:
+            self.status.set("CFL задаётся во время расчёта (на паузе или на ходу). До расчёта — «CFL нач.» "
+                            "в настройках шага.")
+            return
+        ctl.cfl_hold = bool(self.cfl_manual_hold.get())
+        ctl.cfl_set = v
+        self.status.set(f"CFL = {v:g} со следующей итерации" + (" и дальше постоянный" if ctl.cfl_hold else
+                        ", дальше — по режиму шага") + (" (расчёт на паузе — нажмите «Продолжить»)"
+                                                        if ctl.pause else ""))
+
     def skip_angle(self):
         ctl = getattr(self, "_rans_ctl", None)
         if ctl is not None and self.worker and self.worker.is_alive():
@@ -2234,6 +2292,8 @@ class App(tk.Tk):
         if L is None:
             return
         if "event" in d:                                   # откат и т. п.
+            if d["event"] in ("пауза", "продолжение"):
+                return
             L["events"].append((float(d["alpha"]), int(d["it"]), d["event"]))
             self.status.set(f"α = {d['alpha']:g}°, итерация {d['it']}: {d['event']}")
             return
@@ -2414,6 +2474,7 @@ class App(tk.Tk):
         self._live = self._new_res()
         self.res_src.set("текущий расчёт")
         self._rans_ctl = RansControl(monitor=lambda d: self.q.put(("iter", d)))
+        self._reset_pause()
         self.stop_flag.clear()
         self.btn_run.configure(state="disabled")
         self.btn_stop.configure(state="normal")

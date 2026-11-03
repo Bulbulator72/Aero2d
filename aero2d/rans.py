@@ -93,6 +93,10 @@ class RansControl:
         self.stop = False
         self.cfl_factor = 1.0          # ≠ 1 — умножить текущий CFL (кнопка «CFL ×0,5»)
         self.rollback = False          # True — откатиться к состоянию с наименьшей невязкой
+        self.pause = False             # True — расчёт ждёт (как пауза во Fluent), False — продолжает
+        self.cfl_set = None            # число — задать CFL со следующей итерации (затем None)
+        self.cfl_hold = True           # при cfl_set: True — держать CFL постоянным (как Courant
+        #                                number во Fluent), False — дальше по правилу роста/формуле
 
 
 def cfl_formula(expr, **v):
@@ -1194,6 +1198,24 @@ class RansSolver:
             return [int(i) for i in np.argsort(-rc)[:k]]
         for it in range(1, max_iter + 1):
             if control is not None:
+                if control.pause and not control.stop:
+                    if control.monitor is not None:
+                        control.monitor(dict(alpha=alpha, it=it, event="пауза"))
+                    import time as _time
+                    while control.pause and not control.stop:
+                        _time.sleep(0.2)
+                    if control.monitor is not None and not control.stop:
+                        control.monitor(dict(alpha=alpha, it=it, event="продолжение"))
+                v_ = control.cfl_set
+                if v_ is not None and float(v_) > 0:
+                    control.cfl_set = None
+                    cfl = float(v_)
+                    self.cfl_hold_value = cfl if control.cfl_hold else None
+                    events.append((it, f"CFL вручную = {cfl:.3g}" + (" (держать)" if control.cfl_hold else ""),
+                                   np.nan, []))
+                    if control.monitor is not None:
+                        control.monitor(dict(alpha=alpha, it=it, event=f"CFL вручную = {cfl:.3g}"
+                                             + (", держать" if control.cfl_hold else ", дальше — по правилу")))
                 sk, st = bool(control.skip), bool(control.stop)
                 if sk or st:
                     status = "принято вручную" if sk else "остановлено"
@@ -1202,6 +1224,8 @@ class RansSolver:
                 f_ = float(control.cfl_factor)
                 if f_ != 1.0:
                     cfl = max(1.0, cfl * f_)
+                    if getattr(self, "cfl_hold_value", None) is not None:
+                        self.cfl_hold_value = cfl
                     control.cfl_factor = 1.0
                     events.append((it, f"CFL вручную → {cfl:.3g}", np.nan, []))
             order = 1 if (it <= first_order_iters and Q0 is None) or it <= first_until else self.order
@@ -1366,6 +1390,8 @@ class RansSolver:
                     grow = (self.cfl_growth if rn < 1.2 * hist[-2][0] and ok_ and lin_ < 0.25 else
                             1.0 if rn < 3.0 * hist[-2][0] and ok_ else 0.5)
                     cfl = min(cfl_max, max(cfl0, cfl * grow))
+            if getattr(self, "cfl_hold_value", None) is not None:
+                cfl = float(self.cfl_hold_value)          # CFL задан вручную и держится
             dt = self.local_dt(Q, cfl)
             N5 = nv * self.nc
             if self.prec == "lu":
@@ -1623,6 +1649,10 @@ class RansSolver:
         fr = self.forces(Q, alpha)
         out["frames"].append((0.0, Q.astype(np.float32)))
         for k in range(1, n_steps + 1):
+            if control is not None and control.pause and not control.stop:
+                import time as _time
+                while control.pause and not control.stop:
+                    _time.sleep(0.2)
             if control is not None and (control.stop or control.skip):
                 out["status"] = "остановлено"
                 control.skip = False
@@ -1885,8 +1915,11 @@ class _ProcControl(RansControl):
     """RansControl внутри процесса-исполнителя: монитор — в общую очередь,
     «следующий угол» и «стоп» — через общие флаги."""
 
-    def __init__(self, queue, skip_gen, stop_ev, cfl_gen=None, back_gen=None):
+    def __init__(self, queue, skip_gen, stop_ev, cfl_gen=None, back_gen=None, ext=None):
         super().__init__(monitor=lambda d: queue.put(("iter", d)))
+        # ext: (событие «пауза», номер задания CFL, значение CFL, «держать»)
+        self._ext = ext
+        self._vseen = ext[1].value if ext is not None else 0
         self._q, self._gen, self._stop = queue, skip_gen, stop_ev
         self._seen = skip_gen.value
         self._cg, self._bg = cfl_gen, back_gen
@@ -1921,6 +1954,36 @@ class _ProcControl(RansControl):
         pass
 
     @property
+    def pause(self):
+        return self._ext is not None and self._ext[0].is_set()
+
+    @pause.setter
+    def pause(self, v):
+        pass
+
+    @property
+    def cfl_set(self):
+        if self._ext is None:
+            return None
+        g = self._ext[1].value
+        if g != self._vseen:
+            self._vseen = g
+            return float(self._ext[2].value)
+        return None
+
+    @cfl_set.setter
+    def cfl_set(self, v):
+        pass
+
+    @property
+    def cfl_hold(self):
+        return self._ext is not None and bool(self._ext[3].value)
+
+    @cfl_hold.setter
+    def cfl_hold(self, v):
+        pass
+
+    @property
     def skip(self):
         g = self._gen.value
         if g != self._seen:
@@ -1946,13 +2009,14 @@ def _rans_chunk(args):
     import warnings
     warnings.filterwarnings("ignore")
     (mesh, mach, re, chord, xref, alphas, idx, Q0, a0, rref, max_iter, conv, queue, flags, init, sopts) = args
-    skip_gen, stop_ev, cfl_gen, back_gen = flags
+    skip_gen, stop_ev, cfl_gen, back_gen = flags[:4]
+    ext = flags[4] if len(flags) > 4 else None
     solver = RansSolver(mesh, mach, re, chord=chord, xref=xref)
     for k_, v_ in (sopts or {}).items():
         setattr(solver, k_, v_)
     if rref:
         solver._rref = rref
-    ctl = _ProcControl(queue, skip_gen, stop_ev, cfl_gen, back_gen)
+    ctl = _ProcControl(queue, skip_gen, stop_ev, cfl_gen, back_gen, ext)
     out = [None] * len(alphas)
     st = {}
 
@@ -2060,6 +2124,7 @@ def rans_polar(elements, alphas, re, mach=0.15, chord=1.0, xref=None, mesh=None,
     mgr = ctx.Manager()
     queue = mgr.Queue()
     skip_gen, stop_ev, cfl_gen, back_gen = mgr.Value("i", 0), mgr.Event(), mgr.Value("i", 0), mgr.Value("i", 0)
+    ext = (mgr.Event(), mgr.Value("i", 0), mgr.Value("d", 0.0), mgr.Value("i", 1))   # пауза, CFL вручную
     rref = getattr(solver, "_rref", 0.0)
     # потоки XLA: на каждый процесс — своя доля ядер
     keep = os.environ.get("XLA_FLAGS")
@@ -2069,7 +2134,7 @@ def rans_polar(elements, alphas, re, mach=0.15, chord=1.0, xref=None, mesh=None,
     try:
         with ProcessPoolExecutor(len(chunks), mp_context=ctx) as ex:
             futs = [ex.submit(_rans_chunk, (mesh, mach, re, chord, xr, alphas, c, Q0, a0, rref, max_iter, conv,
-                                            queue, (skip_gen, stop_ev, cfl_gen, back_gen),
+                                            queue, (skip_gen, stop_ev, cfl_gen, back_gen, ext),
                                             {i: init[i] for i in c if i in init}, solver_opts))
                     for c in chunks]
             pending = set(futs)
@@ -2110,6 +2175,13 @@ def rans_polar(elements, alphas, re, mach=0.15, chord=1.0, xref=None, mesh=None,
                     if control.rollback:
                         back_gen.value += 1
                         control.rollback = False
+                    if bool(control.pause) != ext[0].is_set():
+                        (ext[0].set if control.pause else ext[0].clear)()
+                    if control.cfl_set is not None:
+                        ext[2].value = float(control.cfl_set)
+                        ext[3].value = int(bool(control.cfl_hold))
+                        ext[1].value += 1
+                        control.cfl_set = None
     finally:
         if keep is None:
             os.environ.pop("XLA_FLAGS", None)
