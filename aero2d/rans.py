@@ -96,11 +96,11 @@ class RansControl:
 
 
 def cfl_formula(expr, **v):
-    """CFL по выражению пользователя: переменные — v (n, orders, res, cfl), функции — ниже.
+    """CFL по выражению пользователя: переменные — v (n, orders, res, dres, cfl), функции — ниже.
     Ошибка в выражении — ValueError с понятным текстом."""
     import math
     names = dict(min=min, max=max, exp=math.exp, log=math.log, log10=math.log10, sqrt=math.sqrt,
-                 abs=abs, pow=pow, tanh=math.tanh, где=lambda c, a, b: a if c else b, pi=math.pi, e=math.e)
+                 abs=abs, pow=pow, tanh=math.tanh, floor=math.floor, ceil=math.ceil, где=lambda c, a, b: a if c else b, pi=math.pi, e=math.e)
     names.update(v)
     try:
         code = compile(str(expr).replace("^", "**").strip(), "<CFL>", "eval")
@@ -108,8 +108,8 @@ def cfl_formula(expr, **v):
         raise ValueError(f"формула CFL: ошибка записи ({e.msg})") from None
     bad = [nm for nm in code.co_names if nm not in names]
     if bad:
-        raise ValueError(f"формула CFL: неизвестное имя «{bad[0]}» (можно: n, orders, res, cfl и функции "
-                         "min, max, exp, log, log10, sqrt, abs, pow, tanh)")
+        raise ValueError(f"формула CFL: неизвестное имя «{bad[0]}» (можно: n, orders, res, dres, cfl и функции "
+                         "min, max, exp, log, log10, sqrt, abs, pow, tanh, floor, ceil, где)")
     try:
         val = float(eval(code, {"__builtins__": {}}, names))
     except (ArithmeticError, ValueError, TypeError) as e:
@@ -117,6 +117,15 @@ def cfl_formula(expr, **v):
     if not np.isfinite(val) or val <= 0:
         raise ValueError(f"формула CFL дала {val:g} — нужно положительное число")
     return val
+
+
+def _cfl_recursive(expr):
+    """Формула CFL зависит от текущего CFL или от отношения невязок соседних итераций."""
+    try:
+        names = compile(str(expr).replace("^", "**").strip(), "<CFL>", "eval").co_names
+    except SyntaxError:
+        return False
+    return "cfl" in names or "dres" in names
 
 
 def _jnp():
@@ -200,6 +209,14 @@ class RansSolver:
         # orders — на сколько порядков упала невязка от первой итерации, res — невязка/начальная,
         # cfl — текущий CFL; функции min, max, exp, log, log10, sqrt, abs, pow, tanh, где (if)
         self.cfl_formula = "min(5*1.2**n, 1000)"
+        # отдельный CFL уравнений турбулентности: CFL_турб = cfl_turb·CFL (как schedule_cflturb в
+        # FUN3D — там на порядок меньше основного — и CFL_REDUCTION_TURB в SU2); None — 1 для SA,
+        # 0,1 для k-ω SST (k и ω сходятся хуже и должны оставаться положительными)
+        self.cfl_turb = None
+        # вязкий спектральный радиус в локальном шаге (Blazek, «Computational Fluid Dynamics»,
+        # гл. 6.1.4): Λv = max(4/3, γ)/ρ·(μ/Pr + μt/Prt)·ΣS²/Ω, Δt = CFL·Ω/(Λc + C·Λv);
+        # C = 1 — для схем против потока (Roe), 4 — для центральных
+        self.dt_visc_c = 1.0
         self.conv = Convergence()      # критерий перехода к следующему углу
         self.rc_smooth = 2             # SA-RC: проходов сглаживания r̃
         self.turb_model = "sa"         # "sa" — SA-neg; "sa-rc" — с поправкой на кривизну линий тока
@@ -943,7 +960,8 @@ class RansSolver:
         D = np.array(D)
         nc = self.nc
         nv = D.shape[1]
-        D[:, np.arange(nv), np.arange(nv)] += (self.vol / dt)[:, None]
+        dt = np.asarray(dt)
+        D[:, np.arange(nv), np.arange(nv)] += self.vol[:, None] / (dt if dt.ndim == 2 else dt[:, None])
         r = np.concatenate([np.arange(nc), self.iL, self.iR])
         c = np.concatenate([np.arange(nc), self.iR, self.iL])
         b = np.concatenate([D, np.asarray(off)])
@@ -1020,15 +1038,24 @@ class RansSolver:
         mu = self.mu_inf * T**1.5 * (1 + SUTH) / (T + SUTH)
         if w.shape[1] == 6:                       # SST: νt = k/ω
             nut = np.maximum(w[:, 4], 0) * self.k_ref / (self.om_ref * np.exp(np.minimum(w[:, 5], 60.0)))
+        elif self.turbulent and w.shape[1] > 4:   # SA: νt = ν̃·fv1
+            nt = np.maximum(w[:, 4], 0) * self.nu_inf
+            X3 = (nt * w[:, 0] / mu) ** 3
+            nut = nt * X3 / (X3 + CV1 ** 3)
         else:
-            nut = np.maximum(w[:, 4], 0) * self.nu_inf
+            nut = 0.0 * mu
         lv = np.zeros(self.nc)
         sv = self.A_i**2
         np.add.at(lv, self.iL, sv)
         np.add.at(lv, self.iR, sv)
         np.add.at(lv, self.cw, self.A_w**2)
-        lam += 4.0 * (mu / w[:, 0] + nut) * lv / self.vol
-        return cfl * self.vol / lam
+        lam += self.dt_visc_c * max(4.0 / 3.0, GAM) * (mu / w[:, 0] / PR + nut / PRT) * lv / self.vol
+        dt = cfl * self.vol / lam
+        ct = self.cfl_turb if self.cfl_turb is not None else (0.1 if self.sst else 1.0)
+        if self.nv > 4 and ct != 1.0:            # (nc, nv): у уравнений турбулентности — свой шаг
+            dt = np.repeat(dt[:, None], self.nv, 1)
+            dt[:, 4:] *= ct
+        return dt
 
     def forces(self, Q, alpha):
         jnp = self.jnp
@@ -1143,7 +1170,7 @@ class RansSolver:
         cfl = cfl0
         self._cfl_target, self._cfl_pen = None, 1.0
         if self.cfl_mode == "formula":            # проверка формулы до расчёта и CFL первой итерации
-            cfl = min(cfl_max, cfl_formula(self.cfl_formula, n=0, orders=0.0, res=1.0, cfl=cfl0))
+            cfl = min(cfl_max, cfl_formula(self.cfl_formula, n=0, orders=0.0, res=1.0, dres=1.0, cfl=cfl0))
         self._last_ok, self._last_lin = True, 0.0
         fh = []
         lu, lu_it = None, 0
@@ -1298,10 +1325,19 @@ class RansSolver:
                         print(f"  it {it:4d}: невязка застряла на {rn:.2e} — ограничитель заморожен", flush=True)
             # CFL: по формуле пользователя или рост по уменьшению невязки (SER)
             if self.cfl_mode == "formula":
+                dres = rn / max(hist[-2][0], 1e-300) if len(hist) >= 2 else 1.0
                 target = cfl_formula(self.cfl_formula, n=it, orders=float(np.log10(max(hist[0][0], 1e-300)
                                                                                    / max(rn, 1e-300))),
-                                     res=rn / max(hist[0][0], 1e-300), cfl=cfl)
+                                     res=rn / max(hist[0][0], 1e-300), dres=dres, cfl=cfl)
                 target = float(min(cfl_max, max(target, 1e-3)))
+                if _cfl_recursive(self.cfl_formula):
+                    # формула от текущего CFL (SER, SU2 v7) сама учитывает уменьшение после
+                    # неудачного шага — без отдельного «штрафа»
+                    self._cfl_target, self._cfl_pen, cfl = target, 1.0, target
+                    target = None
+            if self.cfl_mode == "formula" and target is None:
+                pass
+            elif self.cfl_mode == "formula":
                 # защита от развала (отмена шага, откат) уменьшает CFL — после неё CFL возвращается
                 # к формуле постепенно (×1,25 за удачную итерацию)
                 last = getattr(self, "_cfl_target", None)
@@ -1364,7 +1400,7 @@ class RansSolver:
                         continue
                     ilu_state = (it, cfl, order)
             M = spla.LinearOperator((N5, N5), ilu.solve)
-            Vdt = np.repeat(self.vol / dt, nv)
+            Vdt = np.broadcast_to(self.vol[:, None] / (dt if dt.ndim == 2 else dt[:, None]), (self.nc, nv)).ravel()
 
             qn = float(np.linalg.norm(Q))
             Rf = R.ravel()
@@ -1619,7 +1655,8 @@ class RansSolver:
                 _, _, blocks = self.jac1(Qj, winf_j, gm, 1.0 / inv_eff)
                 self._want_blocks = False
                 ilu = self._bilu.factor(blocks)
-                Vd = np.repeat(self.vol * inv_eff, nv)
+                Vd = np.broadcast_to(self.vol[:, None] * (inv_eff if inv_eff.ndim == 2 else inv_eff[:, None]),
+                                     (self.nc, nv)).ravel()
 
                 def mv(x):
                     return np.asarray(jvpf(Qj, jnp.asarray(x.reshape(-1, nv)), winf_j, gm)).ravel() + Vd * x

@@ -1955,11 +1955,30 @@ class App(tk.Tk):
         self.e_cfl_formula.pack(side="left", padx=4)
         Tooltip(self.e_cfl_formula, "Действует в режиме шага «по формуле». Переменные: n — номер итерации на "
                                     "угле (1, 2, 3, …), orders — на сколько порядков упала невязка, res — невязка / "
-                                    "начальная, cfl — текущий CFL. Функции: min, max, exp, log, log10, sqrt, abs, "
-                                    "pow, tanh, где(условие, a, b). Степень — ** или ^. Примеры: min(5*1.2**n, 500); "
+                                    "начальная, dres — невязка / невязка прошлой итерации, cfl — текущий CFL. "
+                                    "Функции: min, max, exp, log, log10, sqrt, abs, pow, tanh, floor, ceil, "
+                                    "где(условие, a, b). Степень — ** или ^. Примеры: min(5*1.2**n, 500); "
                                     "где(n < 50, 10, 200); min(5*10**orders, 1e4). «наиб.» ограничивает CFL сверху.")
+        ttk.Label(bar6, text="готовые:").pack(side="left")
+        self.cfl_example = tk.StringVar(value="")
+        cbx = ttk.Combobox(bar6, textvariable=self.cfl_example, values=list(self.CFL_FORMULAS),
+                           state="readonly", width=34)
+        cbx.pack(side="left", padx=4)
+        cbx.bind("<<ComboboxSelected>>", lambda _: self._apply_cfl_example())
+        Tooltip(cbx, "Формулы наращивания CFL из распространённых решателей (неявная схема, локальный шаг "
+                     "Δt = CFL·Ω/(Λc + Λv) по Blazek). Выбор подставляет формулу и включает режим «по формуле».")
+        bar7 = ttk.Frame(fr, padding=(4, 0))
+        bar7.pack(side="top", fill="x")
+        ttk.Label(bar7, text="CFL уравнений k, ω (турбулентность) = CFL ×").pack(side="left")
+        self.cfl_turb = tk.StringVar(value="авто")
+        ct_ = ttk.Combobox(bar7, textvariable=self.cfl_turb, values=["авто", "1", "0.5", "0.2", "0.1", "0.05"],
+                           width=6)
+        ct_.pack(side="left")
+        Tooltip(ct_, "Отдельный (меньший) шаг для уравнений турбулентности — как schedule_cflturb в FUN3D "
+                     "(там CFL турбулентности на порядок меньше основного) и CFL_REDUCTION_TURB в SU2. "
+                     "«авто»: 1 для SA, 0.1 для k-ω SST.")
         self.cfl_formula_hint = tk.StringVar(value="")
-        ttk.Label(bar6, textvariable=self.cfl_formula_hint, foreground="#555").pack(side="left", padx=6)
+        ttk.Label(bar7, textvariable=self.cfl_formula_hint, foreground="#555").pack(side="left", padx=6)
         self.cfl_formula.trace_add("write", lambda *_: self._check_cfl_formula())
         self._check_cfl_formula()
         self.lim_zone = tk.StringVar(value="у задних кромок")
@@ -2005,6 +2024,24 @@ class App(tk.Tk):
                                       rollback_factor="20", mode="grow"),
                    "по формуле (CFL(n) ниже)": dict(mode="formula")}
 
+    # готовые формулы CFL (режим «по формуле») — по источникам: FUN3D (schedule_cfl, линейный рост),
+    # NASA WIND (cfl1, cflfac каждые inccfl итераций), SER Mulder–van Leer, SU2 v7 (FactorUp/Down)
+    CFL_FORMULAS = {
+        "FUN3D: линейно 10 → 200 за 50 итераций": "10 + 190*min(n/50, 1)",
+        "WIND: ×2 каждые 10 итераций, до 1e4": "min(5*2**floor(n/10), 1e4)",
+        "SER (Mulder–van Leer): CFL·(R прошл./R)": "cfl*min(2, max(0.1, 1/dres))",
+        "SER по падению от начала: 5·10^orders": "min(5*10**orders, 1e5)",
+        "SU2 v7: ×1.2 при спаде, ×0.7 при росте": "где(dres < 1, cfl*1.2, cfl*0.7)",
+        "Экспонента: 5·1.2^n до 1000": "min(5*1.2**n, 1000)",
+    }
+
+    def _apply_cfl_example(self):
+        f = self.CFL_FORMULAS.get(self.cfl_example.get())
+        if f:
+            self.cfl_formula.set(f)
+            self.cfl_preset.set("по формуле (CFL(n) ниже)")
+            self._apply_cfl_preset()
+
     def _apply_cfl_preset(self):
         p = self.CFL_PRESETS.get(self.cfl_preset.get())
         if p:
@@ -2021,9 +2058,21 @@ class App(tk.Tk):
             return
         from .rans import cfl_formula
         try:
-            vals = [cfl_formula(self.cfl_formula.get(), n=n_, orders=0.03 * n_, res=10 ** (-0.03 * n_), cfl=5.0)
-                    for n_ in (1, 10, 50, 200)]
-            txt = "CFL при n = 1/10/50/200: " + " / ".join(f"{v:.3g}" for v in vals)
+            from .rans import _cfl_recursive
+            ex = self.cfl_formula.get()
+            if _cfl_recursive(ex):
+                # пробный прогон: невязка падает в 1,07 раза за итерацию (0,03 порядка)
+                c_, vals = 5.0, []
+                for n_ in range(1, 201):
+                    c_ = cfl_formula(ex, n=n_, orders=0.03 * n_, res=10 ** (-0.03 * n_), dres=10 ** -0.03, cfl=c_)
+                    if n_ in (1, 10, 50, 200):
+                        vals.append(c_)
+                txt = "CFL (при ровном спаде невязки), n = 1/10/50/200: "
+            else:
+                vals = [cfl_formula(ex, n=n_, orders=0.03 * n_, res=10 ** (-0.03 * n_), dres=10 ** -0.03, cfl=5.0)
+                        for n_ in (1, 10, 50, 200)]
+                txt = "CFL, n = 1/10/50/200: "
+            txt += " / ".join(f"{v:.3g}" for v in vals) + " (≤ «наиб.»)"
             if getattr(self, "cfl_mode_v", "") != "formula":
                 txt += "  (включите режим «по формуле»)"
             self.cfl_formula_hint.set(txt)
@@ -2046,8 +2095,16 @@ class App(tk.Tk):
         o["cfl_mode"] = getattr(self, "cfl_mode_v", "grow")
         if o["cfl_mode"] == "formula":
             from .rans import cfl_formula
-            cfl_formula(self.cfl_formula.get(), n=0, orders=0.0, res=1.0, cfl=o["cfl_start"])   # ValueError — в окно
+            cfl_formula(self.cfl_formula.get(), n=0, orders=0.0, res=1.0, dres=1.0, cfl=o["cfl_start"])   # ValueError
             o["cfl_formula"] = self.cfl_formula.get()
+        ct = self.cfl_turb.get().strip().replace(",", ".")
+        if ct not in ("", "авто"):
+            try:
+                o["cfl_turb"] = float(ct)
+            except ValueError:
+                raise ValueError("Невязки: «CFL k, ω = CFL ×» — число от 0.001 до 1 или «авто»") from None
+            if not 1e-3 <= o["cfl_turb"] <= 1.0:
+                raise ValueError("Невязки: «CFL k, ω = CFL ×» — число от 0.001 до 1 или «авто»")
         o["prec_fill"] = int(self.prec_fill.get())
         o["limiter_zone"] = self.LIMITER_ZONES.get(self.lim_zone.get(), "te")
         o["turb_model"] = self.TURB_MODELS[self.turb_model.get()]
