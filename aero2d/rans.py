@@ -95,6 +95,30 @@ class RansControl:
         self.rollback = False          # True — откатиться к состоянию с наименьшей невязкой
 
 
+def cfl_formula(expr, **v):
+    """CFL по выражению пользователя: переменные — v (n, orders, res, cfl), функции — ниже.
+    Ошибка в выражении — ValueError с понятным текстом."""
+    import math
+    names = dict(min=min, max=max, exp=math.exp, log=math.log, log10=math.log10, sqrt=math.sqrt,
+                 abs=abs, pow=pow, tanh=math.tanh, где=lambda c, a, b: a if c else b, pi=math.pi, e=math.e)
+    names.update(v)
+    try:
+        code = compile(str(expr).replace("^", "**").strip(), "<CFL>", "eval")
+    except SyntaxError as e:
+        raise ValueError(f"формула CFL: ошибка записи ({e.msg})") from None
+    bad = [nm for nm in code.co_names if nm not in names]
+    if bad:
+        raise ValueError(f"формула CFL: неизвестное имя «{bad[0]}» (можно: n, orders, res, cfl и функции "
+                         "min, max, exp, log, log10, sqrt, abs, pow, tanh)")
+    try:
+        val = float(eval(code, {"__builtins__": {}}, names))
+    except (ArithmeticError, ValueError, TypeError) as e:
+        raise ValueError(f"формула CFL: не вычисляется ({e})") from None
+    if not np.isfinite(val) or val <= 0:
+        raise ValueError(f"формула CFL дала {val:g} — нужно положительное число")
+    return val
+
+
 def _jnp():
     # без служебных сообщений XLA («Constant folding … is taking > 1s» — это компиляция,
     # на результат не влияет)
@@ -172,6 +196,10 @@ class RansSolver:
         # cfl_limit и дальше постоянный (как число Куранта во Fluent); "ser" — по отношению невязок
         self.cfl_mode = "grow"
         self.cfl_growth = 1.25
+        # "formula": CFL задан выражением (cfl_formula) от n — номер итерации на этом угле (1, 2, …),
+        # orders — на сколько порядков упала невязка от первой итерации, res — невязка/начальная,
+        # cfl — текущий CFL; функции min, max, exp, log, log10, sqrt, abs, pow, tanh, где (if)
+        self.cfl_formula = "min(5*1.2**n, 1000)"
         self.conv = Convergence()      # критерий перехода к следующему углу
         self.rc_smooth = 2             # SA-RC: проходов сглаживания r̃
         self.turb_model = "sa"         # "sa" — SA-neg; "sa-rc" — с поправкой на кривизну линий тока
@@ -1111,6 +1139,9 @@ class RansSolver:
         hist = []
         r0 = None
         cfl = cfl0
+        self._cfl_target, self._cfl_pen = None, 1.0
+        if self.cfl_mode == "formula":            # проверка формулы до расчёта и CFL первой итерации
+            cfl = min(cfl_max, cfl_formula(self.cfl_formula, n=0, orders=0.0, res=1.0, cfl=cfl0))
         self._last_ok, self._last_lin = True, 0.0
         fh = []
         lu, lu_it = None, 0
@@ -1263,8 +1294,22 @@ class RansSolver:
                     phi = phi_fn(Qj)
                     if verbose:
                         print(f"  it {it:4d}: невязка застряла на {rn:.2e} — ограничитель заморожен", flush=True)
-            # CFL: рост по уменьшению невязки (SER)
-            if len(hist) >= 2 and hist[-2][1] == order:
+            # CFL: по формуле пользователя или рост по уменьшению невязки (SER)
+            if self.cfl_mode == "formula":
+                target = cfl_formula(self.cfl_formula, n=it, orders=float(np.log10(max(hist[0][0], 1e-300)
+                                                                                   / max(rn, 1e-300))),
+                                     res=rn / max(hist[0][0], 1e-300), cfl=cfl)
+                target = float(min(cfl_max, max(target, 1e-3)))
+                # защита от развала (отмена шага, откат) уменьшает CFL — после неё CFL возвращается
+                # к формуле постепенно (×1,25 за удачную итерацию)
+                last = getattr(self, "_cfl_target", None)
+                pen = getattr(self, "_cfl_pen", 1.0)
+                if last is not None and cfl < 0.99 * last * pen:
+                    pen = cfl / last
+                pen = min(1.0, pen * 1.25) if getattr(self, "_last_ok", True) else pen
+                self._cfl_target, self._cfl_pen = target, pen
+                cfl = target * pen
+            elif len(hist) >= 2 and hist[-2][1] == order:
                 if self.cfl_mode == "fixed":
                     # как постоянное число Куранта во Fluent (coupled, 50–200): рост до
                     # cfl_limit, дальше без изменений; уменьшение — только при неудаче шага

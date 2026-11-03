@@ -1933,6 +1933,22 @@ class App(tk.Tk):
             e_.bind("<KeyRelease>", lambda _: self.cfl_preset.set("свой"))
             self.cfl_vars[key] = v
         ttk.Label(bar5, text=" раз;  ограничитель:").pack(side="left")
+        # CFL по формуле (режим «по формуле»)
+        bar6 = ttk.Frame(fr, padding=(4, 0))
+        bar6.pack(side="top", fill="x")
+        ttk.Label(bar6, text="CFL по формуле:").pack(side="left")
+        self.cfl_formula = tk.StringVar(value="min(5*1.2**n, 1000)")
+        self.e_cfl_formula = ttk.Entry(bar6, textvariable=self.cfl_formula, width=40)
+        self.e_cfl_formula.pack(side="left", padx=4)
+        Tooltip(self.e_cfl_formula, "Действует в режиме шага «по формуле». Переменные: n — номер итерации на "
+                                    "угле (1, 2, 3, …), orders — на сколько порядков упала невязка, res — невязка / "
+                                    "начальная, cfl — текущий CFL. Функции: min, max, exp, log, log10, sqrt, abs, "
+                                    "pow, tanh, где(условие, a, b). Степень — ** или ^. Примеры: min(5*1.2**n, 500); "
+                                    "где(n < 50, 10, 200); min(5*10**orders, 1e4). «наиб.» ограничивает CFL сверху.")
+        self.cfl_formula_hint = tk.StringVar(value="")
+        ttk.Label(bar6, textvariable=self.cfl_formula_hint, foreground="#555").pack(side="left", padx=6)
+        self.cfl_formula.trace_add("write", lambda *_: self._check_cfl_formula())
+        self._check_cfl_formula()
         self.lim_zone = tk.StringVar(value="у задних кромок")
         ttk.Combobox(bar5, textvariable=self.lim_zone, values=list(self.LIMITER_ZONES), state="readonly",
                      width=16).pack(side="left")
@@ -1973,7 +1989,8 @@ class App(tk.Tk):
                    "как Fluent (Courant 200)": dict(cfl_start="5", cfl_limit="200", cfl_growth="1.25",
                                                     first_order="30", rollback_factor="100", mode="fixed"),
                    "осторожный": dict(cfl_start="2", cfl_limit="1e4", cfl_growth="1.1", first_order="60",
-                                      rollback_factor="20", mode="grow")}
+                                      rollback_factor="20", mode="grow"),
+                   "по формуле (CFL(n) ниже)": dict(mode="formula")}
 
     def _apply_cfl_preset(self):
         p = self.CFL_PRESETS.get(self.cfl_preset.get())
@@ -1983,6 +2000,22 @@ class App(tk.Tk):
                     self.cfl_mode_v = v
                 else:
                     self.cfl_vars[k].set(v)
+        self._check_cfl_formula()
+
+    def _check_cfl_formula(self):
+        """Проверка формулы CFL при вводе: CFL при n = 0, 10, 50, 200 — или ошибка."""
+        if not hasattr(self, "cfl_formula_hint"):
+            return
+        from .rans import cfl_formula
+        try:
+            vals = [cfl_formula(self.cfl_formula.get(), n=n_, orders=0.03 * n_, res=10 ** (-0.03 * n_), cfl=5.0)
+                    for n_ in (1, 10, 50, 200)]
+            txt = "CFL при n = 1/10/50/200: " + " / ".join(f"{v:.3g}" for v in vals)
+            if getattr(self, "cfl_mode_v", "") != "formula":
+                txt += "  (включите режим «по формуле»)"
+            self.cfl_formula_hint.set(txt)
+        except ValueError as e:
+            self.cfl_formula_hint.set("⚠ " + str(e))
 
     # зона ограничителя Венкатакришнана (RansSolver.limiter_zone)
     LIMITER_ZONES = {"у задних кромок": "te", "везде (как раньше)": "all", "нет": "off"}
@@ -1998,6 +2031,10 @@ class App(tk.Tk):
             raise ValueError("Невязки: CFL нач. > 0 и ≤ наибольшего, рост ≥ 1, откат при росте > 1")
         o["first_order"] = int(o["first_order"])
         o["cfl_mode"] = getattr(self, "cfl_mode_v", "grow")
+        if o["cfl_mode"] == "formula":
+            from .rans import cfl_formula
+            cfl_formula(self.cfl_formula.get(), n=0, orders=0.0, res=1.0, cfl=o["cfl_start"])   # ValueError — в окно
+            o["cfl_formula"] = self.cfl_formula.get()
         o["prec_fill"] = int(self.prec_fill.get())
         o["limiter_zone"] = self.LIMITER_ZONES.get(self.lim_zone.get(), "te")
         o["turb_model"] = self.TURB_MODELS[self.turb_model.get()]
