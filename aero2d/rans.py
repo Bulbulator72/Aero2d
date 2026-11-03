@@ -1128,7 +1128,9 @@ class RansSolver:
         w_fs = np.tile(winf, (self.nc, 1))
         w_fs[:, 1:3] *= np.clip(self.wall_d / 0.02, 0, 1)[:, None]
         R_fs = np.asarray(F_["res2f"](self.cons(jnp.asarray(w_fs)), jnp.asarray(winf), jnp.asarray(0.0)))
-        r_fs = float(np.sqrt(np.mean((R_fs / self.vol[:, None]) ** 2, 0)).sum())
+        rfs_eq = np.sqrt(np.mean((R_fs / self.vol[:, None]) ** 2, 0))
+        self._eq_w = self._eq_weights(rfs_eq)
+        r_fs = float((self._eq_w * rfs_eq).sum())
         warm = Q0 is not None
         if warm and self.vortex_bc:
             # циркуляция для вихревой поправки на внешней границе — сразу по начальному полю
@@ -1183,7 +1185,7 @@ class RansSolver:
             winf_j = jnp.asarray(winf)
             gm = jnp.asarray(self.gamma_vortex if self.vortex_bc else 0.0)
             R = np.asarray(resf(Qj, winf_j, gm))
-            rn = float(np.sqrt(np.mean((R / self.vol[:, None]) ** 2, 0)).sum())
+            rn = float((self._eq_w * np.sqrt(np.mean((R / self.vol[:, None]) ** 2, 0))).sum())
             # --- защита от развала: откат к состоянию с наименьшей невязкой
             manual = control is not None and control.rollback
             if manual:
@@ -1469,6 +1471,45 @@ class RansSolver:
                           [h[0] for h in hist], fr["elements"], Q, status, H)
 
 
+    def _turb_from(self, Q, out, winf):
+        """Перенос вихревой вязкости между SA и k-ω SST (тёплый старт другой моделью):
+        SA → SST: νt = ν̃·fv1, по Брэдшоу −u′v′ = a1·k = νt·Ω ⇒ k = νt·Ω/a1, ω = Ω/a1, у стенки
+        ω ≥ 6ν/(β1·d²), вдали — не меньше набегающего потока; SST → SA: ν̃ ≈ νt = k/ω."""
+        jnp = self.jnp
+        rho = Q[:, 0]
+        T = GAM * (GAM - 1) * (Q[:, 3] - 0.5 * (Q[:, 1] ** 2 + Q[:, 2] ** 2) / rho) / rho
+        mu = np.asarray(self.mu_lam(jnp.asarray(T)))
+        nu = mu / rho
+        if Q.shape[1] == 6:                              # SST → SA
+            nut = np.maximum(Q[:, 4] / rho, 0) * self.k_ref / (self.om_ref * np.exp(Q[:, 5] / rho))
+            out[:, 4] = rho * np.maximum(nut / self.nu_inf, winf[4])
+            return
+        uv = jnp.asarray(np.column_stack([Q[:, 1] / rho, Q[:, 2] / rho]))
+        gv = np.asarray(self._lsq(uv))                   # (nc,2,2)
+        Om = np.abs(gv[:, 1, 0] - gv[:, 0, 1])
+        X = np.maximum(Q[:, 4], 0) / rho * self.nu_inf / nu
+        nut = X ** 3 / (X ** 3 + CV1 ** 3) * np.maximum(Q[:, 4], 0) / rho * self.nu_inf
+        k_inf, wt_inf = winf[4] * self.k_ref, winf[5]
+        om = np.maximum(np.maximum(Om / SST_A1, 6 * nu / (SST_B1 * self.wall_d ** 2)), self.om_ref * np.exp(wt_inf))
+        k = np.maximum(nut * om, k_inf)
+        out[:, 4] = rho * k / self.k_ref
+        out[:, 5] = rho * np.log(om / self.om_ref)
+
+    def _eq_weights(self, rfs_eq=None):
+        """Веса уравнений в норме невязки (критерий сходимости, CFL): 1 у уравнений течения и SA.
+        У k-ω SST невязка уравнения ω̃ у стенки на порядки больше остальных (члены порядка βω ~ 10⁷
+        уравновешивают друг друга) и забивала норму — уравнения k и ω̃ взвешиваются так, чтобы
+        их невязка однородного потока была как в среднем у уравнений течения."""
+        w = np.ones(self.nv)
+        if self.nv == 6:
+            if rfs_eq is not None:
+                ref = float(np.mean(rfs_eq[:4]))
+                w[4:] = np.minimum(1.0, ref / np.maximum(rfs_eq[4:], 1e-300))
+                self._eq_w_sst = w.copy()
+            elif getattr(self, "_eq_w_sst", None) is not None:
+                w = self._eq_w_sst.copy()
+        return w
+
     def _convert_state(self, Q, winf):
         """Начальное поле другой модели турбулентности → переменные этой модели.
         SA (5) ↔ SA+AFT (7): ñ = 0, γ̃ = 0 / отбросить; SA ↔ k-ω SST (6): течение (ρ, ρu, ρv,
@@ -1480,6 +1521,10 @@ class RansSolver:
             out = np.empty((len(Q), nv))
             out[:, :4] = Q[:, :4]
             out[:, 4:] = Q[:, :1] * np.asarray(winf[4:])[None, :]
+            try:
+                self._turb_from(Q, out, winf)
+            except Exception:                            # noqa: BLE001 — оценка не обязательна
+                pass
             return out
         if Q.shape[1] > nv:                              # состояние с переходом → без
             return Q[:, :nv].copy()
@@ -1559,7 +1604,7 @@ class RansSolver:
                 Qj = jnp.asarray(Q)
                 Rs = np.asarray(resf(Qj, winf_j, gm))
                 Rt = Rs + vol * (c0 * Q + c1 * Qn + (c2 * Qnm1 if bdf2 else 0.0)) / dtp
-                rn = float(np.sqrt(np.mean((Rt / vol) ** 2, 0)).sum())
+                rn = float((self._eq_weights() * np.sqrt(np.mean((Rt / vol) ** 2, 0))).sum())
                 if not np.isfinite(rn):
                     break
                 if verbose and verbose > 1:
