@@ -1962,7 +1962,8 @@ class App(tk.Tk):
 
     TURB_MODELS = {"SA (Спаларт–Аллмарас)": "sa",
                    "SA-RC (поправка на кривизну)": "sa-rc",
-                   "SA-AFT (переход, Ñкрит из окна)": "sa-aft"}
+                   "SA-AFT (переход, Ñкрит из окна)": "sa-aft",
+                   "k-ω SST (Menter 2003, проверяется)": "sst"}
 
     # режимы шага: "обычный" — CFL растёт, пока шаги Ньютона удаются (адаптивный, как в SU2);
     # «как Fluent» — CFL растёт до 200 и дальше постоянный (число Куранта coupled-решателя
@@ -2113,6 +2114,8 @@ class App(tk.Tk):
             orders = None
         rfs = D.get("r_fs", {})
         names = ["неразрывность", "импульс x", "импульс y", "энергия", "турбулентность ν̃", "переход ñ", "перемежаемость γ"]
+        if any(np.array(D["angles"][a_]["res"]).shape[1] == 6 for a_ in angs):      # k-ω SST
+            names = names[:4] + ["турбулентность k", "диссипация ω"]
         import matplotlib as mpl
         cmap = mpl.colormaps["turbo"]
         show = angs if sel == "все углы" else [float(sel)]
