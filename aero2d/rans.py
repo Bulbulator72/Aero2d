@@ -37,7 +37,8 @@ CB1, SIG, CB2, KAP = 0.1355, 2.0 / 3.0, 0.622, 0.41
 AFT_SIGN, AFT_C1, AFT_C2, AFT_C3, AFT_SIGY, CT3 = 1.0, 100.0, 0.06, 50.0, 1.0, 1.2
 CW1 = CB1 / KAP**2 + (1 + CB2) / SIG
 CW2, CW3, CV1, CV2, CV3, CN1 = 0.3, 2.0, 7.1, 0.7, 0.9, 16.0
-# k-ω SST (Menter 2003, NASA TMR «SST-2003»): набор 1 — у стенки, набор 2 — вдали (k-ε)
+# k-ω SST (Menter 2003 с поддерживающими членами — NASA TMR «SST-2003-sust»): набор 1 — у
+# стенки, набор 2 — вдали (k-ε)
 SST_SK1, SST_SW1, SST_B1, SST_G1 = 0.85, 0.5, 0.075, 5.0 / 9.0
 SST_SK2, SST_SW2, SST_B2, SST_G2 = 1.0, 0.856, 0.0828, 0.44
 SST_BS, SST_A1 = 0.09, 0.31
@@ -584,10 +585,14 @@ class RansSolver:
         bl = lambda c1, c2: F1 * c1 + (1 - F1) * c2
         beta, gam, sw = bl(SST_B1, SST_B2), bl(SST_G1, SST_G2), bl(SST_SW1, SST_SW2)
         P = jnp.minimum(mut * S2, 10 * SST_BS * rho * om * k)
-        Sk = (P - SST_BS * rho * om * k) / kr
+        # поддерживающие члены SST-sust (Spalart–Rumsey, NASA TMR «SST-2003-sust»): без них k и ω
+        # набегающего потока затухают по пути к телу (на 50 хорд ω падает в сотни раз)
+        ki, wti = self.sst_inf()
+        k_inf, om_inf = ki * kr, wr * np.exp(wti)
+        Sk = (P - SST_BS * rho * om * k + SST_BS * rho * om_inf * k_inf) / kr
         Pw = gam * rho * jnp.minimum(S2, 10 * SST_BS * om * k * rho / jnp.maximum(mut, 1e-30 * mu)) / om
         Gw = mu + sw * mut
-        Sw = (Pw - beta * rho * om + Gw * jnp.sum(gw * gw, 1)
+        Sw = (Pw - beta * rho * om + beta * rho * om_inf ** 2 / om + Gw * jnp.sum(gw * gw, 1)
               + 2 * (1 - F1) * rho * SST_SW2 * kw / om)
         return mut, F1, jnp.stack([Sk, Sw], 1)
 
