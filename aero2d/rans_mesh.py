@@ -67,6 +67,7 @@ class MeshOptions:
     # сгущения — след любого угла поляры идёт по мелкой сетке (раньше 0°, 6°, 12° и 0,6c:
     # при α > 5° след уходил на крупные треугольники, сходимость застревала)
     wake_alphas: tuple = tuple(float(a) for a in range(-4, 21, 2))
+    cblock: bool = True            # True — С-блоки + треугольники; False — слой gmsh (прежний генератор)
     far_radius: float = 50.0
     far_size: float = 8.0
 

@@ -1805,7 +1805,7 @@ def mesh_for(elements, alpha, re, chord=1.0, fine=False, opts=None):
     near = o.near_size or ((0.002 if fine else 0.003) if multi else 0.004)
     kw = dict(yplus=o.yplus, ratio=o.ratio, bl_thickness=(o.bl_thickness or None), far_radius=o.far_radius,
               far_size=o.far_size, slot_size=near * chord, growth=o.growth,
-              wake_block=(o.wake_length if o.wake_refine else 0.0))
+              wake_block=(o.wake_length if o.wake_refine else 0.0), cblock=getattr(o, "cblock", True))
     if o.wake_refine:
         wk = []
         for a_ in (o.wake_alphas or (0.0,)):

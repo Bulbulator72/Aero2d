@@ -1611,6 +1611,15 @@ class App(tk.Tk):
         self.mesh_wake = tk.BooleanVar(value=True)
         ttk.Checkbutton(side, text="сгущать по линиям следа", variable=self.mesh_wake).grid(
             row=r0, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.mesh_gen = tk.StringVar(value=list(self.MESH_GENERATORS)[0])
+        gcb = ttk.Combobox(side, textvariable=self.mesh_gen, values=list(self.MESH_GENERATORS),
+                           state="readonly", width=30)
+        gcb.grid(row=r0 + 1, column=0, columnspan=2, sticky="we", pady=(4, 0))
+        Tooltip(gcb, "С-блок — четырёхугольники у стенки и вдоль следа, лучшие показатели качества, но на "
+                     "NACA 0012 при α = 0 (Re 6e6) расчёт пока не сходится — разбираюсь. Слой gmsh — прежний "
+                     "генератор: качество хуже (веер у острой кромки), зато тот же случай сходится "
+                     "(Cd 0,00807 при эталоне NASA 0,00819).")
+        r0 += 1
         ttk.Button(side, text="Построить и показать сетку", command=self.build_mesh_preview).grid(
             row=r0 + 1, column=0, columnspan=2, sticky="we", pady=(8, 2))
         ttk.Button(side, text="Параметры по умолчанию", command=self.reset_mesh_opts).grid(
@@ -1680,6 +1689,9 @@ class App(tk.Tk):
             self.mesh_vars[key].set(val)
         self.mesh_wake.set(True)
 
+    MESH_GENERATORS = {"генератор: С-блок (качество лучше)": True,
+                       "генератор: слой gmsh (сходится надёжнее)": False}
+
     def mesh_opts(self):
         from .rans_mesh import MeshOptions
         kw = {}
@@ -1691,7 +1703,8 @@ class App(tk.Tk):
             kw[key] = int(v) if key == "n_surface" else v
         if kw["yplus"] <= 0 or not 1.0 < kw["ratio"] < 2.0:
             raise ValueError("Сетка: y⁺ > 0, рост слоя от 1 до 2")
-        return MeshOptions(wake_refine=self.mesh_wake.get(), **kw)
+        return MeshOptions(wake_refine=self.mesh_wake.get(),
+                           cblock=self.MESH_GENERATORS.get(self.mesh_gen.get(), True), **kw)
 
     @staticmethod
     def _mesh_signature(af, re, alpha, opts):
