@@ -377,6 +377,10 @@ def _c_block(x, y, h0, ratio, t, smin, wake_len, obstacles=(), wake_size=0.008, 
     # прежний рост «по доле длины» давал скачки высоты соседних столбцов в разы)
     h1w = np.minimum(h0 * (s_e / h0) ** xi, h0 * 1.8 ** (np.arange(len(d)) + 1))
     top = np.maximum(sk, h_top0 * (1 - xi) + s_e * xi)
+    # за кромкой стенки нет: первая ячейка у разреза растёт не медленнее 1,25 на столбец (раньше
+    # она оставалась ~h0 на трети хорды — ячейки с удлинением ~1000 в следе, на них расчёт
+    # NACA 0012 при α = 0 раскачивался); не выше половины верхнего ряда
+    h1w = np.minimum(np.maximum(h1w, h0 * 1.25 ** (np.arange(len(d)) + 1)), np.maximum(0.5 * top, h1w))
     Tw = np.maximum(_thick_for_top(h1w, top, n), T0 * (1 - xi))
     Tw = np.minimum(Tw, np.maximum(clr_l(d) / 3.0, T0))
     W = np.column_stack([np.interp(d, sl, P_c[:, 0]), np.interp(d, sl, P_c[:, 1])])
