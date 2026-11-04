@@ -58,36 +58,34 @@ def header():
 
 
 def naca():
-    import numpy as np
     from aero2d.geometry import naca4, repanel
-    from aero2d.rans import RansSolver
+    from aero2d.rans import Convergence, rans_polar
     from aero2d.rans_mesh import build_mesh, quality
     TMR = {0.0: (0.0, 0.00819), 10.0: (1.0909, 0.01231)}
     af = repanel(naca4("0012", 200), 130)
     t = time.time()
     mesh = build_mesh([af], re=6e6, far_radius=50)
-    log(f"\n--- NACA 0012, M 0,15, Re 6e6: сетка {quality(mesh)['cells']} ячеек ({time.time() - t:.1f} с)")
+    log(f"\n--- NACA 0012, M 0,15, Re 6e6: сетка {quality(mesh)['cells']} ячеек ({time.time() - t:.1f} с), "
+        f"{getattr(mesh, 'generator', '')}")
     log("эталон NASA TMR (CFL3D): α=0: Cd 0,00819; α=10: Cl 1,0909, Cd 0,01231")
-    # ограничитель: "te" — только у задних кромок (по умолчанию с 10.2026), "all" — везде (как раньше)
+    # как в окне программы: поляра, первый угол — с быстрым стартом на грубой сетке
     for zone in ("te", "all"):
-        s = RansSolver(mesh, 0.15, 6e6)
-        s.limiter_zone = zone
-        Q, a0 = None, None
-        for a in (0.0, 10.0):
-            t = time.time()
-            r = s.solve(a, Q0=Q, max_iter=400, alpha0=a0)
-            ref = TMR[a]
-            log(f"ограничитель {zone:3s} α {a:4.1f}: Cl {r.cl:.4f} (эталон {ref[0]:.4f})  Cd {r.cd:.5f} "
-                f"(эталон {ref[1]:.5f}; давл. {r.cdp:.5f}, трение {r.cdf:.5f})  итераций {r.iterations}, "
-                f"{r.status}, {time.time() - t:.0f} с")
-            Q, a0 = r.state, a
-        # та же точка отдельно (с нуля) — должна совпасть с точкой поляры
         t = time.time()
-        r1 = RansSolver(mesh, 0.15, 6e6)
-        r1.limiter_zone = zone
-        r1 = r1.solve(10.0, max_iter=400)
+        res, _ = rans_polar([af], [0.0, 10.0], 6e6, mach=0.15, mesh=mesh, max_iter=400, conv=Convergence(),
+                            workers=1, coarse_start=True, solver_opts={"limiter_zone": zone})
+        for r in res:
+            ref = TMR[r.alpha]
+            log(f"ограничитель {zone:3s} α {r.alpha:4.1f}: Cl {r.cl:.4f} (эталон {ref[0]:.4f})  Cd {r.cd:.5f} "
+                f"(эталон {ref[1]:.5f}; давл. {r.cdp:.5f}, трение {r.cdf:.5f})  итераций {r.iterations}, "
+                f"{r.status}")
+        log(f"   поляра 0°, 10°: {time.time() - t:.0f} с")
+        # та же точка отдельно — должна совпасть с точкой поляры
+        t = time.time()
+        r1 = rans_polar([af], [10.0], 6e6, mach=0.15, mesh=mesh, max_iter=400, conv=Convergence(), workers=1,
+                        coarse_start=True, solver_opts={"limiter_zone": zone})[0][0]
+        r = res[1]
         log(f"ограничитель {zone:3s} α 10,0 отдельно: Cl {r1.cl:.4f} Cd {r1.cd:.5f} (в поляре {r.cl:.4f} / "
-            f"{r.cd:.5f}), итераций {r1.iterations}, {time.time() - t:.0f} с")
+            f"{r.cd:.5f}), итераций {r1.iterations}, {r1.status}, {time.time() - t:.0f} с")
 
 
 def gaw():

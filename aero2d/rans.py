@@ -1924,8 +1924,11 @@ def coarse_options(elements, opts=None):
     n_side = o.n_surface or max(len(e.x) for e in elements) // 2
     multi = len(elements) > 1
     near = o.near_size or (0.003 if multi else 0.004)
+    # грубая сетка — генератором gmsh (слой у стенки): с однородного потока на нём расчёт
+    # устанавливается надёжно, а на мелком следе С-блока переход 1-й → 2-й порядок раскачивается;
+    # с перенесённого поля С-блок сходится сразу (NACA 0012, α = 0: 52 итерации, Cd 0,00792)
     return replace(o, n_surface=max(40, int(n_side) // 2), near_size=2.5 * near, wake_size=2.5 * o.wake_size,
-                   ratio=max(o.ratio, 1.3), growth=max(o.growth, 0.35))
+                   ratio=max(o.ratio, 1.3), growth=max(o.growth, 0.35), cblock=False)
 
 
 class _ProcControl(RansControl):
