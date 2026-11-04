@@ -199,6 +199,8 @@ class RansSolver:
         self.vortex_bc = vortex_bc
         self.turbulent = turbulent
         self.limiter_k = 5.0
+        self.turb_order = 1            # порядок переноса переменных турбулентности (1 — устойчивее; 2 — как
+        #                                было до 11.2026: ν̃ — вторым, ñ и γ̃ — первым)
         # где действует ограничитель: "te" — только у задних кромок (веер вырожденных
         # ячеек, ради которого он нужен; в гладком дозвуковом течении ограничитель
         # «дребезжит» и не даёт невязке падать), "all" — везде, "off" — нигде
@@ -736,9 +738,14 @@ class RansSolver:
             # положительность ρ, p
             wL = jnp.where((wL[:, [0]] > 0.2 * w[iL][:, [0]]) & (wL[:, [3]] > 0.2 * w[iL][:, [3]]), wL, w[iL])
             wR = jnp.where((wR[:, [0]] > 0.2 * w[iR][:, [0]]) & (wR[:, [3]] > 0.2 * w[iR][:, [3]]), wR, w[iR])
-            if w.shape[1] > 5:                   # ñ, γ̃ — перенос первого порядка (устойчивость)
-                wL = wL.at[:, 5:].set(w[iL, 5:])
-                wR = wR.at[:, 5:].set(w[iR, 5:])
+            # переменные турбулентности (ν̃; k, ω; ñ, γ̃) — перенос первого порядка, как по умолчанию в
+            # CFL3D и FUN3D: со вторым порядком без ограничителя ν̃ в следе за концом блока
+            # четырёхугольников (NACA 0012, 75 тыс. ячеек, α = 0) раскачивался до ±10⁵ и расчёт
+            # разваливался; на силы в эталонных случаях NASA TMR это почти не влияет
+            k0 = 4 if self.turb_order == 1 else 5
+            if w.shape[1] > k0:
+                wL = wL.at[:, k0:].set(w[iL, k0:])
+                wR = wR.at[:, k0:].set(w[iR, k0:])
         else:
             wL, wR = w[iL], w[iR]
         Fc = self.roe(wL, wR, J["n_i"])
@@ -998,7 +1005,7 @@ class RansSolver:
         return (self.nv, self.turb_model, self.aft_version, float(self.ncrit), float(self.limiter_k),
                 self.limiter_zone,
                 float(self.zmin), bool(self.sa_raw_grad), bool(self.visc_raw_grad), int(self.rc_smooth),
-                bool(self.turbulent), float(self.chi_inf), float(self.chi_inf_tr), self.xref)
+                bool(self.turbulent), float(self.chi_inf), float(self.chi_inf_tr), self.xref, int(self.turb_order))
 
     def _fns(self):
         """Скомпилированные (jax.jit) невязки, произведения якобиана на вектор и
