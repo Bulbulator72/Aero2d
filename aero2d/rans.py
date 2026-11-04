@@ -199,6 +199,7 @@ class RansSolver:
         self.vortex_bc = vortex_bc
         self.turbulent = turbulent
         self.limiter_k = 5.0
+        self.cfl_reset_on_order = True  # при переходе с 1-го на 2-й порядок — CFL заново с начального
         self.turb_order = 1            # порядок переноса переменных турбулентности (1 — устойчивее; 2 — как
         #                                было до 11.2026: ν̃ — вторым, ñ и γ̃ — первым)
         # где действует ограничитель: "te" — только у задних кромок (веер вырожденных
@@ -1236,6 +1237,15 @@ class RansSolver:
                     control.cfl_factor = 1.0
                     events.append((it, f"CFL вручную → {cfl:.3g}", np.nan, []))
             order = 1 if (it <= first_order_iters and Q0 is None) or it <= first_until else self.order
+            if (order == 2 and getattr(self, "_prev_order", order) == 1 and self.cfl_reset_on_order
+                    and getattr(self, "cfl_hold_value", None) is None):
+                # переход с 1-го на 2-й порядок — заново с начального CFL: поле первого порядка
+                # (толстый пограничный слой) ещё сильно меняется, и при CFL ~ 10² на С-блоке
+                # (NACA 0012, α = 0, 74 тыс. ячеек) расчёт раскачивался; с тёплого старта при CFL 5
+                # тот же случай сходится за 52 итерации
+                cfl = cfl0
+                ilu_state = None
+            self._prev_order = order
             if order == 1:
                 resf, jvpf = res1, jvp1
             elif phi is None:
