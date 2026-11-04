@@ -325,6 +325,17 @@ def _c_block(x, y, h0, ratio, t, smin, wake_len, obstacles=(), wake_size=0.008, 
         if np.allclose(T2, TS):
             break
         TS = T2
+    # и по длине дуги: толщина меняется не круче 0,2 на единицу длины — при мелком шаге на носке
+    # (≈ 10⁻⁴ c) правило «×1,2 между соседями» давало узкий клин (с треугольниками VC ≈ 45 внутри,
+    # расчёт не сходился); теперь тонкое место — плавная ямка
+    seg_S = np.hypot(*np.diff(np.vstack([S, S[:1]]), axis=0).T)
+    for _ in range(3):
+        for i in range(1, M):
+            TS[i] = min(TS[i], TS[i - 1] + 0.2 * seg_S[i - 1])
+        TS[0] = min(TS[0], TS[-1] + 0.2 * seg_S[-1])
+        for i in range(M - 2, -1, -1):
+            TS[i] = min(TS[i], TS[i + 1] + 0.2 * seg_S[i])
+        TS[-1] = min(TS[-1], TS[0] + 0.2 * seg_S[-1])
     T0 = float(TS[0])
     h_top0 = float(h0 * _ratio_for(h0, T0, n) ** (n - 1))
     # --- линия следа: биссектриса кромки, затем — направление потока
