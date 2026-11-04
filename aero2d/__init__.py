@@ -7,4 +7,4 @@ import os as _os
 _os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
 # версия — дата сборки; показывается в заголовке окна и в aero2d.exe --selftest
-__version__ = "2026.11.06-2 (быстрый старт на сетке gmsh: С-блок сходится)"
+__version__ = "2026.11.06-3 (слой 0,02c у одного профиля)"
