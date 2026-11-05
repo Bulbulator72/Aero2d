@@ -293,7 +293,12 @@ def _c_block(x, y, h0, ratio, t, smin, wake_len, obstacles=(), wake_size=0.008, 
     obst = np.asarray(obstacles) if len(obstacles) else None
     ht = float(h0 * _ratio_for(h0, t, n) ** (n - 1))           # верхний ряд у стенки
     blunt = False                                  # тупые кромки — в c_block (_cblock_slot)
-    x, y = _coarsen_te(x, y, te_w or 1.2 * ht)
+    # шаг у кромки — не крупнее половины шага блока: при 1,2·ht шаг выходил то 0,0042 (и
+    # делился пополам по cap до 0,0021), то 0,0037 (не делился) — от округления числа слоёв;
+    # у кромки оставался столбец вдвое шире, и при y⁺ 0,5 расчёт не сходился (NACA 0012,
+    # α 10°). Мельче 1,2·ht не берём: узкие высокие столбцы у кромки перекашиваются
+    cap_v = float(np.clip(4.0 * ht, 0.4 * smin, smin))
+    x, y = _coarsen_te(x, y, te_w or min(1.2 * ht, 0.5 * cap_v))
     loop = np.column_stack([x, y])
     fixed = np.zeros(len(loop), bool)
     t1, t2 = loop[1] - loop[0], loop[-1] - loop[0]
