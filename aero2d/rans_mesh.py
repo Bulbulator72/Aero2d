@@ -380,6 +380,20 @@ def cell_quality(mesh: Mesh) -> dict:
     nonortho = np.zeros(n)
     np.maximum.at(nonortho, l[m], no)
     np.maximum.at(nonortho, r[m], no)
+    # вывернутые ячейки: при сборке сетки все ячейки разворачиваются против часовой
+    # стрелки, поэтому вывернутый треугольник получает положительную площадь и по
+    # углам не виден. Его выдаёт грань, у которой обе ячейки лежат по одну сторону.
+    fc = mesh.face_center[m]
+    nf = mesh.face_normal[m]
+    sl = np.sum((mesh.centroid[l[m]] - fc) * nf, 1)
+    sr = np.sum((mesh.centroid[r[m]] - fc) * nf, 1)
+    folded = np.zeros(n, bool)
+    bad = sl * sr >= 0
+    folded[l[m][bad]] = True
+    folded[r[m][bad]] = True
+    det[folded] = -1.0
+    qual[folded] = -1.0
+    amin[folded] = np.minimum(amin[folded], 0.0)
     return dict(det=det, quality=np.clip(qual, -1.0, 1.0), angle=amin, vol_ratio=vol_ratio, nonortho=nonortho)
 
 
