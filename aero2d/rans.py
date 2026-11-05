@@ -245,6 +245,7 @@ class RansSolver:
         # отмены неудачного шага (откат остаётся только при NaN — иначе расчёт не продолжить —
         # и по кнопке «Откат к лучшему»)
         self.rollback_auto = True
+        self.cfl_lin_back = 0.7         # множитель CFL, если GMRES сошёлся хуже чем до 0,25 (1 — не снижать)
         self.rollback_first_order = 15 # после отката из-за NaN — итераций первым порядком (при
                                        # росте невязки — нет: первый порядок уводит от уже
                                        # сошедшегося решения второго порядка)
@@ -1404,7 +1405,12 @@ class RansSolver:
                 else:                                   # рост, пока шаги удаются
                     ok_ = getattr(self, "_last_ok", True)
                     lin_ = getattr(self, "_last_lin", 0.0)
+                    # GMRES решил линейную задачу хуже чем на 0,25 — CFL снижается: при большом
+                    # шаге матрица плохо обусловлена (тонкие ячейки у стенки, y⁺ 0,5), неточный
+                    # шаг Ньютона не гасит общие моды поля, невязка стоит, а Cl «гуляет»
+                    # (NACA 0012, α 10°: Cl 1,00 вместо 1,09)
                     grow = (self.cfl_growth if rn < 1.2 * hist[-2][0] and ok_ and lin_ < 0.25 else
+                            self.cfl_lin_back if lin_ >= 0.25 and ok_ and rn < 3.0 * hist[-2][0] else
                             1.0 if rn < 3.0 * hist[-2][0] and ok_ else 0.5)
                     cfl = min(cfl_max, max(cfl0, cfl * grow))
             if getattr(self, "cfl_hold_value", None) is not None:
