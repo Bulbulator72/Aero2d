@@ -35,7 +35,14 @@ VARIANTS = {
     "nolim": ("без ограничителя", {"limiter_zone": "off"}, {}),
     "ratio11": ("сетка: рост слоя 1,1 вместо 1,2", {}, {"ratio": 1.1}),
     "yplus05": ("сетка: y+ 0,5 вместо 1", {}, {"yplus": 0.5}),
+    # серия по y+ без ограничителя (так расчёт сходится лучше всего): куда идёт решение
+    # при измельчении у стенки — к эталону или от него
+    "yp2": ("серия y+: 2, без ограничителя", {"limiter_zone": "off"}, {"yplus": 2.0}),
+    "yp1": ("серия y+: 1, без ограничителя", {"limiter_zone": "off"}, {"yplus": 1.0}),
+    "yp05": ("серия y+: 0,5, без ограничителя", {"limiter_zone": "off"}, {"yplus": 0.5}),
+    "yp025": ("серия y+: 0,25, без ограничителя", {"limiter_zone": "off"}, {"yplus": 0.25}),
 }
+SERIES = ("yp2", "yp1", "yp05", "yp025")
 
 
 def log(s):
@@ -75,7 +82,8 @@ def run(name):
 
 
 def main():
-    names = [a for a in sys.argv[1:] if a in VARIANTS] or list(VARIANTS)
+    # без аргументов — серия по y+ (первые 6 вариантов уже посчитаны 2026-11-05)
+    names = [a for a in sys.argv[1:] if a in VARIANTS] or list(SERIES)
     import aero2d
     log(f"=== Поиск причины низкого Cd, NACA 0012 α 10°; aero2d {aero2d.__version__}; "
         f"{time.strftime('%Y-%m-%d %H:%M')}; ядер {os.cpu_count()}")
