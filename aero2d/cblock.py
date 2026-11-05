@@ -26,6 +26,40 @@ class BlockError(RuntimeError):
     pass
 
 
+def _node_tangents(x, y, closed=True, corner_deg=20.0):
+    """Единичные касательные в узлах контура для деления отрезков по гладкой кривой:
+    в гладком узле — биссектриса соседних отрезков, в угле (излом больше corner_deg,
+    острая кромка, углы щелей) — у каждого отрезка своя (его направление): там кривая
+    остаётся прямой. Возвращает (t_out, t_in): касательная в начале отрезка k и в конце
+    отрезка k−1 для узла k."""
+    P = np.column_stack([x, y])
+    n = len(P)
+    d = np.roll(P, -1, axis=0) - P                     # отрезок k: P[k] → P[k+1]
+    L = np.maximum(np.hypot(d[:, 0], d[:, 1]), 1e-300)
+    u = d / L[:, None]
+    up = np.roll(u, 1, axis=0)                         # отрезок k−1
+    cosang = np.clip(np.sum(u * up, 1), -1.0, 1.0)
+    smooth = cosang > np.cos(np.radians(corner_deg))
+    b = u + up
+    b /= np.maximum(np.hypot(b[:, 0], b[:, 1]), 1e-300)[:, None]
+    t_out = np.where(smooth[:, None], b, u)
+    t_in = np.where(smooth[:, None], b, up)
+    if not closed:
+        t_out[0], t_in[-1] = u[0], up[-1]
+    return t_out, t_in
+
+
+def _hermite_point(a, b, ta, tb, s):
+    """Точка кубической кривой Эрмита между узлами a и b (касательные ta, tb — единичные)
+    при параметре s ∈ [0, 1]."""
+    L = float(np.hypot(*(b - a)))
+    h00 = 2 * s**3 - 3 * s**2 + 1
+    h10 = s**3 - 2 * s**2 + s
+    h01 = -2 * s**3 + 3 * s**2
+    h11 = s**3 - s**2
+    return h00 * a + h10 * L * ta + h01 * b + h11 * L * tb
+
+
 def _subdivide(x, y, smin, grade=1.25, closed=True):
     """Замкнутый контур (без повтора первой точки): отрезки длиннее smin делятся, а шаги
     соседних отрезков после деления различаются не больше чем в grade раз (длинный
@@ -45,11 +79,15 @@ def _subdivide(x, y, smin, grade=1.25, closed=True):
         if np.allclose(T2, T):
             break
         T = T2
+    # новые точки — на гладкой кривой через узлы (кубический Эрмит), а не на прямой: при
+    # делении по прямой контур становился многоугольником с изломами 2–6° через 4 грани у
+    # носка, и над каждым изломом — свой пик разрежения (Cp «пилой», ±0,3 у носка NACA 0012)
+    t_out, t_in = _node_tangents(np.asarray(x, float), np.asarray(y, float), closed)
     for k in range(n if closed else n - 1):
         a, b = np.array([x[k], y[k]]), np.array([x[(k + 1) % n], y[(k + 1) % n]])
         m = max(1, int(np.ceil(Lk[k] / T[k] - 1e-9)))
         for j in range(m):
-            p = a + (b - a) * j / m
+            p = _hermite_point(a, b, t_out[k], t_in[(k + 1) % n], j / m)
             xs.append(p[0])
             ys.append(p[1])
     if not closed:
