@@ -43,15 +43,31 @@ def _cosine_spacing(n: int) -> np.ndarray:
     return 0.5 * (1.0 - np.cos(beta))
 
 
-def naca4(code: str, n_side: int = 100, closed_te: bool = True) -> Airfoil:
-    """NACA 4-значный профиль. n_side — число точек на каждой стороне."""
+NACA_TMR_X0 = 1.008930411365   # ноль полутолщины исходной формулы NACA (a4 = −0,1015)
+
+
+def naca4(code: str, n_side: int = 100, closed_te: bool = True, scaled_te: bool = False) -> Airfoil:
+    """NACA 4-значный профиль. n_side — число точек на каждой стороне.
+    closed_te — острая кромка заменой a4 на −0,1036 (форма немного толще исходной).
+    scaled_te — острая кромка, как в NASA TMR (turbmodels.larc.nasa.gov): исходная
+    формула (a4 = −0,1015) продлена до нуля толщины при x = 1,00893 и сжата до
+    хорды 1. С этим профилем сравнивают с данными TMR: замена a4 даёт другой
+    профиль, и Cd при α = 10° отличается на ~0,001."""
     m = int(code[0]) / 100.0
     p = int(code[1]) / 10.0
     t = int(code[2:]) / 100.0
     xc = _cosine_spacing(n_side)
-    a4 = -0.1036 if closed_te else -0.1015
-    yt = 5 * t * (0.2969 * np.sqrt(xc) - 0.1260 * xc - 0.3516 * xc**2
-                  + 0.2843 * xc**3 + a4 * xc**4)
+    if scaled_te:
+        xs = xc * NACA_TMR_X0
+        a4 = -0.1015
+        yt = 5 * t * (0.2969 * np.sqrt(xs) - 0.1260 * xs - 0.3516 * xs**2
+                      + 0.2843 * xs**3 + a4 * xs**4) / NACA_TMR_X0
+        yt[-1] = 0.0
+        closed_te = True
+    else:
+        a4 = -0.1036 if closed_te else -0.1015
+        yt = 5 * t * (0.2969 * np.sqrt(xc) - 0.1260 * xc - 0.3516 * xc**2
+                      + 0.2843 * xc**3 + a4 * xc**4)
     yc = np.zeros_like(xc)
     dyc = np.zeros_like(xc)
     if m > 0 and p > 0:
