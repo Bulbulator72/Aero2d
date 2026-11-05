@@ -27,6 +27,7 @@ class BlockError(RuntimeError):
 
 
 WAKE_H1_GROWTH = 0.0          # >1 — рост первой ячейки у разреза следа на столбец
+WAKE_AR_MAX = 0.0             # >0 — наибольшее отношение ширины столбца следа к первой ячейке
 
 
 def _node_tangents(x, y, closed=True, corner_deg=20.0):
@@ -439,6 +440,8 @@ def _c_block(x, y, h0, ratio, t, smin, wake_len, obstacles=(), wake_size=0.008, 
         # столбец, не выше половины верхнего ряда (иначе высота ~h0 тянется на треть хорды)
         h1w = np.minimum(np.maximum(h1w, h0 * WAKE_H1_GROWTH ** (np.arange(len(d)) + 1)),
                          np.maximum(0.5 * top, h1w))
+    if WAKE_AR_MAX > 0.0:
+        h1w = np.minimum(np.maximum(h1w, sk / WAKE_AR_MAX), np.maximum(0.5 * top, h1w))
     Tw = np.maximum(_thick_for_top(h1w, top, n), T0 * (1 - xi))
     Tw = np.minimum(Tw, np.maximum(clr_l(d) / 3.0, T0))
     W = np.column_stack([np.interp(d, sl, P_c[:, 0]), np.interp(d, sl, P_c[:, 1])])
