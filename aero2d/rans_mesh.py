@@ -74,12 +74,19 @@ class MeshOptions:
 
 def build_mesh(elements, chord=1.0, re=1e6, yplus=1.0, ratio=1.2, bl_thickness=None,
                far_radius=50.0, far_size=8.0, surf_ratio=1.0, wakes=None, wake_size=0.01,
-               slot_size=None, verbose=False, growth=0.25, cblock=True, wake_block=1.0):
+               slot_size=None, verbose=False, growth=0.25, cblock=True, wake_block=1.0,
+               wake_h1_growth=None):
     """elements — список Airfoil (обход: ЗК → верх → носок → низ → ЗК), в общей
     системе координат; Re — по хорде chord. Первый шаг у стенки — по оценке
     y⁺ = yplus для турбулентной пластины (Cf ≈ 0,026 Re^(−1/7)).
     wakes — список ломаных (x, y) линий следа для сгущения; wake_block — длина блока
-    четырёхугольников вдоль следа, хорд (0 — без него: короткий разрез у кромки)."""
+    четырёхугольников вдоль следа, хорд (0 — без него: короткий разрез у кромки).
+    wake_h1_growth — рост первой ячейки у разреза следа на столбец (None — по y⁺: 1,15 при
+    y⁺ ≥ 1, иначе выключен). За кромкой стенки нет, а высота ~h0 тянулась далеко по следу:
+    ν̃ на оси следа неустойчив, и на сетках y⁺ 1–2 Cl NACA 0012 (α 10°) был 1,064 или
+    расчёт не сходился; с ростом 1,15 — 1,086–1,089 (эталон 1,0909) за ~52 итерации.
+    На сетках y⁺ ≤ 0,5 рост, наоборот, мешает (не сходится и за 1500 итераций), а без
+    него они сходятся: Cl 1,0895 (0,5) и 1,0911 (0,25). Проверка 2026-11-06."""
     import gmsh
     cf = 0.026 * re ** (-1 / 7)
     h0 = yplus * chord / (re * np.sqrt(cf / 2))
@@ -107,7 +114,9 @@ def build_mesh(elements, chord=1.0, re=1e6, yplus=1.0, ratio=1.2, bl_thickness=N
         try:
             m = build_cblock_mesh(elements, chord, h0, ratio, bl_thickness, far_radius, far_size, wakes,
                                   wake_size, 0.004 * chord if slot_size is None else slot_size, growth,
-                                  wake_len=wake_block, verbose=verbose)
+                                  wake_len=wake_block, verbose=verbose,
+                                  wake_h1_growth=(1.15 if yplus >= 0.99 else 0.0) if wake_h1_growth is None
+                                  else wake_h1_growth)
             m.generator = "С-блок у каждого элемента + треугольники"
             return m
         except Exception as e:                         # noqa: BLE001 — запасной вариант ниже

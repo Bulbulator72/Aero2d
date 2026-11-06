@@ -114,7 +114,8 @@ def test_continue_rans_appends_history():
 def test_rollback_keeps_best_state():
     from aero2d.rans import RansSolver
     from aero2d.rans_mesh import build_mesh
-    m = build_mesh([repanel(naca4("0012", 120), 60)], re=1e6, far_radius=20)
+    # сетка без роста ячейки следа: на ней невязка в начале растёт и откат гарантирован
+    m = build_mesh([repanel(naca4("0012", 120), 60)], re=1e6, far_radius=20, wake_h1_growth=0.0)
     s = RansSolver(m, 0.15, 1e6)
     s.rollback_factor, s.max_rollbacks = 1.05, 2          # искусственно частые откаты
     r = s.solve(0.0, max_iter=40)

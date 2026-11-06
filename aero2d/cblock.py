@@ -26,7 +26,8 @@ class BlockError(RuntimeError):
     pass
 
 
-WAKE_H1_GROWTH = 0.0          # >1 — рост первой ячейки у разреза следа на столбец
+WAKE_H1_GROWTH = 0.0          # >1 — рост первой ячейки у разреза следа на столбец (если не задан
+                              # явно; build_mesh задаёт его по y⁺, см. rans_mesh.build_mesh)
 WAKE_AR_MAX = 0.0             # >0 — наибольшее отношение ширины столбца следа к первой ячейке
 
 
@@ -227,7 +228,7 @@ def _ratio_for(h1, t, n):
 
 
 def c_block(x, y, h0, ratio, t, smin, wake_len, obstacles=(), wake_size=0.008, flow_dir=(1.0, 0.0),
-            smooth=None):
+            smooth=None, wake_h1_growth=None):
     """См. _c_block; smooth=None — сглаживание нормалей подбирается: самое слабое, при
     котором блок не выворачивается (у кромки над разрезом — вогнутый угол)."""
     xx, yy = np.asarray(x, float), np.asarray(y, float)
@@ -247,7 +248,8 @@ def c_block(x, y, h0, ratio, t, smin, wake_len, obstacles=(), wake_size=0.008, f
     err = None
     for sm in ((smooth,) if smooth is not None else (10, 30, 60, 120, 250)):
         try:
-            b = _c_block(x, y, h0, ratio, t, smin, wake_len, obstacles, wake_size, flow_dir, sm)
+            b = _c_block(x, y, h0, ratio, t, smin, wake_len, obstacles, wake_size, flow_dir, sm,
+                         wake_h1_growth=wake_h1_growth)
             if b.get("short"):
                 # кромка в щели: длинный блок следа не помещается — короткий разрез (как у
                 # NASA: след переднего элемента над закрылком разрешается сеткой вокруг закрылка)
@@ -310,7 +312,7 @@ def _check(nodes, quads, what):
 
 
 def _c_block(x, y, h0, ratio, t, smin, wake_len, obstacles=(), wake_size=0.008, flow_dir=(1.0, 0.0),
-             smooth=10, wake_growth=1.12, te_w=None):
+             smooth=10, wake_growth=1.12, te_w=None, wake_h1_growth=None):
     """С-блок четырёхугольников вокруг одного элемента и вдоль его следа (как С-сетка с
     разрезом в ICEM / гиперболическая С-сетка Mavriplis): путь «верх разреза → контур →
     низ разреза», слои — по сглаженным нормалям. Разрез — линия следа от острой задней
@@ -435,10 +437,11 @@ def _c_block(x, y, h0, ratio, t, smin, wake_len, obstacles=(), wake_size=0.008, 
     # прежний рост «по доле длины» давал скачки высоты соседних столбцов в разы)
     h1w = np.minimum(h0 * (s_e / h0) ** xi, h0 * 1.8 ** (np.arange(len(d)) + 1))
     top = np.maximum(sk, h_top0 * (1 - xi) + s_e * xi)
-    if WAKE_H1_GROWTH > 1.0:
+    g_w = WAKE_H1_GROWTH if wake_h1_growth is None else wake_h1_growth
+    if g_w > 1.0:
         # за кромкой стенки нет: первая ячейка у разреза растёт не медленнее WAKE_H1_GROWTH на
         # столбец, не выше половины верхнего ряда (иначе высота ~h0 тянется на треть хорды)
-        h1w = np.minimum(np.maximum(h1w, h0 * WAKE_H1_GROWTH ** (np.arange(len(d)) + 1)),
+        h1w = np.minimum(np.maximum(h1w, h0 * g_w ** (np.arange(len(d)) + 1)),
                          np.maximum(0.5 * top, h1w))
     if WAKE_AR_MAX > 0.0:
         h1w = np.minimum(np.maximum(h1w, sk / WAKE_AR_MAX), np.maximum(0.5 * top, h1w))
@@ -536,7 +539,7 @@ def _crosses(A, B):
 
 
 def build_cblock_mesh(elements, chord, h0, ratio, t, far_radius, far_size, wakes, wake_size, smin, growth,
-                      wake_len=1.0, flow_alpha=6.0, verbose=False):
+                      wake_len=1.0, flow_alpha=6.0, verbose=False, wake_h1_growth=None):
     # wake_len — длина блока следа в хордах (0 — без блока следа, только короткий разрез)
     """Сетка: С-блоки у элементов + треугольники gmsh снаружи (см. описание модуля)."""
     import gmsh
@@ -552,7 +555,7 @@ def build_cblock_mesh(elements, chord, h0, ratio, t, far_radius, far_size, wakes
         for i, e in enumerate(elements):
             obst = np.concatenate([p for k, p in enumerate(polys) if k != i]) if len(elements) > 1 else []
             blocks.append(c_block(e.x, e.y, h0, ratio, t, smin, scale[i] * wake_len * chord, obst,
-                                  wake_size * chord, fd))
+                                  wake_size * chord, fd, wake_h1_growth=wake_h1_growth))
         # контуры блоков не должны пересекаться: блок следа, задевший соседа, — короче
         outl = [b["nodes"][b["outline"]] for b in blocks]
         clash = set()

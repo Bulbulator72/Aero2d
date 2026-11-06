@@ -7,4 +7,4 @@ import os as _os
 _os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
 # версия — дата сборки; показывается в заголовке окна и в aero2d.exe --selftest
-__version__ = "2026.11.06-9 (14_RANS_Cd_study: предел итераций --iter; 15 — долгие расчёты y+ ≤ 0,5)"
+__version__ = "2026.11.06-10 (рост первой ячейки у разреза следа при y+ ≥ 1: Cl NACA 0012 1,064 → 1,089)"
