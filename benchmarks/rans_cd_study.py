@@ -41,8 +41,14 @@ VARIANTS = {
     "yp1": ("серия y+: 1, без ограничителя", {"limiter_zone": "off"}, {"yplus": 1.0}),
     "yp05": ("серия y+: 0,5, без ограничителя", {"limiter_zone": "off"}, {"yplus": 0.5}),
     "yp025": ("серия y+: 0,25, без ограничителя", {"limiter_zone": "off"}, {"yplus": 0.25}),
+    # то же, но первая ячейка у разреза следа растёт в 1,15 раза на столбец (без этого высота
+    # ~h0 тянется далеко за кромку, ν̃ на оси следа неустойчив, Cl зависит от шага у кромки)
+    "yp2w": ("y+ 2, рост ячейки следа 1,15", {"limiter_zone": "off"}, {"yplus": 2.0, "_wake_growth": 1.15}),
+    "yp1w": ("y+ 1, рост ячейки следа 1,15", {"limiter_zone": "off"}, {"yplus": 1.0, "_wake_growth": 1.15}),
+    "yp05w": ("y+ 0,5, рост ячейки следа 1,15", {"limiter_zone": "off"}, {"yplus": 0.5, "_wake_growth": 1.15}),
+    "yp025w": ("y+ 0,25, рост ячейки следа 1,15", {"limiter_zone": "off"}, {"yplus": 0.25, "_wake_growth": 1.15}),
 }
-SERIES = ("yp2", "yp1", "yp05", "yp025")
+SERIES = ("yp1", "yp1w", "yp2w", "yp05", "yp05w", "yp025w")
 
 
 def log(s):
@@ -55,10 +61,16 @@ def run(name):
     from aero2d.geometry import naca4, repanel
     from aero2d.rans import Convergence, RansSolver, rans_polar
     from aero2d.rans_mesh import build_mesh
+    import aero2d.cblock as cblock
     desc, sopts, mopts = VARIANTS[name]
+    mopts = dict(mopts)
     af = repanel(naca4("0012", 200), 130)
     t = time.time()
-    mesh = build_mesh([af], re=6e6, far_radius=50, **mopts)
+    cblock.WAKE_H1_GROWTH = mopts.pop("_wake_growth", 0.0)
+    try:
+        mesh = build_mesh([af], re=6e6, far_radius=50, **mopts)
+    finally:
+        cblock.WAKE_H1_GROWTH = 0.0
     opts = {"limiter_zone": "te"}
     opts.update(sopts)
     res, _ = rans_polar([af], [10.0], 6e6, mach=0.15, mesh=mesh, max_iter=400, conv=Convergence(), workers=1,
@@ -82,7 +94,7 @@ def run(name):
 
 
 def main():
-    # без аргументов — серия по y+ (первые 6 вариантов уже посчитаны 2026-11-05)
+    # без аргументов — серия по y+ с ростом ячейки следа и без него (сетка с гладким носком)
     names = [a for a in sys.argv[1:] if a in VARIANTS] or list(SERIES)
     import aero2d
     log(f"=== Поиск причины низкого Cd, NACA 0012 α 10°; aero2d {aero2d.__version__}; "
