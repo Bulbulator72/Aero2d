@@ -10,7 +10,7 @@
 поперёк слоя. Отчёт: benchmarks/cd_study_report.txt (дописывается после каждого
 варианта — можно прислать и недосчитанный).
 
-Запуск: python benchmarks/rans_cd_study.py [имена вариантов через пробел]"""
+Запуск: python benchmarks/rans_cd_study.py [имена вариантов через пробел] [--iter N]"""
 import os
 import sys
 import time
@@ -57,7 +57,7 @@ def log(s):
         f.write(s + "\n")
 
 
-def run(name):
+def run(name, max_iter=400):
     from aero2d.geometry import naca4, repanel
     from aero2d.rans import Convergence, RansSolver, rans_polar
     from aero2d.rans_mesh import build_mesh
@@ -73,7 +73,7 @@ def run(name):
         cblock.WAKE_H1_GROWTH = 0.0
     opts = {"limiter_zone": "te"}
     opts.update(sopts)
-    res, _ = rans_polar([af], [10.0], 6e6, mach=0.15, mesh=mesh, max_iter=400, conv=Convergence(), workers=1,
+    res, _ = rans_polar([af], [10.0], 6e6, mach=0.15, mesh=mesh, max_iter=max_iter, conv=Convergence(), workers=1,
                         coarse_start=True, solver_opts=opts)
     r = res[0]
     log(f"\n[{name}] {desc}: ячеек {mesh.n_cells}")
@@ -96,13 +96,15 @@ def run(name):
 def main():
     # без аргументов — серия по y+ с ростом ячейки следа и без него (сетка с гладким носком)
     names = [a for a in sys.argv[1:] if a in VARIANTS] or list(SERIES)
+    # --iter N — предел итераций (по умолчанию 400): для сеток y+ ≤ 0,5, которые за 400 не сходятся
+    it = int(sys.argv[sys.argv.index("--iter") + 1]) if "--iter" in sys.argv else 400
     import aero2d
     log(f"=== Поиск причины низкого Cd, NACA 0012 α 10°; aero2d {aero2d.__version__}; "
         f"{time.strftime('%Y-%m-%d %H:%M')}; ядер {os.cpu_count()}")
     log("эталон TMR: Cl 1,0909  Cd 0,01231  давл. 0,00612  трение ≈0,0062")
     for n in names:
         try:
-            run(n)
+            run(n, it)
         except Exception as ex:          # один упавший вариант не должен останавливать остальные
             log(f"\n[{n}] ошибка: {type(ex).__name__}: {ex}")
     log("\nГотово.")
