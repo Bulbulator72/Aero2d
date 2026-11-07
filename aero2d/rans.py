@@ -256,6 +256,11 @@ class RansSolver:
         self.xtr_u = 1.0
         self.xtr_l = 1.0
         self.aft_cfl_max = 300.0       # предел CFL при расчёте с переходом
+        self.aft_gamma_cap = True       # γ̃ ≤ 0 при обновлении (γ ≤ 1)
+        self.aft_onset_smooth = 0.02    # ширина сглаживания изломов F_onset (0 — как у NASA, с изломами)
+        self.aft_grad_term = True       # член Γ|∇γ̃|² уравнения γ̃ = ln γ
+        self.aft_n_dt = 1000.0          # множитель шага уравнения ñ
+        self.aft_rollback = 1e6         # с переходом откат/отмена шага — только при росте невязки в столько раз (и NaN)
         self.aft_version = "2019b"     # калибровка AFT: "2019b" (новая) или "2017b"
         # шаг по псевдовремени и защита от развала
         self.cfl_start = 5.0           # CFL первой итерации
@@ -597,7 +602,7 @@ class RansSolver:
 
     def aft_source(self, w, g, wd, HL):
         """Источники уравнений ρñ и ργ̃ (AFT2017b, NASA TMR) на единицу объёма: (nc, 2)."""
-        jnp = self.jnp
+        jax, jnp = self.jax, self.jnp
         rho, u, v, p, chi = (w[:, k] for k in range(5))
         # γ̃ > 0 (γ > 1) не обрезается: член c1 S F_onset (1 − e^γ̃) возвращает его к 0
         nt, gt = w[:, 5], jnp.minimum(w[:, 6], 3.0)
@@ -626,13 +631,26 @@ class RansSolver:
         Fc = 0.5 * (1 + jnp.tanh((ReV / ReV0 - 1.0) / 0.05))
         Sn = rho * Om * Fc * Fg * dn
         RT = mut / mu
-        Fon = jnp.maximum(jnp.minimum(jnp.maximum(nt, 0.0) / self.ncrit_eff(), 2.0)
-                          - jnp.maximum(1 - (RT / 3.5) ** 3, 0.0), 0.0)
+        if self.aft_onset_smooth > 0:
+            # F_onset = max(min(ñ/Ñкрит, 2) − max(1 − (R_T/3,5)³, 0), 0) с гладкими max (softplus
+            # ширины aft_onset_smooth): источник γ̃ ~ c1·S·F_onset ≈ 10⁴·F_onset, и излом max(·, 0)
+            # при сдвиге ñ или χ на доли процента включал/выключал его — невязка γ̃ на фронте
+            # перехода прыгала ×35, расчёт не устанавливался (пластина Re 5·10⁶)
+            e_ = self.aft_onset_smooth
+            sp = lambda z: e_ * jax.nn.softplus(z / e_)
+            Fon = sp(jnp.minimum(jnp.maximum(nt, 0.0) / self.ncrit_eff(), 2.0) - sp(1 - (RT / 3.5) ** 3))
+        else:
+            Fon = jnp.maximum(jnp.minimum(jnp.maximum(nt, 0.0) / self.ncrit_eff(), 2.0)
+                              - jnp.maximum(1 - (RT / 3.5) ** 3, 0.0), 0.0)
         if self.xtr_u < 1.0 or self.xtr_l < 1.0:          # принудительный переход
             Fon = jnp.where(self.J["trip"], 2.0, Fon)
         Ft = jnp.exp(-((RT / 2) ** 4))
         eg = jnp.exp(gt)
         Sg = AFT_C1 * rho * S * Fon * (1 - eg) - AFT_C2 * rho * Om * Ft * (AFT_C3 * eg - 1)
+        if self.aft_grad_term:
+            # γ̃ = ln γ: уравнение для γ, делённое на γ, — (1/γ)∇·(Γ∇γ) = ∇·(Γ∇γ̃) + Γ|∇γ̃|²
+            # (как |∇ω̃|² у ω̃ = ln ω в k-ω SST); Γ — как в диффузии γ̃ (visc_flux)
+            Sg = Sg + (mu + mut / AFT_SIGY) * (g[:, 6, 0] ** 2 + g[:, 6, 1] ** 2)
         return jnp.stack([Sn, Sg], 1)
 
     def sst_cell(self, w, g, wd):
@@ -1123,9 +1141,14 @@ class RansSolver:
         tb = getattr(self, "_tb", 1.0)
         if self.nv > 4 and tb != 1.0:
             ct = ct * tb
-        if self.nv > 4 and ct != 1.0:            # (nc, nv): у уравнений турбулентности — свой шаг
-            dt = np.repeat(dt[:, None], self.nv, 1)
+        if self.nv > 4 and (ct != 1.0 or (self.nv == 7 and self.aft_n_dt != 1.0)):
+            dt = np.repeat(dt[:, None], self.nv, 1)     # (nc, nv): у уравнений турбулентности — свой шаг
             dt[:, 4:] *= ct
+            if self.nv == 7:
+                # ñ: уравнение почти линейно по ñ (источник — от течения), шаг можно брать много
+                # больше: ñ переносится вдоль тонкого слоя, и при общем CFL ~200 установление
+                # огибающей по пластине требовало тысяч итераций
+                dt[:, 5] *= self.aft_n_dt
         return dt
 
     def forces(self, Q, alpha):
@@ -1185,8 +1208,14 @@ class RansSolver:
         crit = conv or self.conv
         cfl0 = self.cfl_start if cfl0 is None else cfl0
         cfl_max = self.cfl_limit if cfl_max is None else cfl_max
+        cfl_max_full = cfl_max
         if self.transition:          # переход: большой шаг заставляет точку перехода «прыгать»
             cfl_max = min(cfl_max, self.aft_cfl_max)
+        # переход: пока фронт перехода формируется, невязка законно растёт на порядки
+        # (турбулентный клин), а откат «к наименьшей невязке» возвращал ламинарное поле —
+        # переход не возникал. Откат и отмена шага — только при NaN и росте в aft_rollback раз
+        rb_factor = max(self.rollback_factor, self.aft_rollback) if self.transition else self.rollback_factor
+        st_reject = max(self.step_reject, self.aft_rollback) if self.transition else self.step_reject
         first_order_iters = self.first_order if first_order_iters is None else first_order_iters
         import scipy.sparse.linalg as spla
         jax, jnp = self.jax, self.jnp
@@ -1322,7 +1351,7 @@ class RansSolver:
                 best.update(rn=np.inf, order=order)
             # у тёплого старта невязка сначала мала и растёт, пока поле подстраивается
             # под новый угол, — это не развал (первые 8 итераций не проверяются)
-            blowup = (not np.isfinite(rn)) or (self.rollback_auto and rn > self.rollback_factor * best["rn"]
+            blowup = (not np.isfinite(rn)) or (self.rollback_auto and rn > rb_factor * best["rn"]
                                                and it - best["it"] >= 3 and not (warm and it <= 8))
             if (blowup or manual) and best["Q"] is not None:
                 n_back += int(not manual)
@@ -1349,7 +1378,7 @@ class RansSolver:
             # отмена неудачного шага: невязка выросла в step_reject раз — вернуть поле,
             # уменьшить CFL и повторить (без отката к «лучшему» и без первого порядка)
             if (self.rollback_auto and prev is not None and prev[2] == order and n_rej < self.max_rejects
-                    and (not np.isfinite(rn) or rn > self.step_reject * prev[1])
+                    and (not np.isfinite(rn) or rn > st_reject * prev[1])
                     and not (warm and it <= 8) and not manual):
                 n_rej += 1
                 ilu_state = None
@@ -1471,7 +1500,25 @@ class RansSolver:
                     cfl = min(cfl_max, max(cfl0, cfl * grow))
             if getattr(self, "cfl_hold_value", None) is not None:
                 cfl = float(self.cfl_hold_value)          # CFL задан вручную и держится
-            if self.turb_boost > 1.0 and nv > 4:
+            if self.transition and order >= 2 and len(hist) >= 2 and hist[-2][1] == order:
+                # предел CFL с переходом подстраивается: силы установились и невязка не растёт —
+                # ×1,2 за итерацию (до общего предела), невязка выросла вдвое — ÷4 (не ниже
+                # aft_cfl_max). Пластина Re 10⁷: при CFL ≤ 300 переход формируется за ~250
+                # итераций, после — с CFL 10⁵ сходится за 88; снимать предел сразу нельзя —
+                # ламинарный старт тоже «спокоен» (переход ещё не начался), и расчёт разваливался:
+                # рост — только когда невязка ещё и упала в 100 раз от наибольшей за расчёт (или
+                # в 300 раз — тогда и при дрейфе сил: при CFL 300 Cd медленно ползёт из-за предела)
+                fw_ = fh[-21:]
+                calm = (len(fw_) == 21
+                        and max(f[0] for f in fw_) - min(f[0] for f in fw_) < 2e-3 * max(0.2, abs(fw_[-1][0]))
+                        and max(f[1] for f in fw_) - min(f[1] for f in fw_) < 5e-3 * abs(fw_[-1][1]) + 1e-6)
+                r2max = max(h[0] for h in hist if h[1] == order)
+                if rn > 2.0 * hist[-2][0] or not getattr(self, "_last_ok", True):
+                    cfl_max = max(min(cfl_max_full, self.aft_cfl_max), cfl_max / 4.0)
+                elif (calm or rn < 3e-3 * r2max) and rn <= 1.2 * hist[-2][0] and rn < 1e-2 * r2max:
+                    cfl_max = min(cfl_max_full, cfl_max * 1.2)
+                cfl = min(cfl, cfl_max)
+            if self.turb_boost > 1.0 and nv == 5:
                 ok_ = getattr(self, "_last_ok", True)
                 fw_ = fh[-11:] if order >= 2 else []
                 calm = (len(fw_) == 11 and max(f[0] for f in fw_) - min(f[0] for f in fw_) < 2e-3 * max(0.2, abs(fw_[-1][0]))
@@ -1584,6 +1631,11 @@ class RansSolver:
                     if lim_ is None:                       # χ (k̂): не больше чем ×1,5 (+1) за шаг
                         lim_ = np.maximum(0.5 * np.abs(old), floor)
                     new = old + np.clip(new - old, -lim_, lim_)
+                    if nv == 7 and k_ == 6 and self.aft_gamma_cap:
+                        # γ̃ ≤ 0 (γ ≤ 1 — полностью турбулентно): у f_t2 = c_t3(1 − e^min(γ̃,0)) в нуле
+                        # излом; шаг Ньютона, перелетающий через него, давал скачок невязки γ̃ ×10–15
+                        # на фронте перехода (пластина, x ≈ 0,95) и откаты
+                        new = np.minimum(new, 0.0)
                     dq[:, k_] = new * rq - Q[:, k_]
             # ограничение шага: ρ и p не меньше 20 % от текущих
             w = np.asarray(self.prim(Qj))
