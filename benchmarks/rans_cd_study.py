@@ -47,6 +47,13 @@ VARIANTS = {
     "yp1w": ("y+ 1, рост ячейки следа 1,15", {"limiter_zone": "off"}, {"yplus": 1.0, "wake_h1_growth": 1.15}),
     "yp05w": ("y+ 0,5, рост ячейки следа 1,15", {"limiter_zone": "off"}, {"yplus": 0.5, "wake_h1_growth": 1.15}),
     "yp025w": ("y+ 0,25, рост ячейки следа 1,15", {"limiter_zone": "off"}, {"yplus": 0.25, "wake_h1_growth": 1.15}),
+    # геометрия TMR (острая кромка сжатием хорды, как у NASA): только на ней Cd сравним с эталоном
+    # (у naca4 с a4 = −0,1036 профиль толще, и Cdp отличается на ~0,001). Обычная сетка и сетка
+    # с мелкими треугольниками у стенок (рост 0,12 вместо 0,25): на обычной Cdp 0,0049 вместо
+    # 0,0061 — недобор от разрешения у носка и в кормовой части, не от модели SA
+    "tmr1": ("геометрия TMR, y+ 1, обычная сетка", {"limiter_zone": "off"}, {"yplus": 1.0, "_tmr": True}),
+    "tmr1g": ("геометрия TMR, y+ 1, рост треугольников 0,12", {"limiter_zone": "off"},
+              {"yplus": 1.0, "growth": 0.12, "_tmr": True}),
 }
 SERIES = ("yp1", "yp1w", "yp2w", "yp05", "yp05w", "yp025w")
 
@@ -63,8 +70,10 @@ def run(name, max_iter=400):
     from aero2d.rans_mesh import build_mesh
     desc, sopts, mopts = VARIANTS[name]
     mopts = dict(mopts)
-    mopts.setdefault("wake_h1_growth", 0.0)      # варианты без «w» — как до 2026.11.06-10
-    af = repanel(naca4("0012", 200), 130)
+    tmr = mopts.pop("_tmr", False)
+    if not tmr:
+        mopts.setdefault("wake_h1_growth", 0.0)  # варианты без «w» — как до 2026.11.06-10
+    af = repanel(naca4("0012", 400 if tmr else 200, scaled_te=tmr), 130)
     t = time.time()
     mesh = build_mesh([af], re=6e6, far_radius=50, **mopts)
     opts = {"limiter_zone": "te"}

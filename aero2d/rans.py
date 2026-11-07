@@ -220,6 +220,19 @@ class RansSolver:
         # FUN3D — там на порядок меньше основного — и CFL_REDUCTION_TURB в SU2); None — 1 для SA,
         # 0,1 для k-ω SST (k и ω сходятся хуже и должны оставаться положительными)
         self.cfl_turb = None
+        # разгон шага уравнений турбулентности на установлении: когда силы установились (Cl за 10
+        # итераций второго порядка меняется < 0,2 %, Cd < 5e-4), а шаги удаются при
+        # CFL ≥ turb_boost_cfl, множитель шага ν̃ растёт ×1,5 за итерацию до
+        # turb_boost, при неудаче — ÷4. В тонких ячейках у разреза следа шаг по звуку в сотни
+        # раз меньше «своего» шага ν̃: псевдовремя съедало шаг Ньютона, χ за итерацию менялся
+        # на ~1e-5, и невязка за кромкой стояла (сгущённые сетки NACA 0012 не сходились).
+        # Пока поле перестраивается, большой шаг ν̃ его раскачивает (NACA 0012: Cl 0,47–0,99 и
+        # откаты) — поэтому только при установившихся силах
+        self.turb_boost = 300.0
+        self.turb_boost_cfl = 10.0
+        # ограничение шага Ньютона (ρ, p не меньше 20 % от текущих): если шаг велик не более чем
+        # в step_limit_cells ячейках — урезается только в них (0 — всегда во всей области)
+        self.step_limit_cells = 100
         # вязкий спектральный радиус в локальном шаге (Blazek, «Computational Fluid Dynamics»,
         # гл. 6.1.4): Λv = max(4/3, γ)/ρ·(μ/Pr + μt/Prt)·ΣS²/Ω, Δt = CFL·Ω/(Λc + C·Λv);
         # C = 1 — для схем против потока (Roe), 4 — для центральных
@@ -1069,6 +1082,9 @@ class RansSolver:
         lam += self.dt_visc_c * max(4.0 / 3.0, GAM) * (mu / w[:, 0] / PR + nut / PRT) * lv / self.vol
         dt = cfl * self.vol / lam
         ct = self.cfl_turb if self.cfl_turb is not None else (0.1 if self.sst else 1.0)
+        tb = getattr(self, "_tb", 1.0)
+        if self.nv > 4 and tb != 1.0:
+            ct = ct * tb
         if self.nv > 4 and ct != 1.0:            # (nc, nv): у уравнений турбулентности — свой шаг
             dt = np.repeat(dt[:, None], self.nv, 1)
             dt[:, 4:] *= ct
@@ -1194,6 +1210,7 @@ class RansSolver:
         H = dict(it=[], res=[], rn=[], cl=[], cd=[], cfl=[])
         events = []                                   # (итерация, событие, невязка, худшие ячейки)
         best = dict(rn=np.inf, Q=None, it=0, cfl=cfl0, order=0)
+        self._tb = 1.0                                # текущий множитель шага турбулентности
         first_until = 0
         n_back = 0
         R = None
@@ -1271,6 +1288,7 @@ class RansSolver:
                                                and it - best["it"] >= 3 and not (warm and it <= 8))
             if (blowup or manual) and best["Q"] is not None:
                 n_back += int(not manual)
+                self._tb = 1.0
                 why = "вручную" if manual else ("NaN" if not np.isfinite(rn) else
                                                   f"невязка ×{rn / best['rn']:.3g} от наименьшей")
                 events.append((it, f"откат к итерации {best['it']} ({why})", rn, worst_cells(R)))
@@ -1415,6 +1433,15 @@ class RansSolver:
                     cfl = min(cfl_max, max(cfl0, cfl * grow))
             if getattr(self, "cfl_hold_value", None) is not None:
                 cfl = float(self.cfl_hold_value)          # CFL задан вручную и держится
+            if self.turb_boost > 1.0 and nv > 4:
+                ok_ = getattr(self, "_last_ok", True)
+                fw_ = fh[-11:] if order >= 2 else []
+                calm = (len(fw_) == 11 and max(f[0] for f in fw_) - min(f[0] for f in fw_) < 2e-3 * max(0.2, abs(fw_[-1][0]))
+                        and max(f[1] for f in fw_) - min(f[1] for f in fw_) < 5e-4)
+                if calm and ok_ and cfl >= self.turb_boost_cfl and len(hist) >= 2 and rn < 1.2 * hist[-2][0]:
+                    self._tb = min(self.turb_boost, 1.5 * self._tb)
+                elif not ok_ or (len(hist) >= 2 and rn >= 1.2 * hist[-2][0]):
+                    self._tb = max(1.0, self._tb / 4.0)
             dt = self.local_dt(Q, cfl)
             N5 = nv * self.nc
             if self.prec == "lu":
@@ -1520,12 +1547,19 @@ class RansSolver:
             w = np.asarray(self.prim(Qj))
             Qn = Q + dq
             wn = np.asarray(self.prim(jnp.asarray(Qn)))
-            rel = np.maximum(np.max(-(wn[:, 0] - w[:, 0]) / w[:, 0]), np.max(-(wn[:, 3] - w[:, 3]) / w[:, 3]))
+            reli = np.maximum(-(wn[:, 0] - w[:, 0]) / w[:, 0], -(wn[:, 3] - w[:, 3]) / w[:, 3])
+            rel = float(np.max(reli))
             lam = 1.0 if rel < 0.2 else 0.2 / rel
-            if lam < 1.0:
+            lam_c = None
+            if lam < 1.0 and self.step_limit_cells > 0 and np.count_nonzero(reli >= 0.2) <= self.step_limit_cells:
+                # шаг велик лишь в нескольких ячейках (обычно огромные ячейки у внешней границы,
+                # где неточное решение линейной задачи просит изменить ρ на десятки процентов) —
+                # урезается шаг только в них, а не во всей области (иначе CFL не растёт)
+                lam_c = np.where(reli < 0.2, 1.0, 0.2 / np.maximum(reli, 1e-300))[:, None]
+            elif lam < 1.0:
                 cfl = max(cfl0, cfl * 0.5)
             prev = (Q.copy(), rn, order)
-            Q = Q + lam * dq
+            Q = Q + (lam_c if lam_c is not None else lam) * dq
             # циркуляция для вихревой поправки
             if self.vortex_bc and it % 5 == 0:
                 fr = self.forces(Q, alpha)
