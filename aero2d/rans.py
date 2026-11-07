@@ -1481,6 +1481,16 @@ class RansSolver:
                 dq, info = _gmres(mv, -R.ravel(), prec=ilu.solve, rtol=gmres_tol, maxiter=gmres_iter,
                                   callback=gh.append)
             lin = float(np.linalg.norm(mv(dq) + R.ravel()) / max(np.linalg.norm(R), 1e-300))
+            if not self.right_prec and not (np.isfinite(lin) and lin < 0.5):
+                # левое предобусловливание минимизирует ‖M⁻¹r‖ и может «сойтись» за одну
+                # итерацию при истинной невязке > 1 (на структурированной С-сетке до 500 хорд —
+                # в огромных ячейках у внешней границы); правое минимизирует саму невязку
+                from .krylov import gmres as _gmres
+                dq2, _ = _gmres(mv, -R.ravel(), prec=ilu.solve, rtol=gmres_tol, maxiter=gmres_iter,
+                                callback=gh.append, right=True)
+                lin2 = float(np.linalg.norm(mv(dq2) + R.ravel()) / max(np.linalg.norm(R), 1e-300))
+                if np.isfinite(lin2) and (not np.isfinite(lin) or lin2 < lin):
+                    dq, lin = dq2, lin2
             gh.append(lin)
             self._last_ok = bool(np.isfinite(lin) and lin < 0.5)
             self._last_lin = lin
