@@ -1863,8 +1863,11 @@ def mesh_for(elements, alpha, re, chord=1.0, fine=False, opts=None):
         els = [repanel(e, max(20, int(round(o.n_surface * float(np.ptp(e.x)) / cmax))), keep_frame=True)
                for e in elements]
     near = o.near_size or ((0.002 if fine else 0.003) if multi else 0.004)
+    # рост треугольников: у одного профиля 0,12 — NACA 0012 (α 10°, TMR) Cdp 0,00597 при эталоне
+    # 0,00612 (с 0,25 — 0,00487: недобор от разрешения у носка и в корме); ячеек +30 %, итераций ×2.
+    # С механизацией пока 0,25 (мелкая сетка на ней не проверена)
     kw = dict(yplus=o.yplus, ratio=o.ratio, bl_thickness=(o.bl_thickness or None), far_radius=o.far_radius,
-              far_size=o.far_size, slot_size=near * chord, growth=o.growth,
+              far_size=o.far_size, slot_size=near * chord, growth=o.growth or (0.25 if multi else 0.12),
               wake_block=(o.wake_length if o.wake_refine else 0.0), cblock=getattr(o, "cblock", True))
     if o.wake_refine:
         wk = []
