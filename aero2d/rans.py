@@ -1542,9 +1542,13 @@ class RansSolver:
                                      callback=lambda rr: gh.append(rr), callback_type="pr_norm")
                 dq = ilu.solve(y)
             else:
+                # с ламинарными областями (расчёт с переходом, ламинарный) — правое
+                # предобусловливание: левое «сходится» по ‖M⁻¹r‖ при истинной невязке ~0,2, CFL
+                # не растёт, ламинарный слой не развивается (пластина Re 5·10⁶: Cd 0,00016 за
+                # 300 итераций вместо 0,00059; с правым — Блазиус за 90 итераций)
                 from .krylov import gmres as _gmres
                 dq, info = _gmres(mv, -R.ravel(), prec=ilu.solve, rtol=gmres_tol, maxiter=gmres_iter,
-                                  callback=gh.append)
+                                  callback=gh.append, right=bool(self.transition or not self.turbulent))
             lin = float(np.linalg.norm(mv(dq) + R.ravel()) / max(np.linalg.norm(R), 1e-300))
             if not self.right_prec and not (np.isfinite(lin) and lin < 0.5):
                 # левое предобусловливание минимизирует ‖M⁻¹r‖ и может «сойтись» за одну
