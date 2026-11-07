@@ -247,6 +247,14 @@ class RansSolver:
         self.sst_k_inf = 9e-9
         self.sst_omega_inf_coef = 1e-6
         self.chi_inf_tr = 0.1          # ν̃/ν набегающего потока при расчёте с переходом (NASA TMR)
+        # степень турбулентности потока, %: если задана — Ñкрит по формуле Мэка
+        # Ñкрит = −8,43 − 2,4·ln(Tu/100) (Tu 0,07 % → 9; 0,5 % → 4,3), иначе — ncrit
+        self.tu = None
+        # принудительный переход (турбулизатор) с моделью SA-AFT: доли хорды каждого тела по x от
+        # носка, верх/низ; ≥ 1 — свободный переход. Дальше этой точки у стенки (в пределах
+        # 0,05 хорды) член начала перехода F_onset в уравнении γ̃ включён полностью
+        self.xtr_u = 1.0
+        self.xtr_l = 1.0
         self.aft_cfl_max = 300.0       # предел CFL при расчёте с переходом
         self.aft_version = "2019b"     # калибровка AFT: "2019b" (новая) или "2017b"
         # шаг по псевдовремени и защита от развала
@@ -350,7 +358,7 @@ class RansSolver:
         self._res_jit = None
         # направление от стенки ∇d (для H_L модели перехода): точная ближайшая точка на
         # отрезках стенки. Нормальная скорость в слое ~U/√Re_x — направление нужно точно.
-        dex, gd = wall_direction(self.m)
+        dex, gd, self._wall_q, self._wall_b = wall_direction(self.m, nearest=True)
         self.J["gd"] = jnp.asarray(gd)
         # зона ограничителя у задних кромок: ячейки ближе limiter_te_radius·хорды к
         # самой задней (по x) точке стенки каждого тела
@@ -363,6 +371,7 @@ class RansSolver:
         self.lim_te = near
         self.J["lim_te"] = jnp.asarray(near)
         self.J["wd_ex"] = jnp.asarray(dex)
+        self.J["trip"] = jnp.zeros(nc, bool)
 
     # ------------------------------------------------------------------
     # физика
@@ -617,8 +626,10 @@ class RansSolver:
         Fc = 0.5 * (1 + jnp.tanh((ReV / ReV0 - 1.0) / 0.05))
         Sn = rho * Om * Fc * Fg * dn
         RT = mut / mu
-        Fon = jnp.maximum(jnp.minimum(jnp.maximum(nt, 0.0) / self.ncrit, 2.0)
+        Fon = jnp.maximum(jnp.minimum(jnp.maximum(nt, 0.0) / self.ncrit_eff(), 2.0)
                           - jnp.maximum(1 - (RT / 3.5) ** 3, 0.0), 0.0)
+        if self.xtr_u < 1.0 or self.xtr_l < 1.0:          # принудительный переход
+            Fon = jnp.where(self.J["trip"], 2.0, Fon)
         Ft = jnp.exp(-((RT / 2) ** 4))
         eg = jnp.exp(gt)
         Sg = AFT_C1 * rho * S * Fon * (1 - eg) - AFT_C2 * rho * Om * Ft * (AFT_C3 * eg - 1)
@@ -673,6 +684,31 @@ class RansSolver:
         nu = self.mu_lam(T) / wc[:, 0]
         dn = self.J["dn_w"] if dn is None else dn
         return jnp.log(60.0 * nu / (SST_B1 * (2 * dn) ** 2) / self.om_ref)
+
+    def ncrit_eff(self):
+        """Ñкрит: из степени турбулентности tu (%, формула Мэка), если она задана, иначе ncrit."""
+        return ncrit_from_tu(self.tu) if self.tu is not None else float(self.ncrit)
+
+    def trip_mask(self):
+        """Ячейки за точкой принудительного перехода (xtr_u, xtr_l) у стенки: (nc,) bool."""
+        nc = self.nc
+        if not self.transition or (self.xtr_u >= 1.0 and self.xtr_l >= 1.0):
+            return np.zeros(nc, bool)
+        q, b = self._wall_q, self._wall_b
+        m = self.m
+        wf = np.where(m.face_tag == 1)[0]
+        mask = np.zeros(nc, bool)
+        for body in np.unique(b):
+            pts = m.face_center[wf][m.face_body[wf] == body]
+            le, te = pts[np.argmin(pts[:, 0])], pts[np.argmax(pts[:, 0])]
+            ch = te - le
+            c2 = float(ch @ ch)
+            k = b == body
+            xr = ((q[k] - le) @ ch) / c2                       # доля хорды от носка
+            up = (ch[0] * (q[k, 1] - le[1]) - ch[1] * (q[k, 0] - le[0])) > 0
+            near = self.wall_d[k] < 0.05 * np.sqrt(c2)
+            mask[np.where(k)[0]] = near & np.where(up, xr >= self.xtr_u, xr >= self.xtr_l)
+        return mask
 
     def ft2(self, w):
         """Связь перехода с SA: f_t2 = c_t3 (1 − exp γ̃) (γ̃ ≤ 0)."""
@@ -868,7 +904,7 @@ class RansSolver:
             scale = jnp.asarray([1.0, self.mach, self.mach, 1.0 / GAM, max(self.sst_inf()[0], 1.0), 5.0])
         else:
             scale = jnp.asarray([1.0, self.mach, self.mach, 1.0 / GAM, max(self.chi_inf, 1.0)]
-                                + ([max(self.ncrit, 1.0), 5.0] if w.shape[1] > 5 else []))
+                                + ([max(self.ncrit_eff(), 1.0), 5.0] if w.shape[1] > 5 else []))
         eps2 = ((self.limiter_k * h) ** 3)[:, None] * scale[None, :] ** 2
 
         def psi(d2, i):
@@ -1020,7 +1056,8 @@ class RansSolver:
         return (self.nv, self.turb_model, self.aft_version, float(self.ncrit), float(self.limiter_k),
                 self.limiter_zone,
                 float(self.zmin), bool(self.sa_raw_grad), bool(self.visc_raw_grad), int(self.rc_smooth),
-                bool(self.turbulent), float(self.chi_inf), float(self.chi_inf_tr), self.xref, int(self.turb_order))
+                bool(self.turbulent), float(self.chi_inf), float(self.chi_inf_tr), self.xref, int(self.turb_order),
+                float(self.ncrit_eff()), float(self.xtr_u), float(self.xtr_l))
 
     def _fns(self):
         """Скомпилированные (jax.jit) невязки, произведения якобиана на вектор и
@@ -1029,6 +1066,7 @@ class RansSolver:
         key = self._fn_key()
         if getattr(self, "_fn_cache_key", None) == key:
             return self._fn_cache
+        self.J["trip"] = self.jnp.asarray(self.trip_mask())
         jax = self.jax
         prim, wallv = self.prim, self._wall_values
 
@@ -1795,9 +1833,15 @@ class RansSolver:
         return out
 
 
-def wall_direction(mesh, k=6):
+def ncrit_from_tu(tu_percent):
+    """Ñкрит по степени турбулентности потока Tu, % (Mack, 1977): −8,43 − 2,4·ln(Tu/100);
+    Tu 0,07 % → 9,0; 0,1 % → 8,1; 0,5 % → 4,3; 1 % → 2,6."""
+    return float(-8.43 - 2.4 * np.log(max(float(tu_percent), 1e-6) / 100.0))
+
+
+def wall_direction(mesh, k=6, nearest=False):
     """Точное расстояние до стенки (до ближайшей точки на отрезках) и единичный вектор
-    ∇d в центрах ячеек."""
+    ∇d в центрах ячеек; nearest=True — ещё ближайшая точка стенки (nc,2) и номер тела."""
     from scipy.spatial import cKDTree
     wf = np.where(mesh.face_tag == 1)[0]
     pa = mesh.nodes[mesh.face_nodes[wf, 0]]
@@ -1813,6 +1857,8 @@ def wall_direction(mesh, k=6):
     i = np.arange(len(c))
     d = dd[i, j]
     g = r[i, j] / np.maximum(d, 1e-300)[:, None]
+    if nearest:
+        return d, g, q[i, j], mesh.face_body[wf][cand[i, j]]
     return d, g
 
 

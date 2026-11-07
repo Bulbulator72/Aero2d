@@ -179,6 +179,7 @@ class App(tk.Tk):
         self.mach = tk.StringVar(value="0")
         self.re = tk.StringVar(value="1e6")
         self.ncrit = tk.StringVar(value="9")
+        self.tu = tk.StringVar(value="")
         self.xtru = tk.StringVar(value="1")
         self.xtrl = tk.StringVar(value="1")
         self.a0, self.a1, self.da = tk.StringVar(value="-4"), tk.StringVar(value="14"), tk.StringVar(value="1")
@@ -201,13 +202,18 @@ class App(tk.Tk):
             "По опорной хорде. Можно несколько через «;» или пробел: 1e5; 3e5; 1e6 — все поляры за один запуск.")
         row(1, "mach", "Число Маха M", ent(self.mach),
             "Сжимаемость — поправкой Кармана–Цяня (вязкий и невязкий метод до M ≈ 0,6).")
-        row(2, "ncrit", "Ñкрит (переход eᴺ)", ent(self.ncrit),
+        row(2, "ncrit", "Ñкрит (переход eᴺ)",
+            lambda fr_: [ttk.Entry(fr_, textvariable=self.ncrit, width=6), ttk.Label(fr_, text="или Tu, %"),
+                         ttk.Entry(fr_, textvariable=self.tu, width=6)],
             "Возмущённость потока: 9 — обычная аэродинамическая труба; 10–11 — малотурбулентная труба "
-            "или спокойная атмосфера; 4–7 — турбулентный поток.")
+            "или спокойная атмосфера; 4–7 — турбулентный поток. Если задана степень турбулентности Tu, % — "
+            "Ñкрит по формуле Мэка −8,43 − 2,4·ln(Tu/100): 0,07 % → 9,0; 0,1 % → 8,1; 0,3 % → 5,5; 1 % → 2,6 "
+            "(пусто — Ñкрит как задан).")
         row(3, "xtr", "Переход не дальше x/c",
             lambda fr_: [ttk.Label(fr_, text="верх"), ttk.Entry(fr_, textvariable=self.xtru, width=5),
                          ttk.Label(fr_, text="низ"), ttk.Entry(fr_, textvariable=self.xtrl, width=5)],
-            "Принудительный переход (турбулизатор): 1 — свободный переход; 0,05 — у передней кромки.")
+            "Принудительный переход (турбулизатор): 1 — свободный переход; 0,05 — у передней кромки. "
+            "В RANS — только с моделью перехода SA-AFT (доли хорды каждого элемента от носка).")
         row(4, "alpha", "Угол атаки α, °",
             lambda fr_: [ttk.Label(fr_, text="от"), ttk.Entry(fr_, textvariable=self.a0, width=5),
                          ttk.Label(fr_, text="до"), ttk.Entry(fr_, textvariable=self.a1, width=5),
@@ -660,7 +666,7 @@ class App(tk.Tk):
             else:
                 fr_.pack_forget()
         need = {"re": m in ("viscous", "rans"), "ncrit": m == "viscous" or m == "rans",
-                "xtr": m == "viscous", "cref": m in ("viscous", "rans", "panel"),
+                "xtr": m in ("viscous", "rans"), "cref": m in ("viscous", "rans", "panel"),
                 "cores": m in ("viscous", "rans")}
         for key, (lb, fr_) in self._cond_rows.items():
             st = "normal" if need.get(key, True) else "disabled"
@@ -854,7 +860,11 @@ class App(tk.Tk):
             self._workers = resolve_workers(self.cores.get())
         except ValueError:
             raise self.InputError(self.cores, "Ядер ЦП", "выберите «авто» или число ядер") from None
-        ncrit = self._num(self.ncrit, "Ñкрит", 0.1, 20, example="9")
+        if self.tu.get().strip():
+            from .rans import ncrit_from_tu
+            ncrit = ncrit_from_tu(self._num(self.tu, "Степень турбулентности Tu, %", 0.01, 2.5, example="0,07"))
+        else:
+            ncrit = self._num(self.ncrit, "Ñкрит", 0.1, 20, example="9")
         xtr = (self._num(self.xtru, "Переход не дальше x/c: верх", 0, 1, example="1"),
                self._num(self.xtrl, "Переход не дальше x/c: низ", 0, 1, example="1"))
         return mach, alphas, niter, re_, ncrit, xtr
@@ -2212,11 +2222,21 @@ class App(tk.Tk):
         o["turb_model"] = self.TURB_MODELS[self.turb_model.get()]
         if o["turb_model"].endswith("aft"):
             try:
-                o["ncrit"] = num(self.ncrit)
-            except ValueError:
-                raise ValueError("Ñкрит — проверьте число") from None
+                if self.tu.get().strip():
+                    from .rans import ncrit_from_tu
+                    o["tu"] = num(self.tu)
+                    if not 0.01 <= o["tu"] <= 2.5:
+                        raise ValueError("Tu для модели перехода: от 0,01 до 2,5 %")
+                    o["ncrit"] = ncrit_from_tu(o["tu"])
+                else:
+                    o["ncrit"] = num(self.ncrit)
+                o["xtr_u"], o["xtr_l"] = num(self.xtru), num(self.xtrl)
+            except ValueError as ex:
+                raise ValueError(str(ex) if "Tu" in str(ex) else "Ñкрит, Tu или переход x/c — проверьте число") from None
             if not 1.0 <= o["ncrit"] <= 14.0:
-                raise ValueError("Ñкрит для модели перехода: от 1 до 14")
+                raise ValueError("Ñкрит для модели перехода: от 1 до 14 (Tu от ~0,01 до ~2 %)")
+            if not (0.0 <= o["xtr_u"] <= 1.0 and 0.0 <= o["xtr_l"] <= 1.0):
+                raise ValueError("Переход не дальше x/c: от 0 до 1")
         return o
 
     def halve_cfl(self):

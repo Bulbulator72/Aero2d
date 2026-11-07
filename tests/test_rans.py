@@ -236,3 +236,31 @@ def test_mesh_does_not_depend_on_alpha():
     els = highlift(naca4("2412", 120), flap=dict(type="slotted", chord=0.3, deflection=20.0), n_side=50)
     o = MeshOptions(far_radius=15, n_surface=50, near_size=0.01, wake_size=0.02)
     assert mesh_for(els, 0.0, 1e6, opts=o).n_cells == mesh_for(els, 12.0, 1e6, opts=o).n_cells
+
+
+def test_ncrit_from_tu():
+    from aero2d.rans import ncrit_from_tu
+    assert abs(ncrit_from_tu(0.07) - 9.0) < 0.01          # Мэк: Tu 0,07 % ≈ Ñкрит 9
+    assert abs(ncrit_from_tu(1.0) - 2.62) < 0.01
+    assert ncrit_from_tu(0.1) > ncrit_from_tu(0.3)
+
+
+def test_trip_mask_sides():
+    """Принудительный переход SA-AFT: зона — у стенки, за x_tr своей стороны."""
+    from aero2d.geometry import naca4, repanel
+    from aero2d.rans import RansSolver
+    from aero2d.rans_mesh import build_mesh
+    m = build_mesh([repanel(naca4("2412", 120), 60)], re=1e6, far_radius=15, far_size=5.0, ratio=1.4,
+                   slot_size=0.02, growth=0.4)
+    s = RansSolver(m, 0.15, 1e6)
+    s.turb_model = "sa-aft"
+    assert not s.trip_mask().any()                         # xtr = 1 — свободный переход
+    s.xtr_u, s.xtr_l = 0.3, 0.6
+    k = s.trip_mask()
+    c = m.centroid
+    assert k.any()
+    assert c[k & (c[:, 1] > 0.03), 0].min() > 0.28        # верх — за 0,3
+    assert c[k & (c[:, 1] < -0.03), 0].min() > 0.55       # низ — за 0,6
+    assert s.wall_d[k].max() < 0.06
+    s.turb_model = "sa"
+    assert not s.trip_mask().any()                         # без модели перехода — нет
