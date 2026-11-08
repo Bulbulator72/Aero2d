@@ -1629,7 +1629,14 @@ class App(tk.Tk):
                      "NACA 0012 при α = 0 (Re 6e6) расчёт пока не сходится — разбираюсь. Слой gmsh — прежний "
                      "генератор: качество хуже (веер у острой кромки), зато тот же случай сходится "
                      "(Cd 0,00807 при эталоне NASA 0,00819).")
-        r0 += 1
+        self.mesh_tr = tk.BooleanVar(value=True)
+        cbt = ttk.Checkbutton(side, text="сгущать у точки перехода (SA-AFT)", variable=self.mesh_tr)
+        cbt.grid(row=r0 + 2, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        Tooltip(cbt, "Только с моделью перехода SA-AFT: точки перехода заранее находятся вязким методом "
+                     "(как XFOIL) при углах поляры, Ñкрит и числе Маха из окна; в зоне ±0,1 хорды вокруг них "
+                     "шаг вдоль поверхности 0,001 хорды (обычно ~0,003). Переход в RANS решается на мелкой "
+                     "сетке — точнее положение перехода и Cd.")
+        r0 += 2
         ttk.Button(side, text="Построить и показать сетку", command=self.build_mesh_preview).grid(
             row=r0 + 1, column=0, columnspan=2, sticky="we", pady=(8, 2))
         ttk.Button(side, text="Параметры по умолчанию", command=self.reset_mesh_opts).grid(
@@ -1698,6 +1705,7 @@ class App(tk.Tk):
         for key, _, val, _ in self.MESH_FIELDS:
             self.mesh_vars[key].set(val)
         self.mesh_wake.set(True)
+        self.mesh_tr.set(True)
 
     MESH_GENERATORS = {"генератор: С-блок (качество лучше)": True,
                        "генератор: слой gmsh (сходится надёжнее)": False}
@@ -1713,7 +1721,7 @@ class App(tk.Tk):
             kw[key] = int(v) if key == "n_surface" else v
         if kw["yplus"] <= 0 or not 1.0 < kw["ratio"] < 2.0:
             raise ValueError("Сетка: y⁺ > 0, рост слоя от 1 до 2")
-        return MeshOptions(wake_refine=self.mesh_wake.get(),
+        return MeshOptions(wake_refine=self.mesh_wake.get(), transition_refine=None if self.mesh_tr.get() else False,
                            cblock=self.MESH_GENERATORS.get(self.mesh_gen.get(), True), **kw)
 
     @staticmethod
@@ -1727,6 +1735,14 @@ class App(tk.Tk):
         af = self.get_config()
         mach, alphas, niter, re_, ncrit, xtr = self._params()
         opts = self.mesh_opts()
+        if self.method.get() == "rans":
+            # модель перехода — сгущение у точек перехода (Ñкрит, M, углы поляры — из окна)
+            from .rans import transition_mesh_options
+            try:
+                so = self.solver_settings()
+            except ValueError:
+                so = {}
+            opts = transition_mesh_options(opts, so, alphas, mach)
         chord = self._cref(1.0 if isinstance(af, list) and self.src.get() != "mfile" else None)
         els = af if isinstance(af, list) else [af]
         if not chord:

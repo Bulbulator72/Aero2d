@@ -265,3 +265,23 @@ def test_trip_mask_sides():
     assert s.wall_d[k].max() < 0.06
     s.turb_model = "sa"
     assert not s.trip_mask().any()                         # без модели перехода — нет
+
+
+def test_refine_surface_transition_zone():
+    """Сгущение у точки перехода: в зоне шаг ≤ ds, рост шага от края зоны плавный, носок — узел."""
+    from aero2d.geometry import naca4, repanel
+    from aero2d.rans import refine_surface
+    af = repanel(naca4("0012", 200), 120)
+    z = {"upper": (0.3, 0.5), "lower": (0.5, 0.7)}
+    r = refine_surface(af, z, 0.001)
+    d = np.hypot(np.diff(r.x), np.diff(r.y))
+    xm = 0.5 * (r.x[1:] + r.x[:-1])
+    ile = int(np.argmin(r.x))
+    assert abs(r.x[ile] - af.x.min()) < 1e-9
+    up = np.arange(len(d)) < ile
+    assert d[up & (xm > 0.32) & (xm < 0.48)].max() < 1.05e-3
+    assert d[~up & (xm > 0.52) & (xm < 0.68)].max() < 1.05e-3
+    assert d[up & (xm > 0.6) & (xm < 0.9)].min() > 2e-3          # вне зоны — прежний шаг
+    mid = (xm[1:] > 0.05) & (xm[1:] < 0.95)
+    q = np.maximum(d[1:] / d[:-1], d[:-1] / d[1:])
+    assert q[mid].max() < 1.3

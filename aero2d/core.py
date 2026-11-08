@@ -504,6 +504,8 @@ def run_rans(af, alphas, mach: float, re: float, callback=None, max_iter: int = 
     if mesh is None:
         if callback:
             callback("Построение сетки (gmsh)…", 0.0)
+        from .rans import transition_mesh_options
+        mesh_opts = transition_mesh_options(mesh_opts, solver_opts, alphas, mach)
         mesh = mesh_for(elements, float(np.median(alphas)), re, chord, opts=mesh_opts)
     n = len(alphas)
 

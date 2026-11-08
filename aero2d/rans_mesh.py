@@ -71,6 +71,15 @@ class MeshOptions:
     cblock: bool = True            # True — С-блоки + треугольники; False — слой gmsh (прежний генератор)
     far_radius: float = 50.0
     far_size: float = 8.0
+    # сгущение у точки ламинарно-турбулентного перехода (для модели SA-AFT): точки перехода —
+    # по вязкому методу (eᴺ, как XFOIL) при углах tr_alphas (пусто — угол расчёта), Ñкрит
+    # tr_ncrit; в зоне ±tr_width хорды шаг вдоль поверхности tr_ds хорды
+    transition_refine: object = None   # None — авто (с моделью SA-AFT — да), True/False — принудительно
+    tr_ncrit: float = 9.0
+    tr_mach: float = 0.15
+    tr_alphas: tuple = ()
+    tr_ds: float = 0.001
+    tr_width: float = 0.1
 
 
 def build_mesh(elements, chord=1.0, re=1e6, yplus=1.0, ratio=1.2, bl_thickness=None,

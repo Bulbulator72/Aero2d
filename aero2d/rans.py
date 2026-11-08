@@ -1972,6 +1972,12 @@ def mesh_for(elements, alpha, re, chord=1.0, fine=False, opts=None):
         cmax = max(float(np.ptp(e.x)) for e in elements)
         els = [repanel(e, max(20, int(round(o.n_surface * float(np.ptp(e.x)) / cmax))), keep_frame=True)
                for e in elements]
+    zones = None
+    if getattr(o, "transition_refine", False) and not multi:
+        al = tuple(o.tr_alphas) or (float(alpha),)
+        zones = transition_zones(els[0], re, al, o.tr_ncrit, o.tr_mach, o.tr_width)
+        if zones:
+            els = [refine_surface(els[0], zones, o.tr_ds * float(np.ptp(els[0].x)))]
     near = o.near_size or ((0.002 if fine else 0.003) if multi else 0.004)
     # рост треугольников: у одного профиля 0,12 — NACA 0012 (α 10°, TMR) Cdp 0,00597 при эталоне
     # 0,00612 (с 0,25 — 0,00487: недобор от разрешения у носка и в корме); ячеек +30 %, итераций ×2.
@@ -2004,7 +2010,90 @@ def mesh_for(elements, alpha, re, chord=1.0, fine=False, opts=None):
             tt = np.linspace(0.0, sl[-1], m_)
             dense.append((np.interp(tt, sl, wx), np.interp(tt, sl, wy)))
         kw.update(wakes=dense or None, wake_size=(0.006 if fine else o.wake_size))
-    return build_mesh(els, chord=chord, re=re, **kw)
+    m = build_mesh(els, chord=chord, re=re, **kw)
+    m.tr_zones = zones                       # зоны сгущения у точек перехода (или None)
+    return m
+
+
+def transition_mesh_options(opts, solver_opts, alphas, mach):
+    """Параметры сетки с учётом модели перехода: при turb_model «…aft» и transition_refine
+    не False — сгущение у точек перехода (Ñкрит из ncrit или tu, M и углы — из расчёта)."""
+    from dataclasses import replace
+    from .rans_mesh import MeshOptions
+    o = opts or MeshOptions()
+    so = solver_opts or {}
+    if not str(so.get("turb_model", "")).endswith("aft") or getattr(o, "transition_refine", None) is False:
+        return o
+    nc = ncrit_from_tu(so["tu"]) if so.get("tu") is not None else float(so.get("ncrit", 9.0))
+    return replace(o, transition_refine=True, tr_ncrit=round(nc, 3), tr_mach=float(mach),
+                   tr_alphas=tuple(round(float(a), 3) for a in np.atleast_1d(alphas)))
+
+
+def transition_zones(af, re, alphas, ncrit=9.0, mach=0.15, width=0.1):
+    """Зоны сгущения у точек перехода по вязкому методу (eᴺ): {"upper": (x0, x1), "lower": (x0, x1)}
+    в долях хорды от носка — объединение по углам alphas (точка ±width). Углы, где вязкий
+    метод не сошёлся, пропускаются; переход у задней кромки (> 0,97) — зоны нет."""
+    from .viscous import ViscousSolver
+    al = sorted(set(float(a) for a in alphas))
+    if len(al) > 8:                          # поляра: не больше 8 углов (крайние и через равные доли)
+        al = [al[i] for i in np.unique(np.linspace(0, len(al) - 1, 8).round().astype(int))]
+    xu, xl = [], []
+    try:
+        vs = ViscousSolver(af, re, ncrit=float(ncrit), mach=min(float(mach), 0.6))
+    except Exception:                        # noqa: BLE001
+        return None
+    for a in al:
+        try:
+            r = vs.solve(a)
+        except Exception:                    # noqa: BLE001
+            continue
+        if np.isfinite(r.xtr_u) and r.xtr_u < 0.97:
+            xu.append(float(r.xtr_u))
+        if np.isfinite(r.xtr_l) and r.xtr_l < 0.97:
+            xl.append(float(r.xtr_l))
+    z = {}
+    if xu:
+        z["upper"] = (max(0.0, min(xu) - width), min(1.0, max(xu) + width))
+    if xl:
+        z["lower"] = (max(0.0, min(xl) - width), min(1.0, max(xl) + width))
+    return z or None
+
+
+def refine_surface(af, zones, ds, growth=0.15):
+    """Контур со сгущением в зонах zones (см. transition_zones): шаг вдоль поверхности ds,
+    за краем зоны растёт не быстрее чем на growth за отрезок до исходного.
+    Точки — по сплайну длины дуги (носок — узел)."""
+    from scipy.interpolate import CubicSpline
+    from .geometry import Airfoil
+    x, y = np.asarray(af.x, float), np.asarray(af.y, float)
+    s = np.r_[0.0, np.cumsum(np.hypot(np.diff(x), np.diff(y)))]
+    sx, sy = CubicSpline(s, x), CubicSpline(s, y)
+    ile = int(np.argmin(x))
+    x0, c = float(x.min()), float(np.ptp(x))
+    # исходный шаг как функция длины дуги
+    hs = np.diff(s)
+    sm = 0.5 * (s[1:] + s[:-1])
+    def target(si):
+        h = float(np.interp(si, sm, hs))
+        xi = (float(sx(si)) - x0) / c
+        side = "upper" if si <= s[ile] else "lower"
+        if side in zones:
+            a, b = zones[side]
+            dist = max(a - xi, xi - b, 0.0) * c          # расстояние от зоны по x
+            h = min(h, ds + growth * dist)               # шаг растёт от края зоны на ~growth за шаг
+        return max(h, 1e-6 * c)
+    pts = [0.0]
+    while pts[-1] < s[-1]:
+        si = pts[-1] + target(pts[-1])
+        pts.append(min(si, s[-1]))
+        if s[-1] - pts[-1] < 0.3 * target(pts[-1]):
+            pts[-1] = s[-1]
+    pts = np.asarray(pts)
+    # носок (точка min x) — обязательно узел: иначе C-блок теряет точку на передней кромке
+    k = int(np.argmin(abs(pts - s[ile])))
+    pts[k] = s[ile]
+    pts = np.unique(pts)
+    return Airfoil(np.asarray(sx(pts)), np.asarray(sy(pts)), getattr(af, "name", "airfoil"))
 
 
 def _seq_order(alphas):
@@ -2091,7 +2180,8 @@ def coarse_options(elements, opts=None):
     # устанавливается надёжно, а на мелком следе С-блока переход 1-й → 2-й порядок раскачивается;
     # с перенесённого поля С-блок сходится сразу (NACA 0012, α = 0: 52 итерации, Cd 0,00792)
     return replace(o, n_surface=max(40, int(n_side) // 2), near_size=2.5 * near, wake_size=2.5 * o.wake_size,
-                   ratio=max(o.ratio, 1.3), growth=max(o.growth, 0.35), cblock=False)
+                   ratio=max(o.ratio, 1.3), growth=max(o.growth, 0.35), cblock=False,
+                   transition_refine=False)
 
 
 class _ProcControl(RansControl):
@@ -2246,6 +2336,7 @@ def rans_polar(elements, alphas, re, mach=0.15, chord=1.0, xref=None, mesh=None,
     alphas = np.asarray(alphas, float)
     init = dict(init or {})
     if mesh is None:
+        mesh_opts = transition_mesh_options(mesh_opts, solver_opts, alphas, mach)
         mesh = mesh_for(elements, float(np.median(alphas)), re, chord, opts=mesh_opts)
     xs = np.concatenate([e.x for e in elements])
     xr = xref if xref is not None else (float(xs.min()) + 0.25 * chord, 0.0)

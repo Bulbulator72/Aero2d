@@ -9,7 +9,9 @@
 
 Расчёт профиля сохраняется каждые 20 итераций (aft_check_state.pkl): если окно закрыть,
 повторный запуск продолжит с места остановки. Отчёт — benchmarks/aft_report.txt.
-Аргументы: plate — только пластина; nlf — только профиль; без аргументов — оба."""
+Аргументы: plate — только пластина; nlf — только профиль; nlf_tr — профиль на сетке со
+сгущением у точек перехода (по вязкому методу; сохранение aft_check_state_tr.pkl); без
+аргументов — пластина и профиль."""
 import os
 import pickle
 import sys
@@ -95,7 +97,7 @@ def plate():
     log(f"   начало перехода (минимум Cf) Re_x = {rx[k][np.argmin(cf[k])]:.2e}   (FUN3D/OVERFLOW ≈ 4,8–5,0e6)")
 
 
-def nlf():
+def nlf(refine=False):
     from scipy.spatial import cKDTree
     from aero2d.core import _rans_xtr
     from aero2d.geometry import load_airfoil, repanel
@@ -104,16 +106,24 @@ def nlf():
     a, re, tu, mach = 0.0, 4e6, 0.15, 0.1
     af = repanel(load_airfoil(os.path.join(HERE, "data", "nlf0416", "nlf0416_coord.dat")), 160)
     nc = ncrit_from_tu(tu)
-    if os.path.exists(STATE):
-        d = pickle.load(open(STATE, "rb"))
-        log(f"\n[NLF(1)-0416] продолжение с итерации {d['it']}")
+    state = STATE.replace(".pkl", "_tr.pkl") if refine else STATE
+    title = "NLF(1)-0416, сетка со сгущением у точек перехода" if refine else "NLF(1)-0416"
+    if os.path.exists(state):
+        d = pickle.load(open(state, "rb"))
+        log(f"\n[{title}] продолжение с итерации {d['it']}")
     else:
         vs = ViscousSolver(af, re, ncrit=nc, mach=mach).solve(a)
-        log(f"\n[NLF(1)-0416] M {mach}, Re {re:.0e}, α {a}°, Tu {tu} % (Ñкрит {nc:.2f})")
+        log(f"\n[{title}] M {mach}, Re {re:.0e}, α {a}°, Tu {tu} % (Ñкрит {nc:.2f})")
         log(f"   вязкий метод: Cl {vs.cl:.4f}  Cd {vs.cd:.5f}  переход {vs.xtr_u:.3f} / {vs.xtr_l:.3f}")
         log("   эксперимент (TP-1861): Cl ≈ 0,45, переход ≈ 0,43 / 0,60")
-        d = dict(mesh=mesh_for([af], a, re), Q=None, it=0, cfl=None, t=0.0)
-        log(f"   сетка: {d['mesh'].n_cells} ячеек")
+        from aero2d.rans import transition_mesh_options
+        from aero2d.rans_mesh import MeshOptions
+        mo = transition_mesh_options(MeshOptions(transition_refine=None if refine else False),
+                                     {"turb_model": "sa-aft", "tu": tu}, [a], mach)
+        d = dict(mesh=mesh_for([af], a, re, opts=mo), Q=None, it=0, cfl=None, t=0.0)
+        z = getattr(d["mesh"], "tr_zones", None)
+        log(f"   сетка: {d['mesh'].n_cells} ячеек" + (f"; сгущение (шаг {mo.tr_ds:g} хорды): верх "
+            f"{z['upper'][0]:.2f}–{z['upper'][1]:.2f}, низ {z['lower'][0]:.2f}–{z['lower'][1]:.2f}" if z else ""))
     m = d["mesh"]
     s = RansSolver(m, mach, re)
     s.turb_model = "sa-aft"
@@ -150,8 +160,8 @@ def nlf():
         rn = float(rn[-1]) if len(rn) else np.nan
         fr = s.forces(r.state, a)
         d["fh"].append((d["it"], fr["cl"], fr["cd"], rn))
-        pickle.dump(d, open(STATE + ".tmp", "wb"))
-        os.replace(STATE + ".tmp", STATE)
+        pickle.dump(d, open(state + ".tmp", "wb"))
+        os.replace(state + ".tmp", state)
         rmax = max(f[3] for f in d["fh"] if np.isfinite(f[3])) if any(np.isfinite(f[3]) for f in d["fh"]) else np.nan
         xu, xl = xtr(fr)
         ok = steady(d["fh"])
@@ -179,6 +189,8 @@ def main():
         plate()
     if "nlf" in what:
         nlf()
+    if "nlf_tr" in what:
+        nlf(refine=True)
     log("\nГотово.")
 
 

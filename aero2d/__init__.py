@@ -7,4 +7,4 @@ import os as _os
 _os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
 # версия — дата сборки; показывается в заголовке окна и в aero2d.exe --selftest
-__version__ = "2026.11.08-5 (18_RANS_transition_check: невязка, CFL и точки перехода в строке; остановка, когда силы установились)"
+__version__ = "2026.11.08-6 (модель перехода: сгущение сетки у точек перехода по вязкому методу; 19_RANS_transition_fine_mesh)"
