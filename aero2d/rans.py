@@ -258,7 +258,7 @@ class RansSolver:
         self.aft_cfl_max = 300.0       # предел CFL при расчёте с переходом
         self.aft_gamma_cap = True       # γ̃ ≤ 0 при обновлении (γ ≤ 1)
         self.aft_onset_smooth = 0.02    # ширина сглаживания изломов F_onset (0 — как у NASA, с изломами)
-        self.aft_grad_term = True       # член Γ|∇γ̃|² уравнения γ̃ = ln γ
+        self.aft_grad_term = False      # член Γ|∇γ̃|² (у NASA TMR и в FUN3D его нет)
         self.aft_n_dt = 1000.0          # множитель шага уравнения ñ
         self.aft_rollback = 1e6         # с переходом откат/отмена шага — только при росте невязки в столько раз (и NaN)
         self.aft_version = "2019b"     # калибровка AFT: "2019b" (новая) или "2017b"
@@ -1890,9 +1890,11 @@ class RansSolver:
 
 
 def ncrit_from_tu(tu_percent):
-    """Ñкрит по степени турбулентности потока Tu, % (Mack, 1977): −8,43 − 2,4·ln(Tu/100);
-    Tu 0,07 % → 9,0; 0,1 % → 8,1; 0,5 % → 4,3; 1 % → 2,6."""
-    return float(-8.43 - 2.4 * np.log(max(float(tu_percent), 1e-6) / 100.0))
+    """Ñкрит по степени турбулентности потока Tu, % (Mack, 1977): −8,43 − 2,4·ln(τ/100),
+    τ = 2,5·tanh(Tu/2,5) (Drela, MISES; NASA TMR для SA-AFT). Tu 0,07 % → 9,0; 0,1 % → 8,1;
+    0,5 % → 4,3; 1 % → 2,7."""
+    tau = 2.5 * np.tanh(max(float(tu_percent), 1e-6) / 2.5)        # ограничитель Дрелы (MISES), как у NASA TMR
+    return float(-8.43 - 2.4 * np.log(tau / 100.0))
 
 
 def wall_direction(mesh, k=6, nearest=False):

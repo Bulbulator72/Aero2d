@@ -241,7 +241,8 @@ def test_mesh_does_not_depend_on_alpha():
 def test_ncrit_from_tu():
     from aero2d.rans import ncrit_from_tu
     assert abs(ncrit_from_tu(0.07) - 9.0) < 0.01          # Мэк: Tu 0,07 % ≈ Ñкрит 9
-    assert abs(ncrit_from_tu(1.0) - 2.62) < 0.01
+    assert abs(ncrit_from_tu(1.0) - 2.75) < 0.01        # с ограничителем Дрелы τ = 2,5·tanh(Tu/2,5)
+    assert abs(ncrit_from_tu(0.0408) - 10.3) < 0.01      # Шубауэр–Клебанов (Hildebrand 2023)
     assert ncrit_from_tu(0.1) > ncrit_from_tu(0.3)
 
 
