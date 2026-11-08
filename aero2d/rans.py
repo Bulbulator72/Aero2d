@@ -255,6 +255,11 @@ class RansSolver:
         # 0,05 хорды) член начала перехода F_onset в уравнении γ̃ включён полностью
         self.xtr_u = 1.0
         self.xtr_l = 1.0
+        # переход по вязкому методу (SA): lam_xtr = (x/c верх, x/c низ) — до этих точек у стенки
+        # порождение ν̃ выключено (ламинарный слой); lam_xtr_table — {α: (верх, низ)}, точки
+        # берутся при каждом угле (линейная интерполяция по α)
+        self.lam_xtr = None
+        self.lam_xtr_table = None
         self.aft_cfl_max = 300.0       # предел CFL при расчёте с переходом
         self.aft_gamma_cap = True       # γ̃ ≤ 0 при обновлении (γ ≤ 1)
         self.aft_onset_smooth = 0.02    # ширина сглаживания изломов F_onset (0 — как у NASA, с изломами)
@@ -378,6 +383,7 @@ class RansSolver:
         self.J["lim_te"] = jnp.asarray(near)
         self.J["wd_ex"] = jnp.asarray(dex)
         self.J["trip"] = jnp.zeros(nc, bool)
+        self.J["prod"] = jnp.ones(nc)
 
     # ------------------------------------------------------------------
     # физика
@@ -708,26 +714,44 @@ class RansSolver:
         """Ñкрит: из степени турбулентности tu (%, формула Мэка), если она задана, иначе ncrit."""
         return ncrit_from_tu(self.tu) if self.tu is not None else float(self.ncrit)
 
-    def trip_mask(self):
-        """Ячейки за точкой принудительного перехода (xtr_u, xtr_l) у стенки: (nc,) bool."""
-        nc = self.nc
-        if not self.transition or (self.xtr_u >= 1.0 and self.xtr_l >= 1.0):
-            return np.zeros(nc, bool)
+    def _wall_chord(self):
+        """Для ячеек: доля хорды своего тела (от носка) у ближайшей точки стенки, сторона (верх —
+        True) и признак «у стенки» (ближе 0,05 хорды тела). Кэшируется."""
+        if getattr(self, "_wc_cache", None) is not None:
+            return self._wc_cache
         q, b = self._wall_q, self._wall_b
         m = self.m
         wf = np.where(m.face_tag == 1)[0]
-        mask = np.zeros(nc, bool)
+        xr = np.ones(self.nc)
+        up = np.zeros(self.nc, bool)
+        near = np.zeros(self.nc, bool)
         for body in np.unique(b):
             pts = m.face_center[wf][m.face_body[wf] == body]
             le, te = pts[np.argmin(pts[:, 0])], pts[np.argmax(pts[:, 0])]
             ch = te - le
             c2 = float(ch @ ch)
-            k = b == body
-            xr = ((q[k] - le) @ ch) / c2                       # доля хорды от носка
-            up = (ch[0] * (q[k, 1] - le[1]) - ch[1] * (q[k, 0] - le[0])) > 0
-            near = self.wall_d[k] < 0.05 * np.sqrt(c2)
-            mask[np.where(k)[0]] = near & np.where(up, xr >= self.xtr_u, xr >= self.xtr_l)
-        return mask
+            k = np.where(b == body)[0]
+            xr[k] = ((q[k] - le) @ ch) / c2
+            up[k] = (ch[0] * (q[k, 1] - le[1]) - ch[1] * (q[k, 0] - le[0])) > 0
+            near[k] = self.wall_d[k] < 0.05 * np.sqrt(c2)
+        self._wc_cache = (xr, up, near)
+        return self._wc_cache
+
+    def trip_mask(self):
+        """Ячейки за точкой принудительного перехода (xtr_u, xtr_l) у стенки: (nc,) bool."""
+        if not self.transition or (self.xtr_u >= 1.0 and self.xtr_l >= 1.0):
+            return np.zeros(self.nc, bool)
+        xr, up, near = self._wall_chord()
+        return near & np.where(up, xr >= self.xtr_u, xr >= self.xtr_l)
+
+    def laminar_mask(self):
+        """Ламинарная область для SA (lam_xtr = (верх, низ)): ячейки у стенки до точки перехода —
+        там порождение ν̃ выключено (как «laminar regions» в CFL3D и FUN3D): (nc,) bool."""
+        if self.lam_xtr is None or self.nv != 5:
+            return np.zeros(self.nc, bool)
+        xu, xl = self.lam_xtr
+        xr, up, near = self._wall_chord()
+        return near & np.where(up, xr < xu, xr < xl)
 
     def ft2(self, w):
         """Связь перехода с SA: f_t2 = c_t3 (1 − exp γ̃) (γ̃ ≤ 0)."""
@@ -900,6 +924,8 @@ class RansSolver:
         if f1 is None and self.turb_model == "sa-rc":
             f1 = self.fr1(w, graw)
         if w.shape[1] == 5:
+            if self.lam_xtr is not None:              # ламинарная область — без порождения ν̃
+                f1 = J["prod"] if f1 is None else f1 * J["prod"]
             return self.sa_source(w, g, J["wd"], f1)[:, None]
         if HL is None:
             HL = self.aft_HL(w)
@@ -997,6 +1023,8 @@ class RansSolver:
         g = self.gradients(w, self._wall_values(w))
 
         f1 = self.fr1(w, g) if self.turb_model == "sa-rc" else jnp.ones(self.nc)
+        if self.lam_xtr is not None and Q.shape[1] == 5:
+            f1 = f1 * J["prod"]
         nv = Q.shape[1]
         if nv == 6:
             def src6(q, gi, wd):
@@ -1076,7 +1104,8 @@ class RansSolver:
                 self.limiter_zone,
                 float(self.zmin), bool(self.sa_raw_grad), bool(self.visc_raw_grad), int(self.rc_smooth),
                 bool(self.turbulent), float(self.chi_inf), float(self.chi_inf_tr), self.xref, int(self.turb_order),
-                float(self.ncrit_eff()), float(self.xtr_u), float(self.xtr_l))
+                float(self.ncrit_eff()), float(self.xtr_u), float(self.xtr_l),
+                None if self.lam_xtr is None else tuple(round(float(v), 4) for v in self.lam_xtr))
 
     def _fns(self):
         """Скомпилированные (jax.jit) невязки, произведения якобиана на вектор и
@@ -1086,6 +1115,7 @@ class RansSolver:
         if getattr(self, "_fn_cache_key", None) == key:
             return self._fn_cache
         self.J["trip"] = self.jnp.asarray(self.trip_mask())
+        self.J["prod"] = self.jnp.asarray(1.0 - self.laminar_mask().astype(float))
         jax = self.jax
         prim, wallv = self.prim, self._wall_values
 
@@ -1207,6 +1237,27 @@ class RansSolver:
         тел поворачивается на α − α0 (у стенок — меньше), иначе внешнее поле
         «узнаёт» о новом угле только через десятки итераций."""
         crit = conv or self.conv
+        if self.lam_xtr_table:
+            self.lam_xtr = lam_xtr_at(self.lam_xtr_table, alpha)
+        if self.lam_xtr is not None and Q0 is None and self.nv == 5:
+            # переход по вязкому методу с холодного старта: сначала полностью турбулентное решение,
+            # потом — с ламинарной областью. С однородного потока сразу с ламинарной областью
+            # слой отрывался и расчёт застревал в отрывном решении (NLF(1)-0416, α 0: Cl ≈ 0 при
+            # 0,49; из турбулентного — 57 итераций)
+            lx, tb = self.lam_xtr, self.lam_xtr_table
+            self.lam_xtr, self.lam_xtr_table = None, None
+            try:
+                r0 = self.solve(alpha, None, max_iter, tol, cfl0, cfl_max, first_order_iters, verbose, callback,
+                                gmres_tol, gmres_iter, conv, control, alpha0)
+            finally:
+                self.lam_xtr, self.lam_xtr_table = lx, tb
+            if verbose:
+                print(f"  турбулентное решение: Cl {r0.cl:.4f}, {r0.status} — включаю ламинарную область "
+                      f"до x/c {lx[0]:.3f} (верх) / {lx[1]:.3f} (низ)", flush=True)
+            r = self.solve(alpha, r0.state, max_iter, tol, None, cfl_max, first_order_iters, verbose, callback,
+                           gmres_tol, gmres_iter, conv, control, alpha)
+            r.iterations += r0.iterations
+            return r
         cfl0 = self.cfl_start if cfl0 is None else cfl0
         cfl_max = self.cfl_limit if cfl_max is None else cfl_max
         cfl_max_full = cfl_max
@@ -1601,7 +1652,7 @@ class RansSolver:
                 # 300 итераций вместо 0,00059; с правым — Блазиус за 90 итераций)
                 from .krylov import gmres as _gmres
                 dq, info = _gmres(mv, -R.ravel(), prec=ilu.solve, rtol=gmres_tol, maxiter=gmres_iter,
-                                  callback=gh.append, right=bool(self.transition or not self.turbulent))
+                                  callback=gh.append, right=bool(self.transition or not self.turbulent or self.lam_xtr is not None))
             lin = float(np.linalg.norm(mv(dq) + R.ravel()) / max(np.linalg.norm(R), 1e-300))
             if not self.right_prec and not (np.isfinite(lin) and lin < 0.5):
                 # левое предобусловливание минимизирует ‖M⁻¹r‖ и может «сойтись» за одну
@@ -1895,6 +1946,50 @@ class RansSolver:
         return out
 
 
+def viscous_transition_opts(elements, alphas, re, mach, solver_opts):
+    """solver_opts с xtr_source="viscous" (SA, переход по вязкому методу): таблица точек перехода
+    lam_xtr_table по углам alphas (Ñкрит — из ncrit или tu, принудительный переход — xtr_forced);
+    модель — SA. Только для одного профиля; без таблицы (вязкий метод не сошёлся) — полностью
+    турбулентно. Иначе solver_opts без изменений."""
+    so = dict(solver_opts or {})
+    if so.get("xtr_source") != "viscous":
+        return solver_opts
+    so.pop("xtr_source")
+    xf = tuple(so.pop("xtr_forced", (1.0, 1.0)))
+    so["turb_model"] = "sa" if so.get("turb_model", "sa").endswith("aft") else so.get("turb_model", "sa")
+    if len(elements) == 1 and "lam_xtr_table" not in so:
+        nc = ncrit_from_tu(so["tu"]) if so.get("tu") is not None else float(so.get("ncrit", 9.0))
+        so["lam_xtr_table"] = viscous_transition_table(elements[0], alphas, re, nc, mach, xf) or None
+    return so
+
+
+def lam_xtr_at(table, alpha):
+    """Точки перехода (верх, низ) при угле alpha по таблице {α: (верх, низ)} — линейно по α,
+    за пределами — ближайший угол; None — переход не задан (полностью турбулентно)."""
+    if not table:
+        return None
+    a = np.array(sorted(table), float)
+    v = np.array([table[k] for k in sorted(table)], float)
+    return float(np.interp(alpha, a, v[:, 0])), float(np.interp(alpha, a, v[:, 1]))
+
+
+def viscous_transition_table(af, alphas, re, ncrit=9.0, mach=0.15, xtr=(1.0, 1.0)):
+    """Точки перехода вязким методом (eᴺ, как XFOIL) при углах alphas: {α: (верх, низ)} в долях
+    хорды от носка; принудительный переход xtr ограничивает их сзади. Углы, где вязкий метод
+    не сошёлся, пропускаются (берутся по соседним); пустой словарь — не сошёлся ни один."""
+    from .viscous import ViscousSolver
+    vs = ViscousSolver(af, re, ncrit=float(ncrit), mach=min(float(mach), 0.6))
+    out = {}
+    for a in sorted(set(float(a) for a in np.atleast_1d(alphas))):
+        try:
+            r = vs.solve(a)
+        except Exception:                    # noqa: BLE001
+            continue
+        if getattr(r, "converged", True) and np.isfinite(r.xtr_u) and np.isfinite(r.xtr_l):
+            out[a] = (min(float(r.xtr_u), float(xtr[0])), min(float(r.xtr_l), float(xtr[1])))
+    return out
+
+
 def ncrit_from_tu(tu_percent):
     """Ñкрит по степени турбулентности потока Tu, % (Mack, 1977): −8,43 − 2,4·ln(τ/100),
     τ = 2,5·tanh(Tu/2,5) (Drela, MISES; NASA TMR для SA-AFT). Tu 0,07 % → 9,0; 0,1 % → 8,1;
@@ -2022,7 +2117,9 @@ def transition_mesh_options(opts, solver_opts, alphas, mach):
     from .rans_mesh import MeshOptions
     o = opts or MeshOptions()
     so = solver_opts or {}
-    if not str(so.get("turb_model", "")).endswith("aft") or getattr(o, "transition_refine", None) is False:
+    tr = str(so.get("turb_model", "")).endswith("aft") or bool(so.get("lam_xtr_table")) \
+        or so.get("xtr_source") == "viscous"
+    if not tr or getattr(o, "transition_refine", None) is False:
         return o
     nc = ncrit_from_tu(so["tu"]) if so.get("tu") is not None else float(so.get("ncrit", 9.0))
     return replace(o, transition_refine=True, tr_ncrit=round(nc, 3), tr_mach=float(mach),
@@ -2335,6 +2432,7 @@ def rans_polar(elements, alphas, re, mach=0.15, chord=1.0, xref=None, mesh=None,
     («досчитать»); rref — опорная невязка прежнего расчёта (для критерия сходимости)."""
     alphas = np.asarray(alphas, float)
     init = dict(init or {})
+    solver_opts = viscous_transition_opts(elements, alphas, re, mach, solver_opts)
     if mesh is None:
         mesh_opts = transition_mesh_options(mesh_opts, solver_opts, alphas, mach)
         mesh = mesh_for(elements, float(np.median(alphas)), re, chord, opts=mesh_opts)

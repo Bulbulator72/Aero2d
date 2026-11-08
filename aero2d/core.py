@@ -501,10 +501,13 @@ def run_rans(af, alphas, mach: float, re: float, callback=None, max_iter: int = 
     alphas = np.asarray(alphas, float)
     if not chord:
         chord = float(max(np.max(e.x) for e in elements) - min(np.min(e.x) for e in elements))
+    from .rans import transition_mesh_options, viscous_transition_opts
+    if (solver_opts or {}).get("xtr_source") == "viscous" and callback:
+        callback("Точки перехода — вязким методом…", 0.0)
+    solver_opts = viscous_transition_opts(elements, alphas, re, mach, solver_opts)
     if mesh is None:
         if callback:
             callback("Построение сетки (gmsh)…", 0.0)
-        from .rans import transition_mesh_options
         mesh_opts = transition_mesh_options(mesh_opts, solver_opts, alphas, mach)
         mesh = mesh_for(elements, float(np.median(alphas)), re, chord, opts=mesh_opts)
     n = len(alphas)
@@ -545,7 +548,11 @@ def run_rans(af, alphas, mach: float, re: float, callback=None, max_iter: int = 
                 xtr_u[i_], xtr_l[i_] = _rans_xtr(np.asarray(e.x), j[o], el["x"][o], el["gam"][o], chord)
         xs_all.append(np.concatenate(xx)); cps_all.append(np.concatenate(cc))
     tm = (solver_opts or {}).get("turb_model", "sa")
-    if tm.endswith("aft"):
+    if (solver_opts or {}).get("lam_xtr_table"):
+        tr_txt = ("; ламинарно-турбулентный переход — по вязкому методу (eᴺ, как XFOIL) при каждом угле: "
+                  "до точки перехода у стенки порождение турбулентной вязкости выключено (ламинарный слой, "
+                  "как «laminar regions» в CFL3D и FUN3D). ")
+    elif tm.endswith("aft"):
         tr_txt = (f"; ламинарно-турбулентный переход — модель AFT2017b (Coder, NASA: усиление волн "
                   f"Толмина–Шлихтинга ñ по огибающей eᴺ и перемежаемость γ), Ñкрит = "
                   f"{(solver_opts or {}).get('ncrit', 9):g}. ")

@@ -246,8 +246,14 @@ class App(tk.Tk):
         ttk.Entry(fr, textvariable=self.rans_iter, width=7).grid(row=0, column=1, sticky="w")
         ttk.Label(fr, text="модель турбулентности").grid(row=1, column=0, sticky="w")
         self.turb_model = tk.StringVar(value=list(self.TURB_MODELS)[0])
-        ttk.Combobox(fr, textvariable=self.turb_model, values=list(self.TURB_MODELS), state="readonly",
-                     width=22).grid(row=1, column=1, sticky="w")
+        tmc = ttk.Combobox(fr, textvariable=self.turb_model, values=list(self.TURB_MODELS), state="readonly",
+                           width=30)
+        tmc.grid(row=1, column=1, sticky="w")
+        Tooltip(tmc, "SA — полностью турбулентный слой. «SA + переход по вязкому методу» — точки перехода "
+                     "при каждом угле находит вязкий метод (eᴺ, как XFOIL; Ñкрит или Tu и «переход не дальше "
+                     "x/c» — из окна), до них у стенки порождение турбулентной вязкости выключено: быстро и "
+                     "устойчиво (NLF(1)-0416: переход 0,42/0,61 при эксперименте 0,43/0,60). SA-AFT — переход "
+                     "решает сам RANS (модель NASA, 2 уравнения): дольше, экспериментально.")
         ttk.Label(fr, text="предобусловливатель ILU(k), k").grid(row=2, column=0, sticky="w")
         self.prec_fill = tk.StringVar(value="3")
         ttk.Combobox(fr, textvariable=self.prec_fill, values=["0", "1", "2", "3", "4"], state="readonly",
@@ -2138,6 +2144,7 @@ class App(tk.Tk):
 
     TURB_MODELS = {"SA (Спаларт–Аллмарас)": "sa",
                    "SA-RC (поправка на кривизну)": "sa-rc",
+                   "SA + переход по вязкому методу (eᴺ)": "sa-vtr",
                    "SA-AFT (переход, Ñкрит из окна)": "sa-aft",
                    "k-ω SST (Menter 2003, проверяется)": "sst"}
 
@@ -2236,7 +2243,10 @@ class App(tk.Tk):
         o["prec_fill"] = int(self.prec_fill.get())
         o["limiter_zone"] = self.LIMITER_ZONES.get(self.lim_zone.get(), "te")
         o["turb_model"] = self.TURB_MODELS[self.turb_model.get()]
-        if o["turb_model"].endswith("aft"):
+        vtr = o["turb_model"] == "sa-vtr"
+        if vtr:
+            o["turb_model"], o["xtr_source"] = "sa", "viscous"
+        if vtr or o["turb_model"].endswith("aft"):
             try:
                 if self.tu.get().strip():
                     from .rans import ncrit_from_tu
@@ -2253,6 +2263,8 @@ class App(tk.Tk):
                 raise ValueError("Ñкрит для модели перехода: от 1 до 14 (Tu от ~0,01 до ~2 %)")
             if not (0.0 <= o["xtr_u"] <= 1.0 and 0.0 <= o["xtr_l"] <= 1.0):
                 raise ValueError("Переход не дальше x/c: от 0 до 1")
+            if vtr:                              # принудительный переход — ограничение точек вязкого метода
+                o["xtr_forced"] = (o.pop("xtr_u"), o.pop("xtr_l"))
         return o
 
     def halve_cfl(self):
