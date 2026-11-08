@@ -285,3 +285,22 @@ def test_refine_surface_transition_zone():
     mid = (xm[1:] > 0.05) & (xm[1:] < 0.95)
     q = np.maximum(d[1:] / d[:-1], d[:-1] / d[1:])
     assert q[mid].max() < 1.3
+
+
+def test_laminar_mask_viscous_transition():
+    """Переход по вязкому методу: ламинарная область — у стенки до точки перехода своей стороны."""
+    from aero2d.geometry import naca4, repanel
+    from aero2d.rans import RansSolver, lam_xtr_at
+    from aero2d.rans_mesh import build_mesh
+    m = build_mesh([repanel(naca4("2412", 120), 60)], re=1e6, far_radius=15, far_size=5.0, ratio=1.4,
+                   slot_size=0.02, growth=0.4)
+    s = RansSolver(m, 0.15, 1e6)
+    assert not s.laminar_mask().any()
+    s.lam_xtr = (0.3, 0.6)
+    k = s.laminar_mask()
+    c = m.centroid
+    assert k.any()
+    assert c[k & (c[:, 1] > 0.03), 0].max() < 0.32         # верх — до 0,3
+    assert c[k & (c[:, 1] < -0.03), 0].max() < 0.62        # низ — до 0,6
+    assert lam_xtr_at({0.0: (0.4, 0.6), 4.0: (0.2, 0.8)}, 2.0) == (0.30000000000000004, 0.7)
+    assert lam_xtr_at({0.0: (0.4, 0.6)}, 10.0) == (0.4, 0.6)

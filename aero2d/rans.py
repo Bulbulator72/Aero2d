@@ -2117,8 +2117,10 @@ def transition_mesh_options(opts, solver_opts, alphas, mach):
     from .rans_mesh import MeshOptions
     o = opts or MeshOptions()
     so = solver_opts or {}
-    tr = str(so.get("turb_model", "")).endswith("aft") or bool(so.get("lam_xtr_table")) \
-        or so.get("xtr_source") == "viscous"
+    # только для SA-AFT: ей надо разрешить рост возмущений у точки перехода. В режиме «переход по
+    # вязкому методу» точка задана — мелкая сетка не нужна и ухудшала сходимость (NLF(1)-0416:
+    # на обычной сетке 78 итераций, со сгущением — колебания и откаты)
+    tr = str(so.get("turb_model", "")).endswith("aft")
     if not tr or getattr(o, "transition_refine", None) is False:
         return o
     nc = ncrit_from_tu(so["tu"]) if so.get("tu") is not None else float(so.get("ncrit", 9.0))

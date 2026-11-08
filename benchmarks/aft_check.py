@@ -180,6 +180,22 @@ def nlf(refine=False):
         f"{status}, итераций {d['it']}, {d['t'] / 60:.0f} мин")
 
 
+def nlf_vtr():
+    """NLF(1)-0416 в режиме «SA + переход по вязкому методу» (батник 20)."""
+    from aero2d.core import run_rans
+    from aero2d.geometry import load_airfoil, repanel
+    from aero2d.rans import Convergence
+    a, re, tu, mach = 0.0, 4e6, 0.15, 0.1
+    af = repanel(load_airfoil(os.path.join(HERE, "data", "nlf0416", "nlf0416_coord.dat")), 160)
+    t0 = time.time()
+    p = run_rans(af, [a], mach, re, max_iter=400, conv=Convergence(),
+                 solver_opts={"xtr_source": "viscous", "tu": tu}, coarse_start=True)
+    log(f"\n[NLF(1)-0416, SA + переход по вязкому методу] M {mach}, Re {re:.0e}, α {a}°, Tu {tu} %")
+    log("   эксперимент (TP-1861): Cl ≈ 0,45, переход ≈ 0,43 / 0,60; вязкий метод: Cl 0,4707, Cd 0,00517")
+    log(f"   RANS: Cl {p.cl[0]:.4f}  Cd {p.cd[0]:.5f}  переход {p.xtr_u[0]:.3f} / {p.xtr_l[0]:.3f}; "
+        f"{(time.time() - t0) / 60:.0f} мин")
+
+
 def main():
     import aero2d
     what = sys.argv[1:] or ["plate", "nlf"]
@@ -191,6 +207,8 @@ def main():
         nlf()
     if "nlf_tr" in what:
         nlf(refine=True)
+    if "nlf_vtr" in what:
+        nlf_vtr()
     log("\nГотово.")
 
 

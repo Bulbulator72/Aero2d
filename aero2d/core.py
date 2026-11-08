@@ -547,6 +547,12 @@ def run_rans(af, alphas, mach: float, re: float, callback=None, max_iter: int = 
             if e_i == 0 and el.get("gam") is not None:
                 xtr_u[i_], xtr_l[i_] = _rans_xtr(np.asarray(e.x), j[o], el["x"][o], el["gam"][o], chord)
         xs_all.append(np.concatenate(xx)); cps_all.append(np.concatenate(cc))
+    tbl = (solver_opts or {}).get("lam_xtr_table")
+    if tbl:                                  # переход по вязкому методу — точки заданы
+        from .rans import lam_xtr_at
+        for i_, a_ in enumerate(alphas):
+            if res[i_] is not None:
+                xtr_u[i_], xtr_l[i_] = lam_xtr_at(tbl, float(a_))
     tm = (solver_opts or {}).get("turb_model", "sa")
     if (solver_opts or {}).get("lam_xtr_table"):
         tr_txt = ("; ламинарно-турбулентный переход — по вязкому методу (eᴺ, как XFOIL) при каждом угле: "
