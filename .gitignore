@@ -3,3 +3,5 @@ __pycache__/
 .pytest_cache/
 benchmarks/*.json
 benchmarks/polar_*.csv
+benchmarks/aft_check_state.pkl
+benchmarks/aft_check_state.pkl.tmp
