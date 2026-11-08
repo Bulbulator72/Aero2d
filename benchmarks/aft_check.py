@@ -119,7 +119,25 @@ def nlf():
     s.turb_model = "sa-aft"
     s.tu = tu
     s.aft_state = dict(d.get("aft_state", {}))
+    def xtr(fr):
+        el = fr["elements"][0]
+        if el.get("gam") is None:
+            return np.nan, np.nan
+        _, j = cKDTree(np.column_stack([af.x, af.y])).query(np.column_stack([el["x"], el["y"]]))
+        o = np.argsort(j, kind="stable")
+        return _rans_xtr(np.asarray(af.x), j[o], el["x"][o], el["gam"][o])
+
+    def steady(fh, n=10):
+        """Силы установились: за последние n кусков (20·n итераций) Cl меняется < 0,0005, Cd < 0,00002."""
+        if len(fh) < n:
+            return False
+        cl = [f[1] for f in fh[-n:]]
+        cd = [f[2] for f in fh[-n:]]
+        return max(cl) - min(cl) < 5e-4 and max(cd) - min(cd) < 2e-5
+
+    d.setdefault("fh", [])
     status = ""
+    print("   итерация: Cl, Cd, невязка (во сколько раз упала от наибольшей), CFL, переход верх/низ", flush=True)
     while d["it"] < int(os.environ.get("AFT_IT", "3000")):
         t = time.time()
         r = s.solve(a, Q0=d["Q"], alpha0=a if d["Q"] is not None else None, max_iter=20, conv=Convergence(),
@@ -128,20 +146,26 @@ def nlf():
         hc = np.atleast_1d((r.history or {}).get("cfl", [50.0]))
         d["cfl"] = float(hc[-1]) if len(hc) else 50.0
         d["aft_state"] = dict(s.aft_state)
+        rn = np.atleast_1d((r.history or {}).get("rn", [np.nan]))
+        rn = float(rn[-1]) if len(rn) else np.nan
+        fr = s.forces(r.state, a)
+        d["fh"].append((d["it"], fr["cl"], fr["cd"], rn))
         pickle.dump(d, open(STATE + ".tmp", "wb"))
         os.replace(STATE + ".tmp", STATE)
-        fr = s.forces(r.state, a)
-        print(f"   итерация {d['it']}: Cl {fr['cl']:.4f}  Cd {fr['cd']:.5f}  ({d['t'] / 60:.0f} мин)", flush=True)
+        rmax = max(f[3] for f in d["fh"] if np.isfinite(f[3])) if any(np.isfinite(f[3]) for f in d["fh"]) else np.nan
+        xu, xl = xtr(fr)
+        ok = steady(d["fh"])
+        print(f"   {d['it']}: Cl {fr['cl']:.4f}  Cd {fr['cd']:.5f}  невязка {rn:.2e} (÷{rmax / rn:.0f})  "
+              f"CFL {d['cfl']:.0f}  переход {xu:.3f}/{xl:.3f}  ({d['t'] / 60:.0f} мин)"
+              + ("  — силы установились" if ok else ""), flush=True)
         status = r.status
         if status.startswith("сошлось"):
             break
+        if ok:
+            status = "силы установились (за 200 итераций Cl < 0,0005, Cd < 0,00002) — расчёт остановлен"
+            break
     fr = s.forces(d["Q"], a)
-    el = fr["elements"][0]
-    xt = (np.nan, np.nan)
-    if el.get("gam") is not None:
-        _, j = cKDTree(np.column_stack([af.x, af.y])).query(np.column_stack([el["x"], el["y"]]))
-        o = np.argsort(j, kind="stable")
-        xt = _rans_xtr(np.asarray(af.x), j[o], el["x"][o], el["gam"][o])
+    xt = xtr(fr)
     log(f"   SA-AFT: Cl {fr['cl']:.4f}  Cd {fr['cd']:.5f}  переход {xt[0]:.3f} / {xt[1]:.3f}; "
         f"{status}, итераций {d['it']}, {d['t'] / 60:.0f} мин")
 
