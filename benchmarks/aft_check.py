@@ -118,14 +118,16 @@ def nlf():
     s = RansSolver(m, mach, re)
     s.turb_model = "sa-aft"
     s.tu = tu
+    s.aft_state = dict(d.get("aft_state", {}))
     status = ""
-    while d["it"] < int(os.environ.get("AFT_IT", "1500")):
+    while d["it"] < int(os.environ.get("AFT_IT", "3000")):
         t = time.time()
         r = s.solve(a, Q0=d["Q"], alpha0=a if d["Q"] is not None else None, max_iter=20, conv=Convergence(),
                     cfl0=d["cfl"])
         d["Q"], d["it"], d["t"] = r.state, d["it"] + r.iterations, d["t"] + time.time() - t
         hc = np.atleast_1d((r.history or {}).get("cfl", [50.0]))
-        d["cfl"] = float(min(hc[-1], 300.0)) if len(hc) else 50.0
+        d["cfl"] = float(hc[-1]) if len(hc) else 50.0
+        d["aft_state"] = dict(s.aft_state)
         pickle.dump(d, open(STATE + ".tmp", "wb"))
         os.replace(STATE + ".tmp", STATE)
         fr = s.forces(r.state, a)

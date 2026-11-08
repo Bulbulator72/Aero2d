@@ -261,6 +261,7 @@ class RansSolver:
         self.aft_grad_term = False      # член Γ|∇γ̃|² (у NASA TMR и в FUN3D его нет)
         self.aft_n_dt = 1000.0          # множитель шага уравнения ñ
         self.aft_rollback = 1e6         # с переходом откат/отмена шага — только при росте невязки в столько раз (и NaN)
+        self.aft_state = {}             # предел CFL и наибольшая невязка — для продолжения кусками
         self.aft_version = "2019b"     # калибровка AFT: "2019b" (новая) или "2017b"
         # шаг по псевдовремени и защита от развала
         self.cfl_start = 5.0           # CFL первой итерации
@@ -1211,6 +1212,10 @@ class RansSolver:
         cfl_max_full = cfl_max
         if self.transition:          # переход: большой шаг заставляет точку перехода «прыгать»
             cfl_max = min(cfl_max, self.aft_cfl_max)
+            # продолжение расчёта кусками (сохранение каждые N итераций): предел CFL и наибольшая
+            # невязка — с прошлого куска, иначе предел каждый раз сбрасывался к 300 и CFL не рос
+            if Q0 is not None and self.aft_state.get("cap"):
+                cfl_max = min(cfl_max_full, max(cfl_max, float(self.aft_state["cap"])))
         # переход: пока фронт перехода формируется, невязка законно растёт на порядки
         # (турбулентный клин), а откат «к наименьшей невязке» возвращал ламинарное поле —
         # переход не возникал. Откат и отмена шага — только при NaN и росте в aft_rollback раз
@@ -1512,12 +1517,13 @@ class RansSolver:
                 calm = (len(fw_) == 21
                         and max(f[0] for f in fw_) - min(f[0] for f in fw_) < 2e-3 * max(0.2, abs(fw_[-1][0]))
                         and max(f[1] for f in fw_) - min(f[1] for f in fw_) < 5e-3 * abs(fw_[-1][1]) + 1e-6)
-                r2max = max(h[0] for h in hist if h[1] == order)
+                r2max = max([h[0] for h in hist if h[1] == order] + [float(self.aft_state.get("r2max", 0.0))])
                 if rn > 2.0 * hist[-2][0] or not getattr(self, "_last_ok", True):
                     cfl_max = max(min(cfl_max_full, self.aft_cfl_max), cfl_max / 4.0)
                 elif (calm or rn < 3e-3 * r2max) and rn <= 1.2 * hist[-2][0] and rn < 1e-2 * r2max:
                     cfl_max = min(cfl_max_full, cfl_max * 1.2)
                 cfl = min(cfl, cfl_max)
+                self.aft_state.update(cap=float(cfl_max), r2max=float(r2max))
             if self.turb_boost > 1.0 and nv == 5:
                 ok_ = getattr(self, "_last_ok", True)
                 fw_ = fh[-11:] if order >= 2 else []

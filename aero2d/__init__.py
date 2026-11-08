@@ -7,4 +7,4 @@ import os as _os
 _os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
 # версия — дата сборки; показывается в заголовке окна и в aero2d.exe --selftest
-__version__ = "2026.11.08-3 (18_RANS_transition_check: проверка модели перехода — пластина NASA и NLF(1)-0416)"
+__version__ = "2026.11.08-4 (модель перехода: предел CFL переносится между кусками расчёта — профиль сходится быстрее)"
