@@ -9,3 +9,5 @@ benchmarks/aft_check_state_tr.pkl
 benchmarks/aft_check_state_tr.pkl.tmp
 benchmarks/nlf_polar_report.txt
 benchmarks/aft_report.txt
+benchmarks/nlf_polar_state.pkl
+benchmarks/nlf_polar_state.pkl.tmp

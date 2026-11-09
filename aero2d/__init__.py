@@ -7,4 +7,4 @@ import os as _os
 _os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
 # версия — дата сборки; показывается в заголовке окна и в aero2d.exe --selftest
-__version__ = "2026.11.09-3 (21_RANS_NLF0416_polar: поляра NLF(1)-0416 до срыва против эксперимента NASA)"
+__version__ = "2026.11.09-4 (21_RANS_NLF0416_polar: углы по очереди, каждый сразу в отчёт, продолжение после закрытия)"
