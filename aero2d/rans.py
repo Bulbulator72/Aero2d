@@ -243,9 +243,12 @@ class RansSolver:
         self.ncrit = 9.0               # критический N-фактор (как Ñкрит в XFOIL)
         # k-ω SST: неизвестные ρk̂ (k̂ = k/k_ref, k_ref = 1e−5·V∞²) и ρω̃ (ω̃ = ln(ω/ω_ref),
         # ω_ref = V∞/c — логарифм: ω у стенки больше, чем вдали, на 7–8 порядков, и всегда > 0);
-        # набегающий поток — как на NASA TMR: k∞ = 9·10⁻⁹ a∞², ω∞ = 10⁻⁶ ρ∞a∞²/μ∞ (μt/μ ≈ 0,009)
-        self.sst_k_inf = 9e-9
-        self.sst_omega_inf_coef = 1e-6
+        # набегающий поток — для SST-sust по NASA TMR (Spalart–Rumsey 2007): k∞ = 10⁻⁶ V∞²
+        # (Tu 0,08 %), ω∞ = 5 V∞/c. Значения обычного SST (k∞ = 9·10⁻⁹ a∞², ω∞ = 10⁻⁶ ρa²/μ)
+        # рассчитаны на затухание по пути к телу; с поддерживающими членами ω∞ оставался в 25–50 раз
+        # больше — член βρω∞²/ω завышал ω во внешней части слоя: Cf пластины −12 %, ранний отрыв
+        self.sst_k_inf_rel = 1e-6         # k∞ / V∞²
+        self.sst_omega_inf_rel = 5.0      # ω∞ · c / V∞
         self.chi_inf_tr = 0.1          # ν̃/ν набегающего потока при расчёте с переходом (NASA TMR)
         # степень турбулентности потока, %: если задана — Ñкрит по формуле Мэка
         # Ñкрит = −8,43 − 2,4·ln(Tu/100) (Tu 0,07 % → 9; 0,5 % → 4,3), иначе — ncrit
@@ -413,8 +416,8 @@ class RansSolver:
 
     def sst_inf(self):
         """k̂∞, ω̃∞ набегающего потока."""
-        k = self.sst_k_inf / self.k_ref if self.turbulent else 1e-12
-        om = self.sst_omega_inf_coef / self.mu_inf
+        k = self.sst_k_inf_rel * self.mach ** 2 / self.k_ref if self.turbulent else 1e-12
+        om = self.sst_omega_inf_rel * self.om_ref
         return k, float(np.log(om / self.om_ref))
 
     def prim(self, Q):
