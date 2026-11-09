@@ -249,6 +249,7 @@ class RansSolver:
         # больше — член βρω∞²/ω завышал ω во внешней части слоя: Cf пластины −12 %, ранний отрыв
         self.sst_k_inf_rel = 1e-6         # k∞ / V∞²
         self.sst_omega_inf_rel = 5.0      # ω∞ · c / V∞
+        self.sst_sa_start = True          # SST с однородного потока: сначала решение SA
         self.chi_inf_tr = 0.1          # ν̃/ν набегающего потока при расчёте с переходом (NASA TMR)
         # степень турбулентности потока, %: если задана — Ñкрит по формуле Мэка
         # Ñкрит = −8,43 − 2,4·ln(Tu/100) (Tu 0,07 % → 9; 0,5 % → 4,3), иначе — ncrit
@@ -1117,6 +1118,10 @@ class RansSolver:
         key = self._fn_key()
         if getattr(self, "_fn_cache_key", None) == key:
             return self._fn_cache
+        store = self.__dict__.setdefault("_fn_store", {})
+        if key in store:                         # SA ↔ SST при старте SST — без повторной компиляции
+            self._fn_cache, self._fn_cache_key = store[key], key
+            return self._fn_cache
         self.J["trip"] = self.jnp.asarray(self.trip_mask())
         self.J["prod"] = self.jnp.asarray(1.0 - self.laminar_mask().astype(float))
         jax = self.jax
@@ -1140,6 +1145,7 @@ class RansSolver:
             jac1b=jax.jit(self._jac1_blocks),
         )
         self._fn_cache, self._fn_cache_key = f, key
+        store[key] = f
         return f
 
     def local_dt(self, Q, cfl):
@@ -1258,6 +1264,26 @@ class RansSolver:
                 print(f"  турбулентное решение: Cl {r0.cl:.4f}, {r0.status} — включаю ламинарную область "
                       f"до x/c {lx[0]:.3f} (верх) / {lx[1]:.3f} (низ)", flush=True)
             r = self.solve(alpha, r0.state, max_iter, tol, None, cfl_max, first_order_iters, verbose, callback,
+                           gmres_tol, gmres_iter, conv, control, alpha)
+            r.iterations += r0.iterations
+            return r
+        if self.sst and Q0 is None and self.turbulent and self.sst_sa_start:
+            # k-ω SST с однородного потока: турбулентность развивается из k∞ десятки итераций
+            # (течение почти ламинарное, Cl колеблется) — сначала SA (с теми же настройками),
+            # затем SST от её вихревой вязкости (_turb_from: k = νt·Ω/a1, ω = Ω/a1)
+            self.turb_model = "sa"
+            try:
+                r0 = self.solve(alpha, None, max_iter, tol, cfl0, cfl_max, first_order_iters, verbose, callback,
+                                gmres_tol, gmres_iter, conv, control, alpha0)
+            finally:
+                self.turb_model = "sst"
+                if hasattr(self, "_bilu"):
+                    del self._bilu
+            if verbose:
+                print(f"  решение SA: Cl {r0.cl:.4f}, {r0.status} — продолжаю моделью k-ω SST", flush=True)
+            if control is not None and getattr(control, "stop", False):
+                return r0
+            r = self.solve(alpha, r0.state, max_iter, tol, None, cfl_max, 0, verbose, callback,
                            gmres_tol, gmres_iter, conv, control, alpha)
             r.iterations += r0.iterations
             return r
