@@ -1701,6 +1701,9 @@ class RansSolver:
             reli = np.maximum(-(wn[:, 0] - w[:, 0]) / w[:, 0], -(wn[:, 3] - w[:, 3]) / w[:, 3])
             rel = float(np.max(reli))
             lam = 1.0 if rel < 0.2 else 0.2 / rel
+            if verbose and verbose > 2 and rel >= 0.2:
+                _ib = np.argsort(-reli)[:5]
+                print("     big step cells", np.count_nonzero(reli >= 0.2), [(int(i), round(float(reli[i]), 2), tuple(np.round(self.m.centroid[i], 4))) for i in _ib], flush=True)
             lam_c = None
             if lam < 1.0 and self.step_limit_cells > 0 and np.count_nonzero(reli >= 0.2) <= self.step_limit_cells:
                 # шаг велик лишь в нескольких ячейках (обычно огромные ячейки у внешней границы,
