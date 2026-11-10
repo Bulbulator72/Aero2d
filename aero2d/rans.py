@@ -1194,7 +1194,9 @@ class RansSolver:
         np.add.at(lv, self.cw, self.A_w**2)
         lam += self.dt_visc_c * max(4.0 / 3.0, GAM) * (mu / w[:, 0] / PR + nut / PRT) * lv / self.vol
         dt = cfl * self.vol / lam
-        ct = self.cfl_turb if self.cfl_turb is not None else (0.1 if self.sst else 1.0)
+        # SST: раньше 0,1 (как schedule_cflturb в FUN3D) — на подробной сетке поле k, ω подстраивалось
+        # к новому углу очень медленно: NACA 0012, 0° → 2,5° за 200 итераций не сошлось, с 1 — за 139
+        ct = self.cfl_turb if self.cfl_turb is not None else 1.0
         tb = getattr(self, "_tb", 1.0)
         if self.nv > 4 and tb != 1.0:
             ct = ct * tb

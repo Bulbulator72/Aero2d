@@ -2013,7 +2013,7 @@ class App(tk.Tk):
         ct_.grid(row=4, column=1, columnspan=2, sticky="w", pady=1)
         Tooltip(ct_, "Отдельный (меньший) шаг для уравнений турбулентности — как schedule_cflturb в FUN3D "
                      "(там CFL турбулентности на порядок меньше основного) и CFL_REDUCTION_TURB в SU2. "
-                     "«авто»: 1 для SA, 0.1 для k-ω SST.")
+                     "«авто»: 1 (одинаковый шаг для всех уравнений).")
 
         g3 = ttk.LabelFrame(st, text="Защита от развала", padding=(6, 2))
         g3.grid(row=0, column=2, sticky="nsew", padx=(4, 0))
