@@ -251,6 +251,9 @@ class RansSolver:
         self.sst_omega_inf_rel = 5.0      # ω∞ · c / V∞
         self.sst_sa_start = True          # SST с однородного потока: сначала решение SA
         self.sst_vort = True              # SST-V: порождение по завихренности (иначе — по деформации)
+        # предел CFL для k-ω SST: при CFL > ~10⁴ на подробной сетке (NACA 0012, 124 тыс. ячеек)
+        # GMRES не сходился и шаги отменялись; при 3000 — без отмен, силы за ~100 итераций
+        self.sst_cfl_max = 3000.0
         self.chi_inf_tr = 0.1          # ν̃/ν набегающего потока при расчёте с переходом (NASA TMR)
         # степень турбулентности потока, %: если задана — Ñкрит по формуле Мэка
         # Ñкрит = −8,43 − 2,4·ln(Tu/100) (Tu 0,07 % → 9; 0,5 % → 4,3), иначе — ncrit
@@ -1302,6 +1305,8 @@ class RansSolver:
             return r
         cfl0 = self.cfl_start if cfl0 is None else cfl0
         cfl_max = self.cfl_limit if cfl_max is None else cfl_max
+        if self.sst:
+            cfl_max = min(cfl_max, self.sst_cfl_max)
         cfl_max_full = cfl_max
         if self.transition:          # переход: большой шаг заставляет точку перехода «прыгать»
             cfl_max = min(cfl_max, self.aft_cfl_max)
@@ -1357,6 +1362,13 @@ class RansSolver:
         self._eq_w = self._eq_weights(rfs_eq)
         r_fs = float((self._eq_w * rfs_eq).sum())
         warm = Q0 is not None
+        # старт от соседнего угла: первые итерации невязка мала (у тела поле ещё прежнее), потом
+        # законно растёт в десятки–сотни раз, пока поле перестраивается. Запоминать эти первые
+        # итерации как «лучшее состояние» нельзя: откат возвращал к самому началу (NACA 0012, SST,
+        # 0° → 10°: откат к итерации 1 на 57-й, CFL → 5, и так по кругу, затем дробление угла).
+        # «Лучшее» запоминается только после пика невязки (с наибольшей прошло ≥ 5 итераций)
+        turning = warm and alpha0 is not None and abs(float(alpha) - float(alpha0)) > 1e-12
+        peak = [0.0, 0]                               # наибольшая невязка этого расчёта и её итерация
         if warm and self.vortex_bc:
             # циркуляция для вихревой поправки на внешней границе — сразу по начальному полю
             # (иначе первые итерации идут с Γ = 0, граница «дёргается» и невязка скачет)
@@ -1374,7 +1386,9 @@ class RansSolver:
         lu, lu_it = None, 0
         H = dict(it=[], res=[], rn=[], cl=[], cd=[], cfl=[])
         events = []                                   # (итерация, событие, невязка, худшие ячейки)
-        best = dict(rn=np.inf, Q=None, it=0, cfl=cfl0, order=0)
+        # при смене угла до пика невязки «лучшее» — начальное поле с бесконечной невязкой:
+        # к нему возвращает только NaN, а не рост невязки
+        best = dict(rn=np.inf, Q=Q.copy() if turning else None, it=0, cfl=cfl0, order=0)
         self._tb = 1.0                                # текущий множитель шага турбулентности
         first_until = 0
         n_back = 0
@@ -1492,7 +1506,9 @@ class RansSolver:
             if not np.isfinite(rn):
                 status = "расходится"
                 break
-            if rn < 0.95 * best["rn"]:
+            if rn > peak[0]:
+                peak[:] = [rn, it]
+            if rn < 0.95 * best["rn"] and (not turning or it - peak[1] >= 5):
                 best.update(rn=rn, Q=Q.copy(), it=it, cfl=cfl, order=order)
             if r0 is None or (order == 2 and len(hist) and hist[-1][1] == 1):
                 r0 = rn
@@ -1544,6 +1560,14 @@ class RansSolver:
                 if (crit.stall_ok and len(o2) > 40 and stalled and rn < 10.0 ** (1.0 - crit.orders) * rref
                         and steady(max(hold, 30), crit.cl_tol, crit.cd_tol)):
                     conv, status = True, "сошлось (невязка застряла, силы установились)"
+                    break
+                # невязка упала на 2,5 порядка от наибольшей за расчёт и дальше не падает (остаток —
+                # в нескольких ячейках у кромки), а Cl и Cd 40 итераций стоят в пределах допуска —
+                # точка сошлась (как остановка по мониторам сил во Fluent). NACA 0012, SST, α 0:
+                # Cd 0,00829 с ~100-й итерации, невязка застряла на 10⁻³ от начальной
+                if (crit.stall_ok and len(o2) > 60 and stalled and rn < 10.0 ** -2.5 * own
+                        and steady(max(hold, 40), crit.cl_tol, crit.cd_tol)):
+                    conv, status = True, "сошлось (силы установились)"
                     break
                 # застой невязки при почти установившихся силах — заморозить ограничитель
                 # («дребезг» ограничителя в нескольких ячейках не даёт невязке падать)
