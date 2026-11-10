@@ -304,3 +304,24 @@ def test_laminar_mask_viscous_transition():
     assert c[k & (c[:, 1] < -0.03), 0].max() < 0.62        # низ — до 0,6
     assert lam_xtr_at({0.0: (0.4, 0.6), 4.0: (0.2, 0.8)}, 2.0) == (0.30000000000000004, 0.7)
     assert lam_xtr_at({0.0: (0.4, 0.6)}, 10.0) == (0.4, 0.6)
+
+
+def test_sst_laminar_region_jacobian():
+    """k-ω SST с ламинарным участком (переход по вязкому методу): невязка и якобиан строятся
+    (маска порождения k передаётся в якобиан поячеечно), в ламинарных ячейках порождения k нет."""
+    import numpy as np
+    from aero2d.geometry import naca4, repanel
+    from aero2d.rans import RansSolver
+    from aero2d.rans_mesh import build_mesh
+    m = build_mesh([repanel(naca4("2412", 120), 60)], re=1e6, far_radius=15, far_size=5.0, ratio=1.4,
+                   slot_size=0.02, growth=0.4)
+    s = RansSolver(m, 0.15, 1e6)
+    s.turb_model = "sst"
+    s.lam_xtr = (0.3, 0.6)
+    winf = s.freestream(2.0)
+    Q = np.asarray(s.cons(s.jnp.asarray(np.tile(winf, (s.nc, 1)))))
+    F = s._fns()
+    R = np.asarray(F["res1"](s.jnp.asarray(Q), s.jnp.asarray(winf), s.jnp.asarray(0.0)))
+    assert R.shape == (s.nc, 6) and np.all(np.isfinite(R))
+    A = s.jac1(s.jnp.asarray(Q), s.jnp.asarray(winf), s.jnp.asarray(0.0), np.ones(s.nc))
+    assert A.shape == (6 * s.nc, 6 * s.nc)

@@ -665,7 +665,7 @@ class RansSolver:
             Sg = Sg + (mu + mut / AFT_SIGY) * (g[:, 6, 0] ** 2 + g[:, 6, 1] ** 2)
         return jnp.stack([Sn, Sg], 1)
 
-    def sst_cell(self, w, g, wd):
+    def sst_cell(self, w, g, wd, prod=None):
         """k-ω SST в ячейках: μt, F1 и источники уравнений ρk̂, ρω̃ на единицу объёма (nc,2).
         Уравнение для ω̃ = ln(ω/ω_ref) получено делением уравнения для ω на ω:
           ∂(ρω̃)/∂t + ∇·(ρuω̃) = ∇·(Γω∇ω̃) + Γω|∇ω̃|² + γρP/(μt ω) − βρω + 2(1−F1)ρσω2 ∇k·∇ω̃/ω."""
@@ -706,7 +706,7 @@ class RansSolver:
             Sp2 = S2
         P = jnp.minimum(mut * Sp2, 10 * SST_BS * rho * om * k)
         if self.lam_xtr is not None:            # переход по вязкому методу: до x_tr k не порождается
-            P = P * self.J["prod"]
+            P = P * (self.J["prod"] if prod is None else prod)
         # поддерживающие члены SST-sust (Spalart–Rumsey, NASA TMR «SST-2003-sust»): без них k и ω
         # набегающего потока затухают по пути к телу (на 50 хорд ω падает в сотни раз)
         ki, wti = self.sst_inf()
@@ -1044,9 +1044,9 @@ class RansSolver:
             f1 = f1 * J["prod"]
         nv = Q.shape[1]
         if nv == 6:
-            def src6(q, gi, wd):
-                return self.sst_cell(self.prim(q[None]), gi[None], wd[None])[2][0]
-            js = jax.vmap(jax.jacfwd(src6))(Q, g, J["wd"])                   # (nc,2,6)
+            def src6(q, gi, wd, pr):
+                return self.sst_cell(self.prim(q[None]), gi[None], wd[None], pr[None])[2][0]
+            js = jax.vmap(jax.jacfwd(src6))(Q, g, J["wd"], J["prod"])                   # (nc,2,6)
         elif nv == 5:
             def src(q, gi, wd, f):
                 return self.sa_source(self.prim(q[None]), gi[None], wd[None], f[None])[0]
