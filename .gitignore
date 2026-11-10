@@ -11,3 +11,7 @@ benchmarks/nlf_polar_report.txt
 benchmarks/aft_report.txt
 benchmarks/nlf_polar_state.pkl
 benchmarks/nlf_polar_state.pkl.tmp
+benchmarks/nlf_polar_sst_report.txt
+benchmarks/nlf_polar_sst_state.pkl
+benchmarks/nlf_polar_sst_state.pkl.tmp
+benchmarks/sst_report.txt

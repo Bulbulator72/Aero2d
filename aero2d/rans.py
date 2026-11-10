@@ -705,6 +705,8 @@ class RansSolver:
         else:
             Sp2 = S2
         P = jnp.minimum(mut * Sp2, 10 * SST_BS * rho * om * k)
+        if self.lam_xtr is not None:            # переход по вязкому методу: до x_tr k не порождается
+            P = P * self.J["prod"]
         # поддерживающие члены SST-sust (Spalart–Rumsey, NASA TMR «SST-2003-sust»): без них k и ω
         # набегающего потока затухают по пути к телу (на 50 хорд ω падает в сотни раз)
         ki, wti = self.sst_inf()
@@ -759,9 +761,10 @@ class RansSolver:
         return near & np.where(up, xr >= self.xtr_u, xr >= self.xtr_l)
 
     def laminar_mask(self):
-        """Ламинарная область для SA (lam_xtr = (верх, низ)): ячейки у стенки до точки перехода —
-        там порождение ν̃ выключено (как «laminar regions» в CFL3D и FUN3D): (nc,) bool."""
-        if self.lam_xtr is None or self.nv != 5:
+        """Ламинарная область для SA и k-ω SST (lam_xtr = (верх, низ)): ячейки у стенки до точки
+        перехода — там порождение ν̃ (у SST — порождение k) выключено (как «laminar regions» в CFL3D
+        и FUN3D): (nc,) bool."""
+        if self.lam_xtr is None or self.nv not in (5, 6):
             return np.zeros(self.nc, bool)
         xu, xl = self.lam_xtr
         xr, up, near = self._wall_chord()

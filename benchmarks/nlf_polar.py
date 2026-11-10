@@ -4,8 +4,9 @@
 
 Углы считаются по очереди: 0°, затем вверх до срыва, затем отрицательные; каждый — от решения
 соседнего (как поляра в окне). Состояние сохраняется после каждого угла (nlf_polar_state.pkl):
-повторный запуск продолжит со следующего угла. Аргумент — углы через запятую
-(по умолчанию −4,0,4,8,10,12,13,14,15,16)."""
+повторный запуск продолжит со следующего угла. Аргументы: углы через запятую
+(по умолчанию −4,0,4,8,10,12,13,14,15,16) и модель турбулентности: sa (по умолчанию) или sst —
+у SST отчёт nlf_polar_sst_report.txt."""
 import json
 import os
 import pickle
@@ -16,8 +17,10 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
-REPORT = os.path.join(HERE, "nlf_polar_report.txt")
-STATE = os.path.join(HERE, "nlf_polar_state.pkl")
+TM = (sys.argv[2] if len(sys.argv) > 2 else "sa").lower()
+SUF = "" if TM == "sa" else "_" + TM
+REPORT = os.path.join(HERE, f"nlf_polar{SUF}_report.txt")
+STATE = os.path.join(HERE, f"nlf_polar{SUF}_state.pkl")
 
 
 def log(s):
@@ -32,7 +35,7 @@ def main():
     from aero2d.rans import (Convergence, RansSolver, lam_xtr_at, mesh_for, ncrit_from_tu,
                              viscous_transition_table)
     from aero2d.viscous import ViscousSolver
-    al = [float(a) for a in (sys.argv[1].split(",") if len(sys.argv) > 1 else
+    al = [float(a) for a in (sys.argv[1].split(",") if len(sys.argv) > 1 and sys.argv[1] != "-" else
                              "-4,0,4,8,10,12,13,14,15,16".split(","))]
     re, mach, tu = 4e6, 0.1, 0.15
     nc = ncrit_from_tu(tu)
@@ -48,7 +51,8 @@ def main():
     else:
         log(f"=== Поляра NLF(1)-0416; aero2d {aero2d.__version__}; {time.strftime('%Y-%m-%d %H:%M')}; "
             f"ядер {os.cpu_count()}")
-        log(f"M {mach}, Re {re:.0e}, Tu {tu} % (Ñкрит {nc:.2f}); эксперимент: {exp['source']}")
+        log(f"M {mach}, Re {re:.0e}, Tu {tu} % (Ñкрит {nc:.2f}); модель {'k-ω SST' if TM == 'sst' else 'SA'}"
+            f" + переход по вязкому методу; эксперимент: {exp['source']}")
         t0 = time.time()
         vs = ViscousSolver(af, re, ncrit=nc, mach=mach)
         visc = {}
@@ -67,6 +71,7 @@ def main():
         d = dict(mesh=mesh, table=table, visc=visc, done={}, Q=None, a_prev=None)
         pickle.dump(d, open(STATE, "wb"))
     s = RansSolver(d["mesh"], mach, re, chord=1.0, xref=(0.25, 0.0))
+    s.turb_model = TM
     s.lam_xtr_table = d["table"] or None
     s.tu = tu
     for a in order:
@@ -89,7 +94,7 @@ def main():
                 return cb(it, rn) if res_ is None else False
             rr, _ = rans_polar([af], [a], re, mach=mach, mesh=d["mesh"], max_iter=400, conv=Convergence(),
                                workers=1, coarse_start=True, callback=cb2,
-                               solver_opts={"lam_xtr_table": d["table"] or None, "tu": tu})
+                               solver_opts={"lam_xtr_table": d["table"] or None, "tu": tu, "turb_model": TM})
             r = rr[0]
         else:
             r = s.solve(a, Q0=q0, alpha0=a0, max_iter=400, conv=Convergence(), callback=cb)

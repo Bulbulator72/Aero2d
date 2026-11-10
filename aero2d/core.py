@@ -564,6 +564,9 @@ def run_rans(af, alphas, mach: float, re: float, callback=None, max_iter: int = 
                   f"{(solver_opts or {}).get('ncrit', 9):g}. ")
     else:
         tr_txt = "; пограничный слой турбулентный от носка (переход не моделируется). "
+    if tm == "sst":
+        tr_txt = ("; модель турбулентности k-ω SST (Menter, вариант NASA SST-V с поддерживающими членами)"
+                  + tr_txt)
     notes = [f"RANS: уравнения Навье–Стокса, осреднённые по Рейнольдсу, модель турбулентности "
              f"Спаларта–Аллмараса" + (" с поправкой Спаларта–Шура на вращение и кривизну линий тока (SA-RC)"
                                       if tm == "sa-rc" else "") + tr_txt +

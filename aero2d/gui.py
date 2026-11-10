@@ -253,7 +253,9 @@ class App(tk.Tk):
                      "при каждом угле находит вязкий метод (eᴺ, как XFOIL; Ñкрит или Tu и «переход не дальше "
                      "x/c» — из окна), до них у стенки порождение турбулентной вязкости выключено: быстро и "
                      "устойчиво (NLF(1)-0416: переход 0,42/0,61 при эксперименте 0,43/0,60). SA-AFT — переход "
-                     "решает сам RANS (модель NASA, 2 уравнения): дольше, экспериментально.")
+                     "решает сам RANS (модель NASA, 2 уравнения): дольше, экспериментально. k-ω SST (Menter, "
+                     "вариант NASA SST-V) — раньше и точнее SA предсказывает отрыв у задней кромки и Cl_max; "
+                     "«k-ω SST + переход по вязкому методу» — то же с ламинарным участком до точек перехода.")
         ttk.Label(fr, text="предобусловливатель ILU(k), k").grid(row=2, column=0, sticky="w")
         self.prec_fill = tk.StringVar(value="3")
         ttk.Combobox(fr, textvariable=self.prec_fill, values=["0", "1", "2", "3", "4"], state="readonly",
@@ -2146,7 +2148,8 @@ class App(tk.Tk):
                    "SA-RC (поправка на кривизну)": "sa-rc",
                    "SA + переход по вязкому методу (eᴺ)": "sa-vtr",
                    "SA-AFT (переход, Ñкрит из окна)": "sa-aft",
-                   "k-ω SST (Menter 2003, проверяется)": "sst"}
+                   "k-ω SST (Menter, NASA SST-V)": "sst",
+                   "k-ω SST + переход по вязкому методу (eᴺ)": "sst-vtr"}
 
     # режимы шага: "обычный" — CFL растёт, пока шаги Ньютона удаются (адаптивный, как в SU2);
     # «как Fluent» — CFL растёт до 200 и дальше постоянный (число Куранта coupled-решателя
@@ -2243,9 +2246,9 @@ class App(tk.Tk):
         o["prec_fill"] = int(self.prec_fill.get())
         o["limiter_zone"] = self.LIMITER_ZONES.get(self.lim_zone.get(), "te")
         o["turb_model"] = self.TURB_MODELS[self.turb_model.get()]
-        vtr = o["turb_model"] == "sa-vtr"
+        vtr = o["turb_model"].endswith("-vtr")
         if vtr:
-            o["turb_model"], o["xtr_source"] = "sa", "viscous"
+            o["turb_model"], o["xtr_source"] = o["turb_model"][:-4], "viscous"
         if vtr or o["turb_model"].endswith("aft"):
             try:
                 if self.tu.get().strip():
