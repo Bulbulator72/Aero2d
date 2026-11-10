@@ -8,7 +8,8 @@
    (CFL3D, сетка 897×257: SST Cl 1,0778 / 1,5068, Cd 0,00809 / 0,01236 / 0,02219;
    SA Cl 1,0909 / 1,5461, Cd 0,00819 / 0,01231 / 0,02124).
 3. NACA 4412 (M 0,09, Re 1,52·10⁶, α = 13,87°, отрыв у задней кромки): SA и SST
-   (CFL3D 897×257: SA Cl 1,721, Cd 0,0286, отрыв x/c 0,787; SST Cl 1,616, Cd 0,0311, отрыв 0,772).
+   (CFL3D 897×257: SA Cl 1,721, Cd 0,0286 (Cdp 0,02156, Cdf 0,00704), отрыв x/c 0,787;
+   SST Cl 1,616, Cd 0,0311 (Cdp 0,0242, Cdf 0,00687), отрыв 0,772).
 Аргумент — номера случаев через запятую (по умолчанию 1,2,3)."""
 import os
 import sys
@@ -84,12 +85,12 @@ def sep_x(r, chord=1.0):
     return xs[0] if xs else float("nan")
 
 
-def airfoil(name, af, re, mach, alphas, refs, sep=False):
+def airfoil(name, af, re, mach, alphas, refs, sep=False, split=None):
     from aero2d.rans import Convergence, mesh_for, rans_polar
     mesh = mesh_for([af], max(alphas), re)
     log(f"\n[{name}] M {mach}, Re {re:.3g}, сетка {mesh.n_cells} ячеек")
     log("   модель   α   |  Cl     эталон |  Cd       эталон" + (" | отрыв x/c эталон" if sep else "")
-        + " | итер., мин, статус")
+        + (" | Cdp     эталон  | Cdf     эталон" if split else "") + " | итер., мин, статус")
     for tm in ("sst", "sa"):
         t = time.time()
         rr, _ = rans_polar([af], alphas, re, mach=mach, mesh=mesh, max_iter=500, conv=Convergence(), workers=1,
@@ -100,6 +101,9 @@ def airfoil(name, af, re, mach, alphas, refs, sep=False):
             line = f"   {tm:6s} {a:5.2f} | {r.cl:6.4f} {rc:6.4f} | {r.cd:.5f}  {rd:.5f}"
             if sep:
                 line += f" | {sep_x(r):.3f}     {rs:.3f}"
+            if split:
+                sp, sf = split[tm]
+                line += f" | {r.cdp:.5f} {sp:.5f} | {r.cdf:.5f} {sf:.5f}"
             log(line + f" | {r.iterations}, {dt:.0f} (все углы), {r.status}")
 
 
@@ -121,7 +125,8 @@ def main():
             elif c == 3:
                 af = repanel(naca4("4412", 200), 130)
                 airfoil("3] NACA 4412 (TMR, отрыв у кромки", af, 1.52e6, 0.09, [13.87],
-                        {"sst": {13.87: (1.616, 0.0311, 0.772)}, "sa": {13.87: (1.721, 0.0286, 0.787)}}, sep=True)
+                        {"sst": {13.87: (1.616, 0.0311, 0.772)}, "sa": {13.87: (1.721, 0.0286, 0.787)}}, sep=True,
+                        split={"sst": (0.0242, 0.00687), "sa": (0.02156, 0.00704)})
         except Exception:                                  # noqa: BLE001
             log(f"случай {c}: ошибка\n" + traceback.format_exc())
     log("Готово.")
