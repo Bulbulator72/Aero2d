@@ -254,6 +254,7 @@ class RansSolver:
         # предел CFL для k-ω SST: при CFL > ~10⁴ на подробной сетке (NACA 0012, 124 тыс. ячеек)
         # GMRES не сходился и шаги отменялись; при 3000 — без отмен, силы за ~100 итераций
         self.sst_cfl_max = 3000.0
+        self.sst_max_dalpha = 2.5         # больший шаг по углу — через промежуточные углы
         self.chi_inf_tr = 0.1          # ν̃/ν набегающего потока при расчёте с переходом (NASA TMR)
         # степень турбулентности потока, %: если задана — Ñкрит по формуле Мэка
         # Ñкрит = −8,43 − 2,4·ln(Tu/100) (Tu 0,07 % → 9; 0,5 % → 4,3), иначе — ncrit
@@ -2278,7 +2279,23 @@ def _seq_order(alphas):
 
 def _solve_angle(solver, a, Q, a_src, max_iter, verbose, cb, conv, control, depth=0):
     """Один угол; если он развалился при старте от соседнего угла a_src, —
-    промежуточный угол (a + a_src)/2 и затем снова a (до двух делений)."""
+    промежуточный угол (a + a_src)/2 и затем снова a (до двух делений).
+    k-ω SST: шаг по углу больше sst_max_dalpha сразу проходится промежуточными углами с
+    ослабленным критерием (NACA 0012, 124 тыс. ячеек: 0° → 10° одним шагом — шаг Ньютона
+    урезался до 2–28 %, сотни итераций и откаты)."""
+    maxd = float(getattr(solver, "sst_max_dalpha", 0.0) or 0.0)
+    if (depth == 0 and getattr(solver, "sst", False) and maxd > 0 and Q is not None and a_src is not None
+            and abs(a - a_src) > maxd * 1.001):
+        n = int(np.ceil(abs(a - a_src) / maxd))
+        for j in range(1, n):
+            if control is not None and control.stop:
+                break
+            m = round(a_src + (a - a_src) * j / n, 3)
+            rm = solver.solve(m, Q0=Q, max_iter=max_iter, verbose=verbose, callback=cb, control=control,
+                              conv=Convergence(3.0, 10, 2e-3, 2e-4), alpha0=a_src)
+            if rm.status.startswith(("расходится", "неустойчиво")):
+                break
+            Q, a_src = rm.state, m
     r = solver.solve(float(a), Q0=Q, max_iter=max_iter, verbose=verbose, callback=cb, conv=conv, control=control,
                      alpha0=a_src)
     bad = r.status.startswith(("расходится", "неустойчиво"))
