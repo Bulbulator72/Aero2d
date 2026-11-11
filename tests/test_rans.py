@@ -325,3 +325,54 @@ def test_sst_laminar_region_jacobian():
     assert R.shape == (s.nc, 6) and np.all(np.isfinite(R))
     A = s.jac1(s.jnp.asarray(Q), s.jnp.asarray(winf), s.jnp.asarray(0.0), np.ones(s.nc))
     assert A.shape == (6 * s.nc, 6 * s.nc)
+
+
+def test_seq_from_seeds():
+    """Добавление углов к поляре: порядок — от ближайшего посчитанного угла, каждый следующий от соседа."""
+    import numpy as np
+    from aero2d.rans import _seq_from
+    al = np.array([13.0, 12.0, 14.0, 15.0, 11.0])
+    assert [al[i] for i in _seq_from(al, [0.0, 2.0, 10.0])] == [11.0, 12.0, 13.0, 14.0, 15.0]
+
+
+def test_merge_and_drop_polars():
+    import numpy as np
+    from aero2d.core import Polar, drop_unconverged, merge_polars
+    def mk(a, ok):
+        a = np.array(a, float)
+        return Polar("P", "rans", 0.15, a, 0.1 * a, 0.01 + 0 * a, 0 * a, np.array(ok, bool),
+                     cp_x=[np.r_[x] for x in a], cp=[np.r_[x] for x in a],
+                     field_ctx=dict(method="rans", alpha=a, states=[f"S{x:g}" for x in a], history=[None] * len(a)))
+    m = merge_polars(mk([0, 2, 4, 6], [1, 1, 0, 1]), mk([5, 6, 7], [1, 1, 1]))
+    assert list(m.alpha) == [0, 2, 4, 5, 6, 7]
+    assert m.field_ctx["states"] == ["S0", "S2", "S4", "S5", "S6", "S7"]
+    assert [c[0] for c in m.cp] == [0, 2, 4, 5, 6, 7]
+    d = drop_unconverged(m)
+    assert list(d.alpha) == [0, 2, 5, 6, 7] and d.field_ctx["states"] == ["S0", "S2", "S5", "S6", "S7"]
+
+
+def test_rans_polar_seeds_extend():
+    """Добавить углы к поляре: без грубой сетки, первый новый угол стартует от решения прежней поляры."""
+    import numpy as np
+    from aero2d.geometry import naca4, repanel
+    from aero2d import rans as R
+    from aero2d.rans_mesh import build_mesh
+    m = build_mesh([repanel(naca4("2412", 120), 60)], re=1e6, far_radius=15, far_size=5.0, ratio=1.4,
+                   slot_size=0.02, growth=0.4)
+    r0, _ = R.rans_polar([repanel(naca4("2412", 120), 60)], [0.0], 1e6, mesh=m, max_iter=15, coarse_start=False)
+    calls = []
+    orig = R.RansSolver.solve
+
+    def spy(self, alpha, Q0=None, *a, **k):
+        calls.append((float(alpha), Q0 is not None, k.get("alpha0")))
+        return orig(self, alpha, Q0, *a, **k)
+    R.RansSolver.solve = spy
+    try:
+        r1, _ = R.rans_polar([repanel(naca4("2412", 120), 60)], [2.0, 1.0], 1e6, mesh=m, max_iter=5,
+                             seeds=[(0.0, r0[0].state)])
+    finally:
+        R.RansSolver.solve = orig
+    assert calls[0] == (1.0, True, 0.0)            # сначала ближайший к посчитанному 0°, от его решения
+    # 2° — от ближайшего сошедшегося: 1° (если сошёлся за 5 итераций) или прежний 0°
+    assert calls[1][0] == 2.0 and calls[1][1] and calls[1][2] in (0.0, 1.0)
+    assert all(r is not None for r in r1)

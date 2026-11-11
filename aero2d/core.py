@@ -476,7 +476,7 @@ def run_multi_viscous_batch(elements, alphas, mach: float, re_list, ncrit: float
 def run_rans(af, alphas, mach: float, re: float, callback=None, max_iter: int = 250,
              name: str | None = None, chord=None, mesh=None, mesh_opts=None, conv=None,
              control=None, workers: int = 1, init=None, rref=None, solver_opts=None,
-             coarse_start="auto") -> Polar:
+             coarse_start="auto", seeds=None) -> Polar:
     """RANS (Навье–Стокс + Спаларт–Аллмарас, полностью турбулентный) для профиля
     или механизации (список элементов). Медленно, но описывает отрыв и слияние
     следов в щелях — для Cl_max механизации. callback(text, fraction) -> True для остановки.
@@ -523,7 +523,8 @@ def run_rans(af, alphas, mach: float, re: float, callback=None, max_iter: int = 
         return callback(txt, min(1.0, (k + (it / max_iter if r is None else 0)) / n))
     res, mesh = rans_polar(elements, alphas, re, mach=mach, chord=chord, callback=cb, max_iter=max_iter,
                            mesh=mesh, conv=conv, control=control, workers=workers, init=init, rref=rref,
-                           solver_opts=solver_opts, mesh_opts=mesh_opts, coarse_start=coarse_start)
+                           solver_opts=solver_opts, mesh_opts=mesh_opts, coarse_start=coarse_start,
+                           seeds=seeds)
     done = np.array([r is not None for r in res])
     nan = float("nan")
     cl = np.array([r.cl if r else nan for r in res])
@@ -605,6 +606,7 @@ def run_rans(af, alphas, mach: float, re: float, callback=None, max_iter: int = 
                  xtr_u=xtr_u if np.isfinite(xtr_u).any() else None,
                  xtr_l=xtr_l if np.isfinite(xtr_l).any() else None,
                  field_ctx=dict(method="rans", mesh=mesh, elements=elements, mach=mach, re=re, chord=chord,
+                                turb_model=tm, transition=bool((solver_opts or {}).get("lam_xtr_table")),
                                 alpha=alphas, states=[r.state if r else None for r in res],
                                 history=[r.history if r else None for r in res]))
 
@@ -772,3 +774,104 @@ def save_csv(polars, path):
                             f6(p.cm[k]), f6(None if p.xtr_u is None else p.xtr_u[k]),
                             f6(None if p.xtr_l is None else p.xtr_l[k]),
                             "да" if p.ok[k] else "нет"])
+
+
+# ----------------------------------------------------------------------------
+# операции над полярой: выборка углов, объединение (добавленные углы RANS)
+# ----------------------------------------------------------------------------
+_ANGLE_ARRAYS = ("alpha", "cl", "cd", "cm", "ok", "cdf", "xtr_u", "xtr_l", "ch")
+_ANGLE_LISTS = ("cp_x", "cp", "bl", "cp_inv", "elem")
+_CTX_LISTS = ("states", "history")
+
+
+def _ctx_clean(ctx):
+    ctx = dict(ctx)
+    for k in ("_tri", "_interp", "_walls"):           # кэши поля течения — по прежним углам
+        ctx.pop(k, None)
+    return ctx
+
+
+def take_angles(p: Polar, idx) -> Polar:
+    """Копия поляры только с углами номер idx (в этом порядке)."""
+    import copy
+    idx = [int(k) for k in idx]
+    n = len(p.alpha)
+    q = copy.copy(p)
+    for name in _ANGLE_ARRAYS:
+        v = getattr(p, name)
+        if v is not None:
+            setattr(q, name, np.asarray(v)[idx])
+    for name in _ANGLE_LISTS:
+        v = getattr(p, name)
+        if v is not None and len(v) == n:
+            setattr(q, name, [v[k] for k in idx])
+    if p.field_ctx is not None:
+        ctx = _ctx_clean(p.field_ctx)
+        if "alpha" in ctx and len(ctx["alpha"]) == n:
+            ctx["alpha"] = np.asarray(ctx["alpha"])[idx]
+        for name in _CTX_LISTS:
+            if name in ctx and ctx[name] is not None and len(ctx[name]) == n:
+                ctx[name] = [ctx[name][k] for k in idx]
+        q.field_ctx = ctx
+    q.notes = list(p.notes)
+    return q
+
+
+def drop_unconverged(p: Polar) -> Polar:
+    """Поляра без несошедшихся точек (в таблице — красные)."""
+    keep = [k for k in range(len(p.alpha)) if p.ok[k]]
+    if len(keep) == len(p.alpha):
+        raise ValueError(f"В поляре «{p.label}» все точки сошлись — удалять нечего")
+    if not keep:
+        raise ValueError(f"В поляре «{p.label}» нет ни одной сошедшейся точки")
+    bad = [f"{a:g}" for a, ok in zip(p.alpha, p.ok) if not ok]
+    q = take_angles(p, keep)
+    q.notes = list(p.notes) + [f"Удалены несошедшиеся точки: α = {', '.join(bad)}°."]
+    return q
+
+
+def merge_polars(old: Polar, new: Polar) -> Polar:
+    """Объединение двух поляр одного расчёта (новые углы RANS на той же сетке): углы обеих,
+    по возрастанию α; при совпадении угла берётся новый результат. Подпись — как у old."""
+    import copy
+    a_old, a_new = np.asarray(old.alpha, float), np.asarray(new.alpha, float)
+    keep_old = [k for k in range(len(a_old)) if not np.any(np.abs(a_new - a_old[k]) < 1e-9)]
+    o, w = take_angles(old, keep_old), new
+    no, nw = len(o.alpha), len(w.alpha)
+    q = copy.copy(old)
+    for name in _ANGLE_ARRAYS:
+        u, v = getattr(o, name), getattr(w, name)
+        if u is None and v is None:
+            continue
+        fill = False if name == "ok" else float("nan")
+        u = np.asarray(u) if u is not None else np.full(no, fill)
+        v = np.asarray(v) if v is not None else np.full(nw, fill)
+        setattr(q, name, np.concatenate([u, v]))
+    for name in _ANGLE_LISTS:
+        u, v = getattr(o, name), getattr(w, name)
+        if (u is None or len(u) != no) and (v is None or len(v) != nw):
+            continue
+        u = list(u) if u is not None and len(u) == no else [None] * no
+        v = list(v) if v is not None and len(v) == nw else [None] * nw
+        setattr(q, name, u + v)
+    if o.field_ctx is not None and w.field_ctx is not None:
+        ctx = _ctx_clean(o.field_ctx)
+        ctx["alpha"] = np.concatenate([np.asarray(o.field_ctx["alpha"], float), np.asarray(w.field_ctx["alpha"], float)])
+        for name in _CTX_LISTS:
+            ctx[name] = list(o.field_ctx.get(name) or [None] * no) + list(w.field_ctx.get(name) or [None] * nw)
+        q.field_ctx = ctx
+    q.notes = list(old.notes) + [f"Добавлены углы: α = {', '.join(f'{a:g}' for a in a_new)}° — на той же сетке, "
+                                 "каждый от ближайшего посчитанного решения."] + \
+        [t for t in new.notes if t.startswith("Итог") or t.startswith("Не сошлись")]
+    order = np.argsort(np.asarray(q.alpha, float), kind="stable")
+    q2 = take_angles(q, order)
+    q2.notes = q.notes
+    return q2
+
+
+def rans_seeds(p: Polar):
+    """Решения сошедшихся углов поляры RANS: [(угол, состояние)] — для добавления углов."""
+    ctx = p.field_ctx or {}
+    if ctx.get("method") != "rans":
+        return []
+    return [(float(a), Q) for a, Q, ok in zip(ctx["alpha"], ctx["states"], p.ok) if Q is not None and ok]

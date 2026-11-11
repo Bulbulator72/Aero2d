@@ -378,6 +378,10 @@ class App(tk.Tk):
         ttk.Label(tb_, text="  Cl = L′/(q∞·c), Cd = D′/(q∞·c), Cm = M′/(q∞·c²) — на единицу размаха "
                   "(S = c·1), c — опорная хорда (см. «Примечания»).", foreground="#555").pack(side="left")
         ttk.Button(tb_, text="Размерные силы…", command=self.forces_dialog).pack(side="right", padx=4, pady=2)
+        b_ = ttk.Button(tb_, text="Удалить несошедшиеся", command=self.drop_bad_points)
+        b_.pack(side="right", padx=4, pady=2)
+        Tooltip(b_, "Убрать из выбранного расчёта точки, которые не сошлись (красные строки): "
+                    "выберите в таблице строку расчёта или любую его точку")
         b_ = ttk.Button(tb_, text="Сохранить в CSV (Excel)…", command=self.save_csv)
         b_.pack(side="right", padx=4, pady=2)
         Tooltip(b_, "Все расчёты из таблицы: α, Cl, Cd, Cm, переход и т. д.; открывается в Excel. "
@@ -893,6 +897,7 @@ class App(tk.Tk):
             return
         self.airfoil = af
         method, grid = self.method.get(), self.grid_name.get()
+        ext = None                                       # поляра RANS, к которой добавляются углы
         if method == "rans":
             try:
                 rit = int(self.rans_iter.get())
@@ -903,6 +908,37 @@ class App(tk.Tk):
                 self._input_error(e if str(e) else ValueError("Итераций на угол — целое число"))
                 return
             mesh0 = self._mesh[1] if self._mesh and self._mesh[0] == sig else None
+            # уже есть поляра RANS этого профиля на той же сетке, той же моделью — новые углы можно
+            # добавить к ней: каждый стартует от ближайшего посчитанного решения, без грубой сетки
+            ext = None
+            if len(re_) == 1:
+                tm_, trn_ = sopts.get("turb_model", "sa"), sopts.get("xtr_source") == "viscous"
+                for q_ in reversed(self.polars):
+                    c_ = q_.field_ctx or {}
+                    if (q_.method == "rans" and c_.get("sig") == sig and c_.get("turb_model", "sa") == tm_
+                            and bool(c_.get("transition")) == trn_ and abs(q_.mach - max(mach, 0.1)) < 1e-9
+                            and core.rans_seeds(q_)):
+                        ext = q_
+                        break
+            if ext is not None:
+                done_ = [a for a, ok in zip(ext.alpha, ext.ok) if ok]
+                new_ = [float(a) for a in alphas if not any(abs(a - d) < 1e-9 for d in done_)]
+                ans = messagebox.askyesnocancel(
+                    "Продолжить поляру",
+                    f"На этой же сетке и этой же моделью уже посчитана поляра «{ext.label}»: сошлись "
+                    f"α = {', '.join(f'{a:g}' for a in done_)}°.\n\n"
+                    f"Да — добавить к ней углы {', '.join(f'{a:g}' for a in new_) or '(новых нет)'}°: каждый "
+                    "стартует от ближайшего уже посчитанного решения, без грубой сетки; посчитанные углы "
+                    "не пересчитываются.\nНет — отдельный расчёт с нуля.")
+                if ans is None:
+                    return
+                if ans:
+                    if not new_:
+                        messagebox.showinfo("Продолжить поляру", "Все заданные углы в этой поляре уже сошлись.")
+                        return
+                    alphas = np.array(new_)
+                else:
+                    ext = None
             from .rans import RansControl
             self._live = self._new_res()
             self.res_src.set("текущий расчёт")
@@ -956,11 +992,21 @@ class App(tk.Tk):
                             break
                         ctl = self._rans_ctl
                         ctl.stop = False
+                        if ext is not None:              # добавить углы к прежней поляре
+                            p_ = core.run_rans(af, alphas, mach, r_, cb, rit, nm, chord=ch_rans,
+                                               mesh=ext.field_ctx["mesh"], mesh_opts=mopts, conv=conv,
+                                               control=ctl, workers=nw, solver_opts=sopts, coarse_start=False,
+                                               seeds=core.rans_seeds(ext))
+                            p_.field_ctx["sig"] = sig
+                            self.q.put(("replace", ext, core.merge_polars(ext, p_)))
+                            break
                         p_ = core.run_rans(af, alphas, mach, r_, cb, rit, nm,
                                            chord=ch_rans,
                                            mesh=(mesh0 if r_ == re0 else None), mesh_opts=mopts, conv=conv,
                                            control=ctl, workers=nw, solver_opts=sopts,
                                            coarse_start=coarse)
+                        if p_.field_ctx is not None:
+                            p_.field_ctx["sig"] = sig
                         ps.append(p_)
                         if p_.field_ctx and r_ == re0 and mesh0 is None:
                             self.q.put(("mesh", sig, p_.field_ctx["mesh"], r_, p_.field_ctx["chord"]))
@@ -1001,6 +1047,9 @@ class App(tk.Tk):
                 elif msg[0] == "done":
                     self._finish()
                     self.add_polar(msg[1])
+                elif msg[0] == "replace":                  # поляра дополнена новыми углами
+                    self._finish()
+                    self.replace_polar(msg[1], msg[2])
                 elif msg[0] == "field":
                     self._draw_field(*msg[1:])
                 elif msg[0] == "field_error":
@@ -1048,6 +1097,7 @@ class App(tk.Tk):
         fmt = lambda arr, k, f: "—" if arr is None or not np.isfinite(arr[k]) else format(arr[k], f)
         grp = self.table.insert("", "end", text=p.label, open=True, tags=("group",),
                                 values=("", "", "", "", "", "", "", "", f"{n_ok} из {len(p.alpha)}"))
+        self.__dict__.setdefault("_grp_polar", {})[grp] = p
         for k in range(len(p.alpha)):
             self.table.insert(grp, "end", text="", tags=() if p.ok[k] else ("bad",), values=(
                 f"{p.alpha[k]:g}", f"{p.cl[k]:.4f}", fmt(p.cd, k, ".5f"), fmt(p.cdf, k, ".5f"),
@@ -2587,7 +2637,57 @@ class App(tk.Tk):
                                [f"{A['rn'][j]:.6e}", f"{A['cl'][j]:.6f}", f"{A['cd'][j]:.6f}"])
         self.status.set(f"Ход невязок сохранён: {path}")
 
+    def replace_polar(self, old, new):
+        """Заменить поляру old на new (дополненную углами или без несошедшихся точек)."""
+        m = self.__dict__.setdefault("_grp_polar", {})
+        for g, q in list(m.items()):
+            if q is old:
+                if self.table.exists(g):
+                    self.table.delete(g)
+                m.pop(g)
+        for i, q in enumerate(self.polars):
+            if q is old:
+                del self.polars[i]
+                break
+        self._field_cache.clear()
+        self.add_polar(new)
+
+    def _table_polar(self):
+        """Поляра, выбранная в таблице (строка-заголовок или любая её точка), иначе None."""
+        sel = self.table.selection()
+        if not sel:
+            return None
+        g = self.table.parent(sel[0]) or sel[0]
+        return self.__dict__.get("_grp_polar", {}).get(g)
+
+    def drop_bad_points(self):
+        """Удалить из поляры несошедшиеся точки (в таблице — красные)."""
+        p = self._table_polar()
+        if p is None:
+            cand = [q for q in self.polars if not np.all(q.ok)]
+            if not cand:
+                messagebox.showinfo("Несошедшиеся точки", "Несошедшихся точек нет.")
+                return
+            if len(cand) > 1:
+                messagebox.showinfo("Несошедшиеся точки", "Выберите в таблице расчёт — строку с его названием "
+                                    "или любую его точку.")
+                return
+            p = cand[0]
+        bad = [f"{a:g}" for a, ok in zip(p.alpha, p.ok) if not ok]
+        if not bad:
+            messagebox.showinfo("Несошедшиеся точки", f"В расчёте «{p.label}» все точки сошлись.")
+            return
+        if not messagebox.askyesno("Удалить несошедшиеся точки",
+                                   f"Расчёт «{p.label}»: удалить α = {', '.join(bad)}°?\n\n"
+                                   "Они исчезнут из таблицы и графиков (их можно посчитать снова)."):
+            return
+        try:
+            self.replace_polar(p, core.drop_unconverged(p))
+        except ValueError as e:
+            messagebox.showinfo("Несошедшиеся точки", str(e))
+
     def clear(self):
+        self.__dict__["_grp_polar"] = {}
         self.polars.clear()
         self.table.delete(*self.table.get_children())
         self.notes.delete("1.0", "end")

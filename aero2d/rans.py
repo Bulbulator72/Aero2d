@@ -2281,6 +2281,20 @@ def _seq_order(alphas):
     return list(order[i0:]) + list(order[:i0][::-1])
 
 
+def _seq_from(alphas, seed_alphas):
+    """Порядок счёта от уже посчитанных углов (seed_alphas): каждый раз — угол, ближайший к
+    посчитанным или к уже пройденным в этом расчёте (каждый следующий стартует от соседа)."""
+    left = list(range(len(alphas)))
+    known = [float(a) for a in seed_alphas]
+    out = []
+    while left:
+        i = min(left, key=lambda k: min(abs(alphas[k] - a) for a in known) if known else abs(alphas[k]))
+        out.append(i)
+        left.remove(i)
+        known.append(float(alphas[i]))
+    return out
+
+
 def _stage(control, alpha, text):
     """Сообщение окну о смене этапа расчёта угла (счётчик итераций начинается заново)."""
     if control is not None and getattr(control, "monitor", None) is not None:
@@ -2330,18 +2344,19 @@ def _keep_state(r):
 
 
 def _solve_sequence(solver, alphas, idx, states, out, max_iter, verbose, conv, control, on_iter, on_done,
-                    init=None, Q0=None, a0=None):
-    """Углы idx по порядку, каждый — от ближайшего посчитанного (states), от
-    своего прежнего решения (init: номер угла → состояние, «досчитать») или,
-    если посчитанных ещё нет, — от Q0 (решение при угле a0)."""
+                    init=None, Q0=None, a0=None, seeds=None):
+    """Углы idx по порядку, каждый — от ближайшего посчитанного (states или seeds — решения
+    прежней поляры на этой сетке: [(угол, состояние)]), от своего прежнего решения (init: номер
+    угла → состояние, «досчитать») или, если посчитанных ещё нет, — от Q0 (решение при угле a0)."""
     init = init or {}
+    seeds = list(seeds or [])
     for i in idx:
         Q, a_src = Q0, a0
+        cand = [(float(alphas[jj]), states[jj]) for jj in states] + seeds
         if i in init:
             Q, a_src = init[i], None
-        elif states:
-            j = min(states, key=lambda jj: abs(alphas[jj] - alphas[i]))
-            Q, a_src = states[j], float(alphas[j])
+        elif cand:
+            a_src, Q = min(cand, key=lambda c: abs(c[0] - alphas[i]))
         r = _solve_angle(solver, float(alphas[i]), Q, a_src, max_iter, verbose,
                          (lambda it, rn: on_iter(i, it, rn)), conv, control)
         out[i] = r
@@ -2521,7 +2536,7 @@ def _split_chunks(alphas, seq, i0, w):
 
 def rans_polar(elements, alphas, re, mach=0.15, chord=1.0, xref=None, mesh=None, callback=None,
                max_iter=250, verbose=False, conv=None, control=None, workers=1, init=None, rref=None,
-               solver_opts=None, mesh_opts=None, coarse_start="auto"):
+               solver_opts=None, mesh_opts=None, coarse_start="auto", seeds=None):
     """Поляра RANS для одно- или многоэлементного профиля: сетка строится один
     раз (сгущение по линиям следа невязкого решения при среднем угле), углы
     атаки считаются от ближайшего к нулю в обе стороны, каждый — от решения
@@ -2536,8 +2551,11 @@ def rans_polar(elements, alphas, re, mach=0.15, chord=1.0, xref=None, mesh=None,
     conv — критерий сходимости (Convergence), control — RansControl (монитор
     итераций, «следующий угол», остановка, CFL ×0,5, откат).
     init — {номер угла: прежнее состояние}: эти углы продолжаются со своего решения
-    («досчитать»); rref — опорная невязка прежнего расчёта (для критерия сходимости)."""
+    («досчитать»); rref — опорная невязка прежнего расчёта (для критерия сходимости).
+    seeds — [(угол, состояние)] решения прежней поляры на этой же сетке (mesh): новые углы
+    считаются по очереди от ближайшего из них, без грубой сетки («добавить углы к поляре»)."""
     alphas = np.asarray(alphas, float)
+    seeds = [(float(a), np.asarray(Q)) for a, Q in (seeds or []) if Q is not None]
     init = dict(init or {})
     solver_opts = viscous_transition_opts(elements, alphas, re, mach, solver_opts)
     if mesh is None:
@@ -2550,7 +2568,7 @@ def rans_polar(elements, alphas, re, mach=0.15, chord=1.0, xref=None, mesh=None,
         setattr(solver, k_, v_)
     if rref:
         solver._rref = float(rref)
-    seq = _seq_order(alphas)
+    seq = _seq_from(alphas, [a for a, _ in seeds]) if seeds else _seq_order(alphas)
     n = len(alphas)
     out = [None] * n
     states = {}
@@ -2565,7 +2583,8 @@ def rans_polar(elements, alphas, re, mach=0.15, chord=1.0, xref=None, mesh=None,
     i0 = seq[0]
     Q0, a0 = None, None
     # --- быстрый старт: первый угол на грубой сетке
-    use_coarse = (coarse_start is True or (coarse_start == "auto" and mesh.n_cells > 20000)) and not init
+    use_coarse = ((coarse_start is True or (coarse_start == "auto" and mesh.n_cells > 20000))
+                  and not init and not seeds)
     if use_coarse:
         if callback:
             callback(0, n, 0, 0.0, None)
@@ -2583,9 +2602,11 @@ def rans_polar(elements, alphas, re, mach=0.15, chord=1.0, xref=None, mesh=None,
         Q0, a0 = transfer_state(cm, rc.state, mesh), float(alphas[i0])
         _stage(control, alphas[i0], f"этап: рабочая сетка ({mesh.n_cells} ячеек)")
     workers = int(max(1, min(workers, n)))
-    if workers <= 1 or n == 1:
+    if workers <= 1 or n == 1 or seeds:
+        # от решений прежней поляры — по очереди (каждый угол от соседа); параллельные куски
+        # стартовали бы от одного решения
         _solve_sequence(solver, alphas, seq, states, out, max_iter, verbose, conv, control, on_iter, on_done,
-                        init, Q0, a0)
+                        init, Q0, a0, seeds=seeds)
         return out, mesh
     if Q0 is None and len(init) < n:
         # первый угол здесь (с нуля), остальные — параллельно от его решения
