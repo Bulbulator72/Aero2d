@@ -1382,6 +1382,7 @@ class RansSolver:
             self.gamma_vortex = 0.5 * self.forces(Q, alpha)["cl"] * self.mach * self.chord
         prev = None                                   # (Q, невязка, порядок) до последнего шага
         n_rej = 0
+        ok_streak = 0                                 # итераций подряд без отмены шага
         hist = []
         r0 = None
         cfl = cfl0
@@ -1502,6 +1503,11 @@ class RansSolver:
                 n_rej += 1
                 ilu_state = None
                 Q = prev[0].copy()
+                if self.sst:
+                    # SST: потолок CFL этого угла — половина CFL неудачного шага (иначе «пила»: рост до
+                    # потолка, отмена, ×0,3, снова рост — механизация при Re 6·10⁶, сотни отмен за угол)
+                    cfl_max = max(4.0 * cfl0, 0.5 * cfl)
+                    ok_streak = 0
                 cfl = max(cfl0, cfl * 0.3)
                 events.append((it, f"шаг отменён (невязка ×{rn / prev[1]:.3g}), CFL → {cfl:.3g}", rn, []))
                 if verbose:
@@ -1510,6 +1516,10 @@ class RansSolver:
                     control.monitor(dict(alpha=alpha, it=it, event=f"шаг отменён, CFL → {cfl:.3g}"))
                 continue
             n_rej = 0
+            ok_streak += 1
+            if self.sst and ok_streak >= 25 and cfl >= 0.9 * cfl_max and cfl_max < cfl_max_full:
+                cfl_max = min(cfl_max_full, 1.5 * cfl_max)  # долго без отмен у потолка — осторожно выше
+                ok_streak = 0
             if not np.isfinite(rn):
                 status = "расходится"
                 break

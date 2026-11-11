@@ -263,8 +263,16 @@ class App(tk.Tk):
         self.coarse_start = tk.BooleanVar(value=True)
         ttk.Checkbutton(fr, text="старт на грубой сетке (если > 20 тыс. ячеек)",
                         variable=self.coarse_start).grid(row=3, column=0, columnspan=2, sticky="w")
+        self.rans_parallel = tk.BooleanVar(value=False)
+        cbp = ttk.Checkbutton(fr, text="углы параллельно (несколько процессов)", variable=self.rans_parallel)
+        cbp.grid(row=4, column=0, columnspan=2, sticky="w")
+        Tooltip(cbp, "Выключено (рекомендуется): углы по очереди — первый (ближайший к 0°) с грубой сетки, "
+                     "каждый следующий — от решения соседнего угла; все ядра работают на один угол. "
+                     "Включено: углы делятся на куски по числу «Ядер ЦП», каждый кусок — свой процесс со своим "
+                     "стартом на грубой сетке; ядер на процесс меньше, и трудные углы считаются одновременно с "
+                     "лёгкими — для RANS обычно дольше.")
         ttk.Label(fr, text="сетка — вкладка «Сетка»; сходимость и шаг — «Невязки»", foreground="#555").grid(
-            row=4, column=0, columnspan=2, sticky="w")
+            row=5, column=0, columnspan=2, sticky="w")
         self._method_frames = {"euler": fe, "rans": fr}
 
         # --- кнопки
@@ -977,6 +985,7 @@ class App(tk.Tk):
             self._input_error(self.InputError(self.cref, "Опорная хорда c", str(e)))
             return
         coarse = "auto" if method == "rans" and self.coarse_start.get() else False
+        rans_par = bool(self.rans_parallel.get())
 
         def job():
             try:
@@ -984,6 +993,8 @@ class App(tk.Tk):
                     self.q.put(("progress", text, frac))
                     return self.stop_flag.is_set()
                 nw = self._workers
+                if method == "rans" and not rans_par:
+                    nw = 1                       # RANS: углы по очереди, все ядра — на один угол
                 if method in ("multi", "multi_viscous"):
                     nm, ch = nm_multi, ch_multi
                     if method == "multi":
@@ -2624,7 +2635,7 @@ class App(tk.Tk):
             conv = self.conv_settings()
             sopts = self.solver_settings()
             from .parallel import resolve_workers
-            nw = resolve_workers(self.cores.get())
+            nw = resolve_workers(self.cores.get()) if self.rans_parallel.get() else 1
         except ValueError as e:
             messagebox.showerror("Ошибка", str(e))
             return
