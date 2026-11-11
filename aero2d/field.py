@@ -50,7 +50,7 @@ def _grid(box, n):
     return np.meshgrid(xs, ys)
 
 
-def compute_field(ctx: dict, k: int, box=None, n: int = 220) -> dict:
+def compute_field(ctx: dict, k: int, box=None, n: int = 320) -> dict:
     """ctx — описание расчёта (Polar.field_ctx), k — номер точки поляры.
     Возвращает сетку X, Y, скорости U, V (в долях V∞), Cp и маску тела."""
     box = box or REGIONS["Весь профиль"]
@@ -157,7 +157,25 @@ def compute_field(ctx: dict, k: int, box=None, n: int = 220) -> dict:
                                 tv["k"] if sst else Q[:, 4] / rho, tv["mut"]]
                                + ([tv["omega_ln"]] if sst else []))
         # на стенке: прилипание (u = v = 0, M = 0), ν̃ = k = μt = 0; давление и ω — из соседних ячеек
-        f = ip(vals, xp, yp, wall={0: 0.0, 1: 0.0, 3: 0.0, 4: 0.0, 5: 0.0})
+        wall_bc = {0: 0.0, 1: 0.0, 3: 0.0, 4: 0.0, 5: 0.0}
+        f = ip(vals, xp, yp, wall=wall_bc)
+        # заливка — по самой расчётной сетке (значения в узлах, линейно в треугольниках): гладкий
+        # контур тел и вся детализация слоя и следа; растр — только для линий тока
+        Nv = ip.W @ vals
+        for j_, v_ in wall_bc.items():
+            Nv[ip.wall, j_] = v_
+        x0b, x1b, y0b, y1b = box
+        dx_, dy_ = 0.05 * (x1b - x0b), 0.05 * (y1b - y0b)
+        P = ip.nodes[ip.tris]
+        sel = ((P[..., 0].max(1) >= x0b - dx_) & (P[..., 0].min(1) <= x1b + dx_)
+               & (P[..., 1].max(1) >= y0b - dy_) & (P[..., 1].min(1) <= y1b + dy_))
+        nodes_ = {"cp": Nv[:, 2], "speed": np.hypot(Nv[:, 0], Nv[:, 1]), "mach_local": Nv[:, 3],
+                  "mut": Nv[:, 5]}
+        if sst:
+            nodes_.update(k_turb=Nv[:, 4], omega=np.exp(Nv[:, 6]))
+        else:
+            nodes_["nut"] = Nv[:, 4]
+        extra.update(tri=(ip.nodes[:, 0], ip.nodes[:, 1], ip.tris[sel]), node=nodes_)
         U, V = f[:, 0], f[:, 1]
         from .rans_mesh import wall_loops
         inside = ~np.isfinite(U)                       # вне расчётной области — внутри тел
@@ -218,6 +236,9 @@ def compute_field(ctx: dict, k: int, box=None, n: int = 220) -> dict:
         iy, ix = distance_transform_edt(ins, return_distances=False, return_indices=True)
         cp_f = cp.reshape(shape)[iy, ix]
         sp_f = speed.reshape(shape)[iy, ix]
+        # остальные величины (M, μt, k, ω, …) — так же: иначе у контура белая «лесенка»
+        for k_ in [k_ for k_, v_ in extra.items() if isinstance(v_, np.ndarray) and v_.shape == shape]:
+            extra[k_] = np.where(ins | ~np.isfinite(extra[k_]), extra[k_][iy, ix], extra[k_])
     else:
         cp_f, sp_f = cp.reshape(shape), speed.reshape(shape)
     U, V = (np.where(inside, np.nan, arr).reshape(shape) for arr in (U, V))

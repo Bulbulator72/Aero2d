@@ -372,6 +372,9 @@ class App(tk.Tk):
         b_.pack(side="left", padx=6)
         Tooltip(b_, "Нестационарный расчёт RANS от выбранной точки поляры RANS и ролик поля течения. "
                     "Вязкий и панельный методы стационарные — у них поле строится кнопкой «Построить».")
+        b_ = ttk.Button(bar, text="Сохранить картинку…", command=self.save_field_png)
+        b_.pack(side="left", padx=6)
+        Tooltip(b_, "Картинка поля течения для отчёта: PNG 300 dpi (или SVG/PDF — векторный формат)")
         self._field_cache = {}
         self._build_res_tab(nb)
         # таблица
@@ -1621,7 +1624,19 @@ class App(tk.Tk):
                 levels = np.linspace(np.nanmin(z), np.nanpercentile(z, 99.7) + 1e-9, 41)
         else:
             z, name = None, "линии тока"
-        if z is not None:
+        nk = {"Cp": "cp", "|V| / V∞": "speed"}.get(name, key if z is not None else None)
+        if z is not None and "node" in f and nk in f["node"]:
+            # RANS: заливка по самой расчётной сетке (плавно внутри треугольников) — гладкий контур
+            # тел, слой и след с той же детализацией, что в расчёте
+            from matplotlib.tri import Triangulation
+            xn, yn, tris = f["tri"]
+            zn = f["node"][nk]
+            if nk == "omega":
+                zn = np.log10(np.maximum(zn, 1e-30))
+            c = ax.tripcolor(Triangulation(xn, yn, tris), zn, shading="gouraud", cmap=cmap,
+                             vmin=levels[0], vmax=levels[-1], rasterized=True)
+            fig.colorbar(c, ax=ax, label=name, shrink=0.85, extend="both")
+        elif z is not None:
             c = ax.contourf(X, Y, z, levels=levels, cmap=cmap, extend="both")
             fig.colorbar(c, ax=ax, label=name, shrink=0.85)
         if self.fl_lines.get() or z is None:
@@ -1633,10 +1648,14 @@ class App(tk.Tk):
                                    cmap="viridis", linewidth=1.0, arrowsize=0.6, broken_streamlines=False)
                 fig.colorbar(sp.lines, ax=ax, label="|V| / V∞", shrink=0.85)
             else:
-                ax.streamplot(X, Y, U, V, start_points=seeds, density=4, color="k", linewidth=0.55,
-                              arrowsize=0.5, broken_streamlines=False)
+                dark = cmap in ("magma", "inferno", "viridis")      # на тёмной заливке — светлые линии
+                sp = ax.streamplot(X, Y, U, V, start_points=seeds, density=4, color="w" if dark else "k",
+                                   linewidth=0.55, arrowsize=0.5, broken_streamlines=False)
+                if dark:
+                    sp.lines.set_alpha(0.55)
+                    sp.arrows.set_alpha(0.55)
         for bx, by in f.get("bodies", [f["body"]]):
-            ax.fill(bx, by, color="#444", zorder=3)
+            ax.fill(bx, by, facecolor="#3a3a3a", edgecolor="#d8d8d8", lw=0.6, zorder=3)
         if "worst_xy" in f and len(f["worst_xy"]):
             wx_, wy_ = f["worst_xy"][:, 0], f["worst_xy"][:, 1]
             ax.plot(wx_, wy_, "o", mfc="none", mec="#00e5ff", ms=11, mew=1.6, zorder=5,
@@ -2781,6 +2800,17 @@ class App(tk.Tk):
         if p:
             core.save_csv(self.polars, p)
             self.status.set(f"Таблица сохранена: {p}")
+
+    def save_field_png(self):
+        if getattr(self, "_field_last", None) is None:
+            messagebox.showinfo("Поле течения", "Сначала постройте поле течения.")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".png", initialfile="поле_течения.png",
+                                            filetypes=[("PNG", "*.png"), ("SVG (вектор)", "*.svg"),
+                                                       ("PDF", "*.pdf")])
+        if path:
+            self.t_fl.fig.savefig(path, dpi=300, bbox_inches="tight")
+            self.status.set(f"Картинка поля течения сохранена: {path}")
 
     def save_png(self):
         if not self.polars:
