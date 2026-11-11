@@ -875,3 +875,73 @@ def rans_seeds(p: Polar):
     if ctx.get("method") != "rans":
         return []
     return [(float(a), Q) for a, Q, ok in zip(ctx["alpha"], ctx["states"], p.ok) if Q is not None and ok]
+
+
+# ----------------------------------------------------------------------------
+# сохранение расчётов в файл (.a2d): поляры с решениями RANS — продолжение после перезапуска
+# ----------------------------------------------------------------------------
+SESSION_EXT = ".a2d"
+
+
+def _session_snapshot(polars):
+    """Копии поляр для записи: без кэшей поля течения (ключи «_…»), решения RANS — float32
+    (вдвое меньше файл; как начальное поле этого достаточно)."""
+    import copy
+    out = []
+    for p in polars:
+        q = copy.copy(p)
+        if p.field_ctx is not None:
+            ctx = {k: v for k, v in p.field_ctx.items() if not str(k).startswith("_")}
+            if ctx.get("method") == "rans" and ctx.get("states") is not None:
+                ctx["states"] = [None if s is None else np.asarray(s, np.float32) for s in ctx["states"]]
+            q.field_ctx = ctx
+        out.append(q)
+    return out
+
+
+def save_session(polars, path, snapshot=None):
+    """Записать поляры (с сетками и решениями RANS) в файл path (gzip + pickle)."""
+    import gzip
+    import os
+    import pickle
+    from . import __version__
+    snap = snapshot if snapshot is not None else _session_snapshot(polars)
+    tmp = path + ".tmp"
+    with gzip.open(tmp, "wb", compresslevel=1) as f:
+        pickle.dump(dict(format="aero2d-session", version=1, aero2d=__version__, polars=snap), f,
+                    protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, path)
+
+
+class _SessionUnpickler:
+    """Чтение только своих классов, numpy и простых типов (файл не может запустить чужой код)."""
+    SAFE_BUILTINS = {"dict", "list", "tuple", "set", "frozenset", "complex", "float", "int", "bool", "str",
+                     "bytes", "bytearray", "slice", "range", "NoneType"}
+
+    @classmethod
+    def load(cls, f):
+        import pickle
+
+        class U(pickle.Unpickler):
+            def find_class(self, module, name):
+                if module == "builtins" and name in cls.SAFE_BUILTINS:
+                    return super().find_class(module, name)
+                if module.split(".")[0] in ("numpy", "aero2d", "collections", "copyreg", "_codecs"):
+                    return super().find_class(module, name)
+                raise pickle.UnpicklingError(f"в файле расчётов недопустимый объект {module}.{name}")
+        return U(f).load()
+
+
+def load_session(path):
+    """Прочитать поляры из файла save_session. Решения RANS — снова float64."""
+    import gzip
+    with gzip.open(path, "rb") as f:
+        d = _SessionUnpickler.load(f)
+    if not isinstance(d, dict) or d.get("format") != "aero2d-session":
+        raise ValueError("Это не файл расчётов aero2d")
+    polars = list(d.get("polars") or [])
+    for p in polars:
+        ctx = p.field_ctx
+        if ctx and ctx.get("method") == "rans" and ctx.get("states") is not None:
+            ctx["states"] = [None if s is None else np.asarray(s, float) for s in ctx["states"]]
+    return polars

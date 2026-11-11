@@ -376,3 +376,34 @@ def test_rans_polar_seeds_extend():
     # 2° — от ближайшего сошедшегося: 1° (если сошёлся за 5 итераций) или прежний 0°
     assert calls[1][0] == 2.0 and calls[1][1] and calls[1][2] in (0.0, 1.0)
     assert all(r is not None for r in r1)
+
+
+def test_session_save_load(tmp_path):
+    """Файл расчётов .a2d: поляры с сеткой и решениями RANS восстанавливаются; чужой код не читается."""
+    import gzip
+    import os
+    import pickle
+    import numpy as np
+    import pytest
+    from aero2d import core
+    from aero2d.geometry import naca4, repanel
+    from aero2d.rans_mesh import build_mesh
+    af = repanel(naca4("2412", 120), 60)
+    m = build_mesh([af], re=1e6, far_radius=15, far_size=5.0, ratio=1.4, slot_size=0.02, growth=0.4)
+    a = np.array([0.0, 2.0])
+    st = [np.random.rand(m.n_cells, 5) for _ in a]
+    p = core.Polar("T", "rans", 0.15, a, 0.1 * a, 0.01 + 0 * a, 0 * a, np.array([True, False]),
+                   field_ctx=dict(method="rans", mesh=m, elements=[af], states=st, history=[None, None],
+                                  alpha=a, _tri="кэш"))
+    f = str(tmp_path / "s.a2d")
+    core.save_session([p, p], f)
+    q = core.load_session(f)
+    assert len(q) == 2 and q[0].field_ctx["mesh"] is q[1].field_ctx["mesh"]
+    assert "_tri" not in q[0].field_ctx and q[0].field_ctx["states"][0].dtype == float
+    assert np.allclose(q[0].field_ctx["states"][1], st[1], atol=1e-6)
+    assert core.rans_seeds(q[0])[0][0] == 0.0 and len(core.rans_seeds(q[0])) == 1
+    bad = str(tmp_path / "bad.a2d")
+    with gzip.open(bad, "wb") as fh:
+        pickle.dump(dict(format="aero2d-session", polars=[os.system]), fh)
+    with pytest.raises(pickle.UnpicklingError):
+        core.load_session(bad)

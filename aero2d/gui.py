@@ -279,6 +279,10 @@ class App(tk.Tk):
         self.btn_skip.pack(fill="x", pady=2)
         mb = tk.Menu(self)
         fm = tk.Menu(mb, tearoff=0)
+        fm.add_command(label="Открыть расчёты (.a2d)…", command=self.open_session)
+        fm.add_command(label="Открыть автосохранение (последние расчёты)", command=self.open_autosave)
+        fm.add_command(label="Сохранить расчёты с решениями RANS (.a2d)…", command=self.save_session)
+        fm.add_separator()
         fm.add_command(label="Сохранить таблицу (CSV)…", command=self.save_csv)
         fm.add_command(label="Сохранить графики (PNG)…", command=self.save_png)
         fm.add_command(label="Сохранить ход невязок RANS (CSV)…", command=self.save_res_csv)
@@ -1047,9 +1051,20 @@ class App(tk.Tk):
                 elif msg[0] == "done":
                     self._finish()
                     self.add_polar(msg[1])
+                    self._autosave()
+                elif msg[0] == "loaded":                   # расчёты из файла .a2d
+                    for p_ in msg[1]:
+                        self.add_polar(p_)
+                    n_r = sum(1 for p_ in msg[1] if (p_.field_ctx or {}).get("method") == "rans")
+                    self.status.set(f"Открыто расчётов: {len(msg[1])} из {msg[2]}"
+                                    + (f" (RANS с решениями: {n_r} — их можно продолжить новыми углами)"
+                                       if n_r else ""))
+                elif msg[0] == "saved":
+                    self.status.set(msg[1])
                 elif msg[0] == "replace":                  # поляра дополнена новыми углами
                     self._finish()
                     self.replace_polar(msg[1], msg[2])
+                    self._autosave()
                 elif msg[0] == "field":
                     self._draw_field(*msg[1:])
                 elif msg[0] == "field_error":
@@ -2685,6 +2700,66 @@ class App(tk.Tk):
             self.replace_polar(p, core.drop_unconverged(p))
         except ValueError as e:
             messagebox.showinfo("Несошедшиеся точки", str(e))
+            return
+        self._autosave()
+
+    # ------------------------------------------------- сохранение расчётов (.a2d)
+    AUTOSAVE = os.path.join(os.path.expanduser("~"), "aero2d_autosave.a2d")
+
+    def _write_session(self, path, polars, done_msg, quiet=False):
+        """Запись в фоне (файл с решениями RANS — десятки МБ, несколько секунд)."""
+        snap = core._session_snapshot(polars)          # копия — здесь, в потоке окна
+        lock = self.__dict__.setdefault("_save_lock", threading.Lock())
+
+        def job():
+            if not lock.acquire(blocking=not quiet):
+                return                                  # автосохранение уже пишется
+            try:
+                core.save_session(None, path, snapshot=snap)
+                self.q.put(("saved", done_msg))
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("saved", f"Не удалось сохранить расчёты в {path}: {e}"))
+            finally:
+                lock.release()
+        threading.Thread(target=job, daemon=True).start()
+
+    def _autosave(self):
+        """После каждого законченного расчёта — все расчёты сеанса в aero2d_autosave.a2d
+        (в папке пользователя): если окно закрыть или программа упадёт, их можно открыть снова."""
+        if self.polars:
+            self._write_session(self.AUTOSAVE, list(self.polars),
+                                f"Расчёты автоматически сохранены: {self.AUTOSAVE}", quiet=True)
+
+    def save_session(self):
+        if not self.polars:
+            messagebox.showinfo("Нет данных", "Сначала выполните расчёт.")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=core.SESSION_EXT, initialfile="расчёты.a2d",
+                                            filetypes=[("Расчёты aero2d", "*.a2d")])
+        if path:
+            self.status.set("Сохраняю расчёты…")
+            self._write_session(path, list(self.polars), f"Расчёты сохранены: {path}")
+
+    def open_session(self, path=None):
+        if path is None:
+            path = filedialog.askopenfilename(filetypes=[("Расчёты aero2d", "*.a2d"), ("Все файлы", "*.*")])
+        if not path:
+            return
+        self.status.set(f"Открываю {path}…")
+
+        def job():
+            try:
+                self.q.put(("loaded", core.load_session(path), path))
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("error", f"Не удалось открыть {path}: {e}", traceback.format_exc()))
+        threading.Thread(target=job, daemon=True).start()
+
+    def open_autosave(self):
+        if not os.path.exists(self.AUTOSAVE):
+            messagebox.showinfo("Автосохранение", f"Автосохранения пока нет ({self.AUTOSAVE}): оно появляется "
+                                "после первого законченного расчёта.")
+            return
+        self.open_session(self.AUTOSAVE)
 
     def clear(self):
         self.__dict__["_grp_polar"] = {}
