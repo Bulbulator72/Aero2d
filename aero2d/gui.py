@@ -1633,8 +1633,13 @@ class App(tk.Tk):
             zn = f["node"][nk]
             if nk == "omega":
                 zn = np.log10(np.maximum(zn, 1e-30))
+            nrm = None
+            if nk == "cp":                           # белый — ровно Cp = 0 (разрежение синее, напор красный)
+                from matplotlib.colors import TwoSlopeNorm
+                nrm = TwoSlopeNorm(vcenter=0.0, vmin=min(levels[0], -1e-3), vmax=max(levels[-1], 1e-3))
             c = ax.tripcolor(Triangulation(xn, yn, tris), zn, shading="gouraud", cmap=cmap,
-                             vmin=levels[0], vmax=levels[-1], rasterized=True)
+                             norm=nrm, vmin=None if nrm else levels[0], vmax=None if nrm else levels[-1],
+                             rasterized=True)
             fig.colorbar(c, ax=ax, label=name, shrink=0.85, extend="both")
         elif z is not None:
             c = ax.contourf(X, Y, z, levels=levels, cmap=cmap, extend="both")
@@ -1649,14 +1654,15 @@ class App(tk.Tk):
                 fig.colorbar(sp.lines, ax=ax, label="|V| / V∞", shrink=0.85)
             else:
                 dark = cmap in ("magma", "inferno", "viridis")      # на тёмной заливке — светлые линии
+                # без стрелок: у линий тока от одного сечения они выстраиваются в столбик посреди картинки
                 sp = ax.streamplot(X, Y, U, V, start_points=seeds, density=4, color="w" if dark else "k",
-                                   linewidth=0.55, arrowsize=0.5, broken_streamlines=False)
+                                   linewidth=0.55, arrowstyle="-", broken_streamlines=False)
                 if dark:
                     sp.lines.set_alpha(0.55)
                     sp.arrows.set_alpha(0.55)
         for bx, by in f.get("bodies", [f["body"]]):
             ax.fill(bx, by, facecolor="#3a3a3a", edgecolor="#d8d8d8", lw=0.6, zorder=3)
-        if "worst_xy" in f and len(f["worst_xy"]):
+        if "worst_xy" in f and len(f["worst_xy"]) and qty.startswith("Невязка"):   # отладка — не в отчёт
             wx_, wy_ = f["worst_xy"][:, 0], f["worst_xy"][:, 1]
             ax.plot(wx_, wy_, "o", mfc="none", mec="#00e5ff", ms=11, mew=1.6, zorder=5,
                     label="ячейки с наибольшей невязкой")
