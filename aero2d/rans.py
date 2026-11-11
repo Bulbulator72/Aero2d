@@ -2500,7 +2500,8 @@ def _rans_chunk(args):
     """Исполнитель: часть поляры в отдельном процессе."""
     import warnings
     warnings.filterwarnings("ignore")
-    (mesh, mach, re, chord, xref, alphas, idx, Q0, a0, rref, max_iter, conv, queue, flags, init, sopts) = args
+    (mesh, mach, re, chord, xref, alphas, idx, Q0, a0, rref, max_iter, conv, queue, flags, init, sopts) = args[:16]
+    cmesh = args[16] if len(args) > 16 else None
     skip_gen, stop_ev, cfl_gen, back_gen = flags[:4]
     ext = flags[4] if len(flags) > 4 else None
     solver = RansSolver(mesh, mach, re, chord=chord, xref=xref)
@@ -2509,6 +2510,19 @@ def _rans_chunk(args):
     if rref:
         solver._rref = rref
     ctl = _ProcControl(queue, skip_gen, stop_ev, cfl_gen, back_gen, ext)
+    a1 = float(alphas[idx[0]])
+    if cmesh is not None and a0 is not None and abs(a1 - float(a0)) > 2.5 and not init:
+        # кусок далеко от угла общего старта: свой старт на грубой сетке при первом угле куска,
+        # а не поворот поля на подробной сетке через промежуточные углы (у SST — шаг ≤ 2,5°:
+        # кусок 7…12° от решения при 0° шёл через 2,33° и 4,67°)
+        cs = RansSolver(cmesh, mach, re, chord=chord, xref=xref)
+        for k_, v_ in (sopts or {}).items():
+            setattr(cs, k_, v_)
+        _stage(ctl, a1, f"этап: грубая сетка ({cmesh.n_cells} ячеек) — старт куска углов")
+        rc = cs.solve(a1, max_iter=max_iter, conv=Convergence(3.5, 10, 2e-3, 2e-4), control=ctl)
+        if rc.converged and not stop_ev.is_set():
+            Q0, a0 = transfer_state(cmesh, rc.state, mesh), a1
+            _stage(ctl, a1, f"этап: рабочая сетка ({mesh.n_cells} ячеек)")
     out = [None] * len(alphas)
     st = {}
 
@@ -2585,10 +2599,12 @@ def rans_polar(elements, alphas, re, mach=0.15, chord=1.0, xref=None, mesh=None,
     # --- быстрый старт: первый угол на грубой сетке
     use_coarse = ((coarse_start is True or (coarse_start == "auto" and mesh.n_cells > 20000))
                   and not init and not seeds)
+    cmesh = None                                       # грубая сетка — и для старта кусков
     if use_coarse:
         if callback:
             callback(0, n, 0, 0.0, None)
         cm = mesh_for(elements, float(np.median(alphas)), re, chord, opts=coarse_options(elements, mesh_opts))
+        cmesh = cm
         cs = RansSolver(cm, mach, re, chord=chord, xref=xr)
         for k_, v_ in (solver_opts or {}).items():
             setattr(cs, k_, v_)
@@ -2637,7 +2653,7 @@ def rans_polar(elements, alphas, re, mach=0.15, chord=1.0, xref=None, mesh=None,
         with ProcessPoolExecutor(len(chunks), mp_context=ctx) as ex:
             futs = [ex.submit(_rans_chunk, (mesh, mach, re, chord, xr, alphas, c, Q0, a0, rref, max_iter, conv,
                                             queue, (skip_gen, stop_ev, cfl_gen, back_gen, ext),
-                                            {i: init[i] for i in c if i in init}, solver_opts))
+                                            {i: init[i] for i in c if i in init}, solver_opts, cmesh))
                     for c in chunks]
             pending = set(futs)
             while pending:
