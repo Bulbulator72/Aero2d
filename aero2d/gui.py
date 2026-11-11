@@ -2344,9 +2344,11 @@ class App(tk.Tk):
     @staticmethod
     def _res_add(D, a, it, res, rn, cl, cd, cfl=None):
         A = D["angles"].setdefault(float(a), dict(it=[], res=[], rn=[], cl=[], cd=[], cfl=[]))
-        if A["it"] and it <= A["it"][-1]:          # угол пересчитывается заново
+        if A["it"] and it <= A["it"][-1]:          # угол пересчитывается заново (новый этап)
             for v in A.values():
                 v.clear()
+            # отметки откатов прошлого этапа на новой кривой только сбивают с толку
+            D["events"] = [e for e in D["events"] if abs(e[0] - float(a)) > 1e-9]
         A["it"].append(it); A["res"].append(res); A["rn"].append(rn); A["cl"].append(cl); A["cd"].append(cd)
         A["cfl"].append(np.nan if cfl is None else float(cfl))
         D["last"] = (float(a), it, cl, cd)
@@ -2357,6 +2359,10 @@ class App(tk.Tk):
             return
         if "event" in d:                                   # откат и т. п.
             if d["event"] in ("пауза", "продолжение"):
+                return
+            if d["event"].startswith("этап:"):           # смена этапа — в строку состояния, без отметки
+                L["stage"] = f"α = {d['alpha']:g}°, {d['event']}"
+                self.status.set(L["stage"])
                 return
             L["events"].append((float(d["alpha"]), int(d["it"]), d["event"]))
             self.status.set(f"α = {d['alpha']:g}°, итерация {d['it']}: {d['event']}")
@@ -2493,7 +2499,8 @@ class App(tk.Tk):
         if D["last"]:
             a, it, cl, cd = D["last"]
             A = D["angles"].get(float(a))
-            msg = f"α = {a:g}°, итерация {it}:  Cl = {cl:.4f}, Cd = {cd:.5f}"
+            msg = (f"{D['stage']}   ·   " if D.get("stage") else "") + \
+                f"α = {a:g}°, итерация {it}:  Cl = {cl:.4f}, Cd = {cd:.5f}"
             if A and A["rn"] and float(a) in rfs and orders is not None:
                 got = float(np.log10(max(rfs[float(a)], 1e-300) / max(A["rn"][-1], 1e-300)))
                 msg += f"   ·   невязка упала на {got:.1f} из {orders:g} порядков"

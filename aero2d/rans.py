@@ -1291,6 +1291,7 @@ class RansSolver:
             # (течение почти ламинарное, Cl колеблется) — сначала SA (с теми же настройками),
             # затем SST от её вихревой вязкости (_turb_from: k = νt·Ω/a1, ω = Ω/a1)
             self.turb_model = "sa"
+            _stage(control, alpha, "этап: модель SA (разгон перед k-ω SST)")
             try:
                 r0 = self.solve(alpha, None, max_iter, tol, cfl0, cfl_max, first_order_iters, verbose, callback,
                                 gmres_tol, gmres_iter, conv, control, alpha0)
@@ -1302,6 +1303,7 @@ class RansSolver:
                 print(f"  решение SA: Cl {r0.cl:.4f}, {r0.status} — продолжаю моделью k-ω SST", flush=True)
             if control is not None and getattr(control, "stop", False):
                 return r0
+            _stage(control, alpha, f"этап: k-ω SST (от решения SA, {self.nc} ячеек)")
             r = self.solve(alpha, r0.state, max_iter, tol, None, cfl_max, 0, verbose, callback,
                            gmres_tol, gmres_iter, conv, control, alpha)
             r.iterations += r0.iterations
@@ -2279,6 +2281,15 @@ def _seq_order(alphas):
     return list(order[i0:]) + list(order[:i0][::-1])
 
 
+def _stage(control, alpha, text):
+    """Сообщение окну о смене этапа расчёта угла (счётчик итераций начинается заново)."""
+    if control is not None and getattr(control, "monitor", None) is not None:
+        try:
+            control.monitor(dict(alpha=float(alpha), it=0, event=text))
+        except Exception:                                  # noqa: BLE001 — окно могло закрыться
+            pass
+
+
 def _solve_angle(solver, a, Q, a_src, max_iter, verbose, cb, conv, control, depth=0):
     """Один угол; если он развалился при старте от соседнего угла a_src, —
     промежуточный угол (a + a_src)/2 и затем снова a (до двух делений).
@@ -2293,6 +2304,7 @@ def _solve_angle(solver, a, Q, a_src, max_iter, verbose, cb, conv, control, dept
             if control is not None and control.stop:
                 break
             m = round(a_src + (a - a_src) * j / n, 3)
+            _stage(control, a, f"этап: промежуточный угол {m:g}° (шаг по углу для SST ≤ {maxd:g}°)")
             rm = solver.solve(m, Q0=Q, max_iter=max_iter, verbose=verbose, callback=cb, control=control,
                               conv=Convergence(3.0, 10, 2e-3, 2e-4), alpha0=a_src)
             if rm.status.startswith(("расходится", "неустойчиво")):
@@ -2561,6 +2573,7 @@ def rans_polar(elements, alphas, re, mach=0.15, chord=1.0, xref=None, mesh=None,
         cs = RansSolver(cm, mach, re, chord=chord, xref=xr)
         for k_, v_ in (solver_opts or {}).items():
             setattr(cs, k_, v_)
+        _stage(control, alphas[i0], f"этап: грубая сетка ({cm.n_cells} ячеек) — быстрый старт")
         rc = cs.solve(float(alphas[i0]), max_iter=max_iter, verbose=verbose, conv=Convergence(3.5, 10, 2e-3, 2e-4),
                       callback=lambda it, rn: on_iter(i0, it, rn), control=control)
         if verbose:
@@ -2568,6 +2581,7 @@ def rans_polar(elements, alphas, re, mach=0.15, chord=1.0, xref=None, mesh=None,
         if control is not None and control.stop:
             return out, mesh
         Q0, a0 = transfer_state(cm, rc.state, mesh), float(alphas[i0])
+        _stage(control, alphas[i0], f"этап: рабочая сетка ({mesh.n_cells} ячеек)")
     workers = int(max(1, min(workers, n)))
     if workers <= 1 or n == 1:
         _solve_sequence(solver, alphas, seq, states, out, max_iter, verbose, conv, control, on_iter, on_done,
