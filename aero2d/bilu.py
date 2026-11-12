@@ -247,39 +247,68 @@ class JaxTriSolve:
         def pad(groups, width_of, fill):
             P = max(1, max(width_of(g) for g in groups))
             return P, fill
-        P = max(1, max(len(E) for _, E, _, _ in ilu.fwd))
-        FE = np.full((len(ilu.fwd), P), nnz, np.int32)
-        FR = np.full((len(ilu.fwd), P), n, np.int32)
-        FC = np.full((len(ilu.fwd), P), n, np.int32)
-        for l, (_, E, _, _) in enumerate(ilu.fwd):
-            FE[l, :len(E)], FR[l, :len(E)], FC[l, :len(E)] = E, r[E], c[E]
-        P = max(1, max(len(E) for _, E, _, _ in ilu.bwd))
-        Pr = max(1, max(len(rw) for rw, _, _, _ in ilu.bwd))
-        nb = len(ilu.bwd)
-        BE = np.full((nb, P), nnz, np.int32)
-        BR = np.full((nb, P), n, np.int32)
-        BC = np.full((nb, P), n, np.int32)
-        BW = np.full((nb, Pr), n, np.int32)
-        for l, (rw, E, _, _) in enumerate(ilu.bwd):
-            BE[l, :len(E)], BR[l, :len(E)], BC[l, :len(E)] = E, r[E], c[E]
-            BW[l, :len(rw)] = rw
-        self.idx = tuple(jnp.asarray(a) for a in (FE, FR, FC, BE, BR, BC, BW))
+        def segments(widths):
+            """Подряд идущие уровни — участками близкой ширины: внутри участка уровни дополняются до
+            его собственного максимума (а не до максимума по всей сетке — там лишней работы ×2–2,5)."""
+            out, s0 = [], 0
+            lo = hi = None
+            for l, w in enumerate(widths):
+                w = max(int(w), 1)
+                if lo is None:
+                    lo = hi = w
+                    continue
+                nlo, nhi = min(lo, w), max(hi, w)
+                if nhi > 1.5 * nlo and l - s0 >= 8:
+                    out.append((s0, l))
+                    s0, lo, hi = l, w, w
+                else:
+                    lo, hi = nlo, nhi
+            out.append((s0, len(widths)))
+            return out
+
+        fseg, bseg = [], []
+        for a_, b_ in segments([len(E) for _, E, _, _ in ilu.fwd]):
+            lv = ilu.fwd[a_:b_]
+            P = max(1, max(len(E) for _, E, _, _ in lv))
+            FE = np.full((len(lv), P), nnz, np.int32)
+            FR = np.full((len(lv), P), n, np.int32)
+            FC = np.full((len(lv), P), n, np.int32)
+            for l, (_, E, _, _) in enumerate(lv):
+                FE[l, :len(E)], FR[l, :len(E)], FC[l, :len(E)] = E, r[E], c[E]
+            fseg.append(tuple(jnp.asarray(a) for a in (FE, FR, FC)))
+        for a_, b_ in segments([max(len(E), len(rw)) for rw, E, _, _ in ilu.bwd]):
+            lv = ilu.bwd[a_:b_]
+            P = max(1, max(len(E) for _, E, _, _ in lv))
+            Pr = max(1, max(len(rw) for rw, _, _, _ in lv))
+            BE = np.full((len(lv), P), nnz, np.int32)
+            BR = np.full((len(lv), P), n, np.int32)
+            BC = np.full((len(lv), P), n, np.int32)
+            BW = np.full((len(lv), Pr), n, np.int32)
+            for l, (rw, E, _, _) in enumerate(lv):
+                BE[l, :len(E)], BR[l, :len(E)], BC[l, :len(E)] = E, r[E], c[E]
+                BW[l, :len(rw)] = rw
+            bseg.append(tuple(jnp.asarray(a) for a in (BE, BR, BC, BW)))
+        self.idx = (tuple(fseg), tuple(bseg))
+        self.n_segments = (len(fseg), len(bseg))
         perm = jnp.asarray(ilu.perm)
 
         def solve(B, invU, b, idx):
-            FE, FR, FC, BE, BR, BC, BW = idx
+            fseg, bseg = idx
             y = jnp.zeros((n + 1, k), b.dtype).at[:n].set(b.reshape(n, k)[perm])
 
             def fwd(y, ix):
                 e, rr, cc = ix
                 return y.at[rr].add(-jnp.einsum("eab,eb->ea", B[e], y[cc])), None
-            y, _ = jax.lax.scan(fwd, y, (FE, FR, FC))
+            for seg in fseg:
+                y, _ = jax.lax.scan(fwd, y, seg)
 
             def bwd(x, ix):
                 e, rr, cc, rw = ix
                 x = x.at[rr].add(-jnp.einsum("eab,eb->ea", B[e], x[cc]))
                 return x.at[rw].set(jnp.einsum("eab,eb->ea", invU[rw], x[rw])), None
-            x, _ = jax.lax.scan(bwd, y, (BE, BR, BC, BW))
+            x = y
+            for seg in bseg:
+                x, _ = jax.lax.scan(bwd, x, seg)
             out = jnp.zeros((n, k), b.dtype).at[perm].set(x[:n])
             return out.reshape(-1)
         self._solve = jax.jit(solve)

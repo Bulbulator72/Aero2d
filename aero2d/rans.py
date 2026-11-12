@@ -300,6 +300,7 @@ class RansSolver:
         self.prec_lag = 1              # >1: разложение ILU повторно до prec_lag итераций (CFL ×2 — заново); на
                                        # механизации это ухудшило сходимость — по умолчанию каждую итерацию
         self.jax_trisolve = True       # прямой/обратный ход ILU — скомпилированным циклом JAX
+        self.limiter_gather = False    # ограничитель: max/min по соседям сбором по таблице (на NLR 7301 — не быстрее)
         self.max_rollbacks = 4         # больше откатов — угол «неустойчив»
         self.sa_raw_grad = False       # True: источник SA по неограниченным градиентам (на механизации хуже сходится)
         self.visc_raw_grad = False     # True: вязкие потоки по неограниченным градиентам
@@ -379,6 +380,23 @@ class RansSolver:
                       d_i=J(d), dist_i=J(self.dist_i), w_i=J(w_i), cw=J(cw), n_w=J(self.n_w), A_w=J(self.A_w),
                       r_w=J(self.r_w), dn_w=J(self.dn_w), w_w=J(ww), cf=J(cf), n_f=J(self.n_f), A_f=J(self.A_f),
                       r_f=J(self.r_f), fc_f=J(self.fc_f), Minv=J(self.Minv), vol=J(self.vol), wd=J(self.wall_d))
+        # таблицы «ячейка → её грани / соседи» для ограничителя: max/min по соседям сбором (gather)
+        # вместо разбрасывания с max/min (scatter-max на процессоре в JAX медленный: ограничитель
+        # занимал ~¼ невязки; NLR 7301, 167 тыс. ячеек)
+        def table(cells, vals, pad):
+            o = np.argsort(cells, kind="stable")
+            c_, v_ = cells[o], vals[o]
+            cnt = np.bincount(c_, minlength=nc)
+            start = np.r_[0, np.cumsum(cnt)[:-1]]
+            pos = np.arange(len(c_)) - start[c_]
+            T = np.full((nc, max(1, int(cnt.max()) if len(cnt) else 1)), pad, np.int64)
+            T[c_, pos] = v_
+            return T
+        nfi = len(L)
+        self.J["nbr"] = J(table(np.r_[L, R], np.r_[R, L], -1))                 # соседи (−1 — нет)
+        self.J["nbr"] = jnp.where(self.J["nbr"] < 0, jnp.arange(nc)[:, None], self.J["nbr"])
+        self.J["ftab"] = J(table(np.r_[L, R], np.r_[np.arange(nfi), nfi + np.arange(nfi)], 2 * nfi))
+        self.J["wtab"] = J(table(np.asarray(cw), np.arange(len(cw)), len(cw)))   # грани стенки ячейки
         self._res_jit = None
         # направление от стенки ∇d (для H_L модели перехода): точная ближайшая точка на
         # отрезках стенки. Нормальная скорость в слое ~U/√Re_x — направление нужно точно.
@@ -707,12 +725,12 @@ class RansSolver:
         # торможения перед носком k раздувалось (аномалия точки торможения) — шаг Ньютона просил
         # изменить p в десятки–тысячи раз, расчёт на подробной сетке не сходился; в пограничном
         # слое Ω ≈ S, для NACA 0012 SST и SST-V почти совпадают (NASA TMR)
-        prod = str(self.sst_prod or "V").upper() if self.sst_vort else "S"
-        if prod == "S":
+        pform = str(self.sst_prod or "V").upper() if self.sst_vort else "S"   # форма порождения
+        if pform == "S":
             Sp2 = S2
         else:
             W2 = (g[:, 2, 0] - g[:, 1, 1]) ** 2
-            Sp2 = W2 if prod == "V" else jnp.sqrt(S2 * W2 + 1e-30)    # Като–Лаундер: S·Ω
+            Sp2 = W2 if pform == "V" else jnp.sqrt(S2 * W2 + 1e-30)   # Като–Лаундер: S·Ω
         P = jnp.minimum(mut * Sp2, 10 * SST_BS * rho * om * k)
         if self.lam_xtr is not None:            # переход по вязкому методу: до x_tr k не порождается
             P = P * (self.J["prod"] if prod is None else prod)
@@ -966,8 +984,16 @@ class RansSolver:
         J = self.J
         iL, iR, cw = J["iL"], J["iR"], J["cw"]
         big = 1e300
-        wmax = w.at[iL].max(w[iR]).at[iR].max(w[iL]).at[cw].max(wv)
-        wmin = w.at[iL].min(w[iR]).at[iR].min(w[iL]).at[cw].min(wv)
+        if self.limiter_gather:
+            wn = w[J["nbr"]]                                                   # (nc, m, nv)
+            inf = jnp.full((1, w.shape[1]), jnp.inf)
+            wvx = jnp.concatenate([wv, -inf])[J["wtab"]]
+            wvn = jnp.concatenate([wv, inf])[J["wtab"]]
+            wmax = jnp.maximum(jnp.maximum(w, wn.max(1)), wvx.max(1))
+            wmin = jnp.minimum(jnp.minimum(w, wn.min(1)), wvn.min(1))
+        else:
+            wmax = w.at[iL].max(w[iR]).at[iR].max(w[iL]).at[cw].max(wv)
+            wmin = w.at[iL].min(w[iR]).at[iR].min(w[iL]).at[cw].min(wv)
         dmax, dmin = wmax - w, wmin - w
         h = jnp.sqrt(J["vol"])
         # характерный масштаб переменных для ε
@@ -985,7 +1011,10 @@ class RansSolver:
             return jnp.where(jnp.abs(d2) < 1e-14, 1.0, jnp.clip(num / den, 0.0, 1.0))
         pL = psi(jnp.einsum("fkj,fj->fk", g[iL], J["rL"]), iL)
         pR = psi(jnp.einsum("fkj,fj->fk", g[iR], J["rR"]), iR)
-        lim = jnp.ones_like(w).at[iL].min(pL).at[iR].min(pR)
+        if self.limiter_gather:
+            lim = jnp.minimum(1.0, jnp.concatenate([pL, pR, jnp.ones((1, w.shape[1]))])[J["ftab"]].min(1))
+        else:
+            lim = jnp.ones_like(w).at[iL].min(pL).at[iR].min(pR)
         return lim
 
     def _grad_T(self, w, g):
@@ -1127,7 +1156,7 @@ class RansSolver:
     def _fn_key(self):
         """Параметры, которые входят в скомпилированные функции как константы."""
         return (self.nv, self.turb_model, self.aft_version, float(self.ncrit), float(self.limiter_k),
-                self.limiter_zone, bool(self.sst_vort), str(self.sst_prod), float(self.sst_k_inf_rel), float(self.sst_omega_inf_rel),
+                self.limiter_zone, bool(self.sst_vort), str(self.sst_prod), bool(self.limiter_gather), float(self.sst_k_inf_rel), float(self.sst_omega_inf_rel),
                 float(self.zmin), bool(self.sa_raw_grad), bool(self.visc_raw_grad), int(self.rc_smooth),
                 bool(self.turbulent), float(self.chi_inf), float(self.chi_inf_tr), self.xref, int(self.turb_order),
                 float(self.ncrit_eff()), float(self.xtr_u), float(self.xtr_l),
