@@ -1388,6 +1388,7 @@ class RansSolver:
         prev = None                                   # (Q, невязка, порядок) до последнего шага
         n_rej = 0
         ok_streak = 0                                 # итераций подряд без отмены шага
+        n_tiny = 0                                    # итераций подряд с шагом, урезанным почти до нуля
         hist = []
         r0 = None
         cfl = cfl0
@@ -1805,7 +1806,16 @@ class RansSolver:
                 # урезается шаг только в них, а не во всей области (иначе CFL не растёт)
                 lam_c = np.where(reli < 0.2, 1.0, 0.2 / np.maximum(reli, 1e-300))[:, None]
             elif lam < 1.0:
-                cfl = max(cfl0, cfl * 0.5)
+                # шаг урезан почти до нуля много итераций подряд — CFL ниже начального (иначе поле
+                # «замерзает»: CFL стоит на начальном, невязка и Cl не меняются — механизация, SST
+                # от решения SA на грубой сетке, α 10°: 80 итераций без изменений)
+                cfl = max(cfl0 if n_tiny < 10 else 0.02 * cfl0, cfl * 0.5)
+            n_tiny = n_tiny + 1 if lam < 0.05 and lam_c is None else 0
+            if n_tiny >= 60:
+                status = "застрял: шаг Ньютона урезан почти до нуля 60 итераций подряд"
+                if verbose:
+                    print(f"  it {it:4d}: {status}", flush=True)
+                break
             prev = (Q.copy(), rn, order)
             Q = Q + (lam_c if lam_c is not None else lam) * dq
             # циркуляция для вихревой поправки
@@ -2627,8 +2637,31 @@ def rans_polar(elements, alphas, re, mach=0.15, chord=1.0, xref=None, mesh=None,
         for k_, v_ in (solver_opts or {}).items():
             setattr(cs, k_, v_)
         _stage(control, alphas[i0], f"этап: грубая сетка ({cm.n_cells} ячеек) — быстрый старт")
-        rc = cs.solve(float(alphas[i0]), max_iter=max_iter, verbose=verbose, conv=Convergence(3.5, 10, 2e-3, 2e-4),
-                      callback=lambda it, rn: on_iter(i0, it, rn), control=control)
+        a_first = float(alphas[i0])
+        cconv = Convergence(3.5, 10, 2e-3, 2e-4)
+        if abs(a_first) > 4.0:
+            # первый угол большой: холодный старт — при 0° (с однородного потока надёжно), затем к
+            # нужному углу шагами ≤ 2,5° — всё на грубой сетке (дёшево). С однородного потока сразу
+            # при 10° механизация уходила в плохое решение SA (Cl 0,72 вместо 1,49), SST от него
+            # «замерзала»
+            steps = [0.0] + [round(a_first * j / int(np.ceil(abs(a_first) / 2.5)), 3)
+                             for j in range(1, int(np.ceil(abs(a_first) / 2.5)))]
+            Qc, ac = None, None
+            for m in steps:
+                _stage(control, a_first, f"этап: грубая сетка, разгон через α = {m:g}°")
+                rm = cs.solve(m, Q0=Qc, alpha0=ac, max_iter=max_iter, verbose=verbose, conv=cconv,
+                              callback=lambda it, rn: on_iter(i0, it, rn), control=control)
+                if control is not None and control.stop:
+                    return out, mesh
+                if rm.status.startswith(("расходится", "неустойчиво", "застрял")):
+                    break
+                Qc, ac = rm.state, m
+            _stage(control, a_first, f"этап: грубая сетка, α = {a_first:g}°")
+            rc = cs.solve(a_first, Q0=Qc, alpha0=ac, max_iter=max_iter, verbose=verbose, conv=cconv,
+                          callback=lambda it, rn: on_iter(i0, it, rn), control=control)
+        else:
+            rc = cs.solve(a_first, max_iter=max_iter, verbose=verbose, conv=cconv,
+                          callback=lambda it, rn: on_iter(i0, it, rn), control=control)
         if verbose:
             print(f"  грубая сетка ({cm.n_cells} ячеек): α {alphas[i0]:g}°, Cl {rc.cl:.4f}, {rc.status}", flush=True)
         if control is not None and control.stop:
