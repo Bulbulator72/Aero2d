@@ -594,6 +594,9 @@ def run_rans(af, alphas, mach: float, re: float, callback=None, max_iter: int = 
             f"{r.alpha:g}°: " + ", ".join(f"{e['cl']:.3f}" for e in r.elements) for r in res if r))
     nm = name or (elements[0].name if len(elements) == 1 else "многоэлементный")
     tname = {"sa": "SA", "sa-rc": "SA-RC", "sa-aft": "SA-AFT"}.get(tm, tm.upper())
+    if tm == "sst":
+        tname = {"V": "SST-V", "S": "SST(S)", "KL": "SST-KL"}.get(str((solver_opts or {}).get("sst_prod", "V")).upper(),
+                                                              "SST")
     if np.isfinite(xtr_u).any():
         notes.append("Переход (начало турбулентного слоя), x/c верх / низ: " + "; ".join(
             f"{a:g}° — {u:.3f} / {l_:.3f}" for a, u, l_ in zip(alphas, xtr_u, xtr_l) if np.isfinite(u)))
@@ -607,6 +610,7 @@ def run_rans(af, alphas, mach: float, re: float, callback=None, max_iter: int = 
                  xtr_l=xtr_l if np.isfinite(xtr_l).any() else None,
                  field_ctx=dict(method="rans", mesh=mesh, elements=elements, mach=mach, re=re, chord=chord,
                                 turb_model=tm, transition=bool((solver_opts or {}).get("lam_xtr_table")),
+                                sst_prod=str((solver_opts or {}).get("sst_prod", "V")).upper() if tm == "sst" else None,
                                 alpha=alphas, states=[r.state if r else None for r in res],
                                 history=[r.history if r else None for r in res]))
 

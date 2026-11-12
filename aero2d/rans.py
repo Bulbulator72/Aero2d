@@ -250,7 +250,11 @@ class RansSolver:
         self.sst_k_inf_rel = 1e-6         # k∞ / V∞²
         self.sst_omega_inf_rel = 5.0      # ω∞ · c / V∞
         self.sst_sa_start = True          # SST с однородного потока: сначала решение SA
-        self.sst_vort = True              # SST-V: порождение по завихренности (иначе — по деформации)
+        # порождение k в SST: "V" — по завихренности Ω² (NASA SST-V; без аномалии точки торможения),
+        # "S" — по деформации S² с ограничителем (Menter 2003, по умолчанию во Fluent), "KL" — Като–Лаундер
+        # S·Ω (во Fluent — опция): в зонах вращения (ниша закрылка) Ω-вариант даёт больше турбулентности
+        self.sst_prod = "V"
+        self.sst_vort = True              # устаревшее: sst_prod = "V" / "S"
         # предел CFL для k-ω SST: при CFL > ~10⁴ на подробной сетке (NACA 0012, 124 тыс. ячеек)
         # GMRES не сходился и шаги отменялись; при 3000 — без отмен, силы за ~100 итераций
         self.sst_cfl_max = 3000.0
@@ -703,11 +707,12 @@ class RansSolver:
         # торможения перед носком k раздувалось (аномалия точки торможения) — шаг Ньютона просил
         # изменить p в десятки–тысячи раз, расчёт на подробной сетке не сходился; в пограничном
         # слое Ω ≈ S, для NACA 0012 SST и SST-V почти совпадают (NASA TMR)
-        if self.sst_vort:
-            W2 = (g[:, 2, 0] - g[:, 1, 1]) ** 2
-            Sp2 = W2
-        else:
+        prod = str(self.sst_prod or "V").upper() if self.sst_vort else "S"
+        if prod == "S":
             Sp2 = S2
+        else:
+            W2 = (g[:, 2, 0] - g[:, 1, 1]) ** 2
+            Sp2 = W2 if prod == "V" else jnp.sqrt(S2 * W2 + 1e-30)    # Като–Лаундер: S·Ω
         P = jnp.minimum(mut * Sp2, 10 * SST_BS * rho * om * k)
         if self.lam_xtr is not None:            # переход по вязкому методу: до x_tr k не порождается
             P = P * (self.J["prod"] if prod is None else prod)
@@ -1122,7 +1127,7 @@ class RansSolver:
     def _fn_key(self):
         """Параметры, которые входят в скомпилированные функции как константы."""
         return (self.nv, self.turb_model, self.aft_version, float(self.ncrit), float(self.limiter_k),
-                self.limiter_zone, bool(self.sst_vort), float(self.sst_k_inf_rel), float(self.sst_omega_inf_rel),
+                self.limiter_zone, bool(self.sst_vort), str(self.sst_prod), float(self.sst_k_inf_rel), float(self.sst_omega_inf_rel),
                 float(self.zmin), bool(self.sa_raw_grad), bool(self.visc_raw_grad), int(self.rc_smooth),
                 bool(self.turbulent), float(self.chi_inf), float(self.chi_inf_tr), self.xref, int(self.turb_order),
                 float(self.ncrit_eff()), float(self.xtr_u), float(self.xtr_l),

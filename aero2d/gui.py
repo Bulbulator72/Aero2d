@@ -930,7 +930,8 @@ class App(tk.Tk):
                 tm_, trn_ = sopts.get("turb_model", "sa"), sopts.get("xtr_source") == "viscous"
                 for q_ in reversed(self.polars):
                     c_ = q_.field_ctx or {}
-                    if (q_.method == "rans" and c_.get("sig") == sig and c_.get("turb_model", "sa") == tm_
+                    same_prod = (tm_ != "sst" or str(c_.get("sst_prod") or "V") == str(sopts.get("sst_prod", "V")))
+                    if (q_.method == "rans" and c_.get("sig") == sig and c_.get("turb_model", "sa") == tm_ and same_prod
                             and bool(c_.get("transition")) == trn_ and abs(q_.mach - max(mach, 0.1)) < 1e-9
                             and core.rans_seeds(q_)):
                         ext = q_
@@ -2249,7 +2250,9 @@ class App(tk.Tk):
                    "SA-RC (поправка на кривизну)": "sa-rc",
                    "SA + переход по вязкому методу (eᴺ)": "sa-vtr",
                    "SA-AFT (переход, Ñкрит из окна)": "sa-aft",
-                   "k-ω SST (Menter, NASA SST-V)": "sst",
+                   "k-ω SST-V (NASA: порождение по завихренности)": "sst",
+                   "k-ω SST (как Fluent: порождение по деформации)": "sst-s",
+                   "k-ω SST-KL (Като–Лаундер)": "sst-kl",
                    "k-ω SST + переход по вязкому методу (eᴺ)": "sst-vtr"}
 
     # режимы шага: "обычный" — CFL растёт, пока шаги Ньютона удаются (адаптивный, как в SU2);
@@ -2350,6 +2353,11 @@ class App(tk.Tk):
         vtr = o["turb_model"].endswith("-vtr")
         if vtr:
             o["turb_model"], o["xtr_source"] = o["turb_model"][:-4], "viscous"
+        if o["turb_model"] in ("sst-s", "sst-kl"):           # форма порождения k в SST
+            o["sst_prod"] = o["turb_model"][4:].upper()
+            o["turb_model"] = "sst"
+        elif o["turb_model"] == "sst":
+            o["sst_prod"] = "V"
         if vtr or o["turb_model"].endswith("aft"):
             try:
                 if self.tu.get().strip():
