@@ -923,6 +923,7 @@ class App(tk.Tk):
                 self._input_error(e if str(e) else ValueError("Итераций на угол — целое число"))
                 return
             mesh0 = self._mesh[1] if self._mesh and self._mesh[0] == sig else None
+            geo_sig = self._mesh_signature(af, re_[0], 0.0, None)     # профиль и Re — без настроек сетки
             # уже есть поляра RANS этого профиля на той же сетке, той же моделью — новые углы можно
             # добавить к ней: каждый стартует от ближайшего посчитанного решения, без грубой сетки
             ext = None
@@ -931,7 +932,10 @@ class App(tk.Tk):
                 for q_ in reversed(self.polars):
                     c_ = q_.field_ctx or {}
                     same_prod = (tm_ != "sst" or str(c_.get("sst_prod") or "V") == str(sopts.get("sst_prod", "V")))
-                    if (q_.method == "rans" and c_.get("sig") == sig and c_.get("turb_model", "sa") == tm_ and same_prod
+                    # тот же профиль и Re (сетка — сохранённая с этой поляры; настройки сетки в окне при
+                    # продолжении не нужны: после открытия файла .a2d их не надо вспоминать)
+                    same_geo = (c_.get("geo_sig") == geo_sig) if c_.get("geo_sig") is not None else c_.get("sig") == sig
+                    if (q_.method == "rans" and same_geo and c_.get("turb_model", "sa") == tm_ and same_prod
                             and bool(c_.get("transition")) == trn_ and abs(q_.mach - max(mach, 0.1)) < 1e-9
                             and core.rans_seeds(q_)):
                         ext = q_
@@ -941,11 +945,12 @@ class App(tk.Tk):
                 new_ = [float(a) for a in alphas if not any(abs(a - d) < 1e-9 for d in done_)]
                 ans = messagebox.askyesnocancel(
                     "Продолжить поляру",
-                    f"На этой же сетке и этой же моделью уже посчитана поляра «{ext.label}»: сошлись "
+                    f"Для этого профиля этой же моделью уже посчитана поляра «{ext.label}»: сошлись "
                     f"α = {', '.join(f'{a:g}' for a in done_)}°.\n\n"
-                    f"Да — добавить к ней углы {', '.join(f'{a:g}' for a in new_) or '(новых нет)'}°: каждый "
-                    "стартует от ближайшего уже посчитанного решения, без грубой сетки; посчитанные углы "
-                    "не пересчитываются.\nНет — отдельный расчёт с нуля.")
+                    f"Да — добавить к ней углы {', '.join(f'{a:g}' for a in new_) or '(новых нет)'}° на её сетке "
+                    f"({ext.field_ctx['mesh'].n_cells} ячеек; настройки сетки в окне не используются): каждый "
+                    "угол стартует от ближайшего уже посчитанного решения, без грубой сетки; посчитанные углы "
+                    "не пересчитываются.\nНет — отдельный расчёт с нуля на сетке по настройкам окна.")
                 if ans is None:
                     return
                 if ans:
@@ -1017,6 +1022,7 @@ class App(tk.Tk):
                                                control=ctl, workers=nw, solver_opts=sopts, coarse_start=False,
                                                seeds=core.rans_seeds(ext))
                             p_.field_ctx["sig"] = sig
+                            p_.field_ctx["geo_sig"] = geo_sig
                             self.q.put(("replace", ext, core.merge_polars(ext, p_)))
                             break
                         p_ = core.run_rans(af, alphas, mach, r_, cb, rit, nm,
@@ -1026,6 +1032,7 @@ class App(tk.Tk):
                                            coarse_start=coarse)
                         if p_.field_ctx is not None:
                             p_.field_ctx["sig"] = sig
+                            p_.field_ctx["geo_sig"] = geo_sig
                         ps.append(p_)
                         if p_.field_ctx and r_ == re0 and mesh0 is None:
                             self.q.put(("mesh", sig, p_.field_ctx["mesh"], r_, p_.field_ctx["chord"]))
