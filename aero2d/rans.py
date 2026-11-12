@@ -2180,7 +2180,10 @@ def mesh_for(elements, alpha, re, chord=1.0, fine=False, opts=None):
         zones = transition_zones(els[0], re, al, o.tr_ncrit, o.tr_mach, o.tr_width)
         if zones:
             els = [refine_surface(els[0], zones, o.tr_ds * float(np.ptp(els[0].x)))]
-    near = o.near_size or ((0.002 if fine else 0.003) if multi else 0.004)
+    # механизация: 0,001c у стенок и в щелях — с 0,003c при 12° слой основного элемента и струя щели
+    # размазывались, SST уходила в нефизическое решение (Cl 1,99 при линейных 1,73; Fluent — линейно до 18°);
+    # с 0,001c (ячеек ×1,45) — по линии
+    near = o.near_size or ((0.0007 if fine else 0.001) if multi else 0.004)
     # рост треугольников: у одного профиля 0,12 — NACA 0012 (α 10°, TMR) Cdp 0,00597 при эталоне
     # 0,00612 (с 0,25 — 0,00487: недобор от разрешения у носка и в корме); ячеек +30 %, итераций ×2.
     # С механизацией пока 0,25 (мелкая сетка на ней не проверена)
@@ -2422,7 +2425,7 @@ def coarse_options(elements, opts=None):
     o = opts or MeshOptions()
     n_side = o.n_surface or max(len(e.x) for e in elements) // 2
     multi = len(elements) > 1
-    near = o.near_size or (0.003 if multi else 0.004)
+    near = o.near_size or (0.001 if multi else 0.004)
     # грубая сетка — генератором gmsh (слой у стенки): с однородного потока на нём расчёт
     # устанавливается надёжно, а на мелком следе С-блока переход 1-й → 2-й порядок раскачивается;
     # с перенесённого поля С-блок сходится сразу (NACA 0012, α = 0: 52 итерации, Cd 0,00792)
