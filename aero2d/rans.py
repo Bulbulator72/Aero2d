@@ -300,6 +300,10 @@ class RansSolver:
         self.prec_lag = 1              # >1: разложение ILU повторно до prec_lag итераций (CFL ×2 — заново); на
                                        # механизации это ухудшило сходимость — по умолчанию каждую итерацию
         self.jax_trisolve = True       # прямой/обратный ход ILU — скомпилированным циклом JAX
+        # точность решения линейной задачи на итерации (GMRES): 5 % — NLR 7301, SST, 167 тыс. ячеек:
+        # 40,7 мин на угол против 59,8 при 1 % (итераций 130 против 119), Cl и Cd те же до 5 знаков;
+        # 10 % — перебор (357 итераций, 53,8 мин)
+        self.gmres_tol = 0.05
         self.limiter_gather = False    # ограничитель: max/min по соседям сбором по таблице (на NLR 7301 — не быстрее)
         self.max_rollbacks = 4         # больше откатов — угол «неустойчив»
         self.sa_raw_grad = False       # True: источник SA по неограниченным градиентам (на механизации хуже сходится)
@@ -1292,13 +1296,14 @@ class RansSolver:
 
     # ------------------------------------------------------------------
     def solve(self, alpha, Q0=None, max_iter=300, tol=1e-7, cfl0=None, cfl_max=None, first_order_iters=None,
-              verbose=False, callback=None, gmres_tol=0.01, gmres_iter=60, conv=None, control=None, alpha0=None):
+              verbose=False, callback=None, gmres_tol=None, gmres_iter=60, conv=None, control=None, alpha0=None):
         """Установление до выполнения критерия conv (Convergence; по умолчанию —
         self.conv) или до max_iter итераций Ньютона. control — RansControl.
         alpha0 — угол, при котором получено начальное поле Q0: скорость вдали от
         тел поворачивается на α − α0 (у стенок — меньше), иначе внешнее поле
         «узнаёт» о новом угле только через десятки итераций."""
         crit = conv or self.conv
+        gmres_tol = self.gmres_tol if gmres_tol is None else gmres_tol
         if self.lam_xtr_table:
             self.lam_xtr = lam_xtr_at(self.lam_xtr_table, alpha)
         if self.lam_xtr is not None and Q0 is None and self.nv == 5:
@@ -1762,11 +1767,14 @@ class RansSolver:
                 eps = 1e-12 * (1.0 + qn) / xn          # мал: изломы ограничителя
                 Rp = np.asarray(resf(jnp.asarray(Q + eps * x.reshape(-1, nv)), winf_j, gm)).ravel()
                 return (Rp - Rf) / eps + Vdt * x
+            # грубее (gmres_tol, 5 %) — только от готового поля и без откатов; с однородного потока и
+            # после отката — 1 % (SA с нуля при 10°: с 5 % развал, с 1 % сходится)
+            gtol = gmres_tol if (warm and n_back == 0) else min(gmres_tol, 0.01)
             gh = []
             if self.right_prec:
                 # правое предобусловливание: GMRES минимизирует истинную линейную невязку
                 Aop = spla.LinearOperator((N5, N5), lambda y: mv(ilu.solve(y)))
-                y, info = spla.gmres(Aop, -R.ravel(), rtol=gmres_tol, maxiter=1, restart=gmres_iter,
+                y, info = spla.gmres(Aop, -R.ravel(), rtol=gtol, maxiter=1, restart=gmres_iter,
                                      callback=lambda rr: gh.append(rr), callback_type="pr_norm")
                 dq = ilu.solve(y)
             else:
@@ -1775,7 +1783,7 @@ class RansSolver:
                 # не растёт, ламинарный слой не развивается (пластина Re 5·10⁶: Cd 0,00016 за
                 # 300 итераций вместо 0,00059; с правым — Блазиус за 90 итераций)
                 from .krylov import gmres as _gmres
-                dq, info = _gmres(mv, -R.ravel(), prec=ilu.solve, rtol=gmres_tol, maxiter=gmres_iter,
+                dq, info = _gmres(mv, -R.ravel(), prec=ilu.solve, rtol=gtol, maxiter=gmres_iter,
                                   callback=gh.append, right=bool(self.transition or not self.turbulent or self.lam_xtr is not None))
             lin = float(np.linalg.norm(mv(dq) + R.ravel()) / max(np.linalg.norm(R), 1e-300))
             if not self.right_prec and not (np.isfinite(lin) and lin < 0.5):
@@ -1783,7 +1791,7 @@ class RansSolver:
                 # итерацию при истинной невязке > 1 (на структурированной С-сетке до 500 хорд —
                 # в огромных ячейках у внешней границы); правое минимизирует саму невязку
                 from .krylov import gmres as _gmres
-                dq2, _ = _gmres(mv, -R.ravel(), prec=ilu.solve, rtol=gmres_tol, maxiter=gmres_iter,
+                dq2, _ = _gmres(mv, -R.ravel(), prec=ilu.solve, rtol=gtol, maxiter=gmres_iter,
                                 callback=gh.append, right=True)
                 lin2 = float(np.linalg.norm(mv(dq2) + R.ravel()) / max(np.linalg.norm(R), 1e-300))
                 if np.isfinite(lin2) and (not np.isfinite(lin) or lin2 < lin):
