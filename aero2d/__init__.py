@@ -7,4 +7,4 @@ import os as _os
 _os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
 # версия — дата сборки; показывается в заголовке окна и в aero2d.exe --selftest
-__version__ = "2026.11.12-2 (SST: потолок CFL после отмен возвращается ×2 за 10 удачных шагов)"
+__version__ = "2026.11.12-3 (SST: форма порождения на выбор — как Fluent (S²), Като–Лаундер, NASA SST-V)"
