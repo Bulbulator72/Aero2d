@@ -1517,8 +1517,11 @@ class RansSolver:
                 continue
             n_rej = 0
             ok_streak += 1
-            if self.sst and ok_streak >= 25 and cfl >= 0.9 * cfl_max and cfl_max < cfl_max_full:
-                cfl_max = min(cfl_max_full, 1.5 * cfl_max)  # долго без отмен у потолка — осторожно выше
+            # долго без отмен у потолка — потолок выше: ×2 за 10 удачных шагов (с ×1,5 за 25 — ступеньки:
+            # механизация, α 0°, после отмен в начале потолок ~30 возвращался к 3000 ~250 итераций,
+            # невязка всё это время падала медленно, 400 итераций на угол)
+            if self.sst and ok_streak >= 10 and cfl >= 0.9 * cfl_max and cfl_max < cfl_max_full:
+                cfl_max = min(cfl_max_full, 2.0 * cfl_max)
                 ok_streak = 0
             if not np.isfinite(rn):
                 status = "расходится"
